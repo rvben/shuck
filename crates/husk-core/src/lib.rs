@@ -1,10 +1,13 @@
 pub mod agent_client;
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use husk_vmm::VmmBackend;
 use husk_vmm::firecracker::FirecrackerBackend;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 pub use husk_state::VmRecord;
 pub use husk_vmm::{VmInfo, VmState};
@@ -15,6 +18,8 @@ pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult};
 pub enum CoreError {
     #[error("VM not found: {0}")]
     VmNotFound(String),
+    #[error("VM already exists: {0}")]
+    VmAlreadyExists(String),
     #[error("VMM error: {0}")]
     Vmm(#[from] husk_vmm::VmmError),
     #[error("network error: {0}")]
@@ -35,6 +40,16 @@ pub struct CreateVmRequest {
     pub rootfs_path: PathBuf,
     pub vcpu_count: Option<u32>,
     pub mem_size_mib: Option<u32>,
+}
+
+/// Tracks resources allocated during VM creation for rollback on failure.
+#[derive(Default)]
+struct AllocatedResources {
+    host_ip: Option<Ipv4Addr>,
+    cid: Option<u32>,
+    tap_name: Option<String>,
+    vm_dir: Option<PathBuf>,
+    vm_id: Option<Uuid>,
 }
 
 /// Core orchestrator that ties together all subsystems.
@@ -67,20 +82,54 @@ impl HuskCore {
     }
 
     /// Create and boot a new VM.
-    pub async fn create_vm(&self, req: CreateVmRequest) -> Result<husk_state::VmRecord, CoreError> {
+    ///
+    /// Allocates network, storage, and VMM resources. On failure, all
+    /// partially allocated resources are rolled back.
+    pub async fn create_vm(&self, req: CreateVmRequest) -> Result<VmRecord, CoreError> {
+        info!(name = %req.name, "creating VM");
+
         husk_storage::validate_kernel(&req.kernel_path)?;
         husk_storage::validate_rootfs(&req.rootfs_path)?;
 
+        let mut resources = AllocatedResources::default();
+        match self.try_create_vm(req, &mut resources).await {
+            Ok(record) => {
+                info!(name = %record.name, id = %record.id, "VM created");
+                Ok(record)
+            }
+            Err(e) => {
+                warn!(error = %e, "VM creation failed, rolling back");
+                self.rollback_create(resources).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner create logic that tracks allocated resources for rollback.
+    async fn try_create_vm(
+        &self,
+        req: CreateVmRequest,
+        resources: &mut AllocatedResources,
+    ) -> Result<VmRecord, CoreError> {
         let (host_ip, guest_ip) = self.ip_allocator.allocate()?;
+        resources.host_ip = Some(host_ip);
+
         let cid = self.state.allocate_cid()?;
+        resources.cid = Some(cid);
+
         let tap_name = format!("husk{cid}");
         let mac = husk_net::generate_mac(cid);
+        debug!(tap = %tap_name, %host_ip, %guest_ip, cid, "resources allocated");
 
         husk_net::create_tap(&tap_name, host_ip).await?;
+        resources.tap_name = Some(tap_name.clone());
+
         husk_net::add_vm_nat(&tap_name, host_ip, &self.host_interface).await?;
 
-        let vm_rootfs = self.storage.vm_dir(&req.name).join("rootfs.ext4");
+        let vm_dir = self.storage.vm_dir(&req.name);
+        let vm_rootfs = vm_dir.join("rootfs.ext4");
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
+        resources.vm_dir = Some(vm_dir);
 
         let vm_config = husk_vmm::VmConfig {
             name: req.name.clone(),
@@ -98,9 +147,10 @@ impl HuskCore {
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
+        resources.vm_id = Some(info.id);
 
         let now = chrono::Utc::now();
-        let record = husk_state::VmRecord {
+        let record = VmRecord {
             id: info.id,
             name: req.name,
             state: info.state.to_string(),
@@ -116,21 +166,52 @@ impl HuskCore {
             created_at: now,
             updated_at: now,
         };
-        self.state.insert_vm(&record)?;
+
+        self.state.insert_vm(&record).map_err(|e| match e {
+            husk_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
+            other => CoreError::State(other),
+        })?;
 
         Ok(record)
     }
 
-    /// Stop a VM.
+    /// Roll back partially allocated resources in reverse order.
+    async fn rollback_create(&self, resources: AllocatedResources) {
+        if let Some(vm_id) = resources.vm_id {
+            debug!(%vm_id, "rolling back: destroying VM");
+            let _ = self.vmm.destroy_vm(vm_id).await;
+        }
+        if let Some(ref dir) = resources.vm_dir {
+            debug!(dir = %dir.display(), "rolling back: removing VM directory");
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
+        if let Some(ref tap) = resources.tap_name {
+            debug!(tap, "rolling back: removing NAT and TAP");
+            let _ = husk_net::remove_vm_nat(tap).await;
+            let _ = husk_net::delete_tap(tap).await;
+        }
+        if let Some(cid) = resources.cid {
+            debug!(cid, "rolling back: releasing CID");
+            let _ = self.state.release_cid(cid);
+        }
+        if let Some(host_ip) = resources.host_ip {
+            debug!(%host_ip, "rolling back: releasing IP");
+            let _ = self.ip_allocator.release(host_ip);
+        }
+    }
+
+    /// Stop a running VM.
     pub async fn stop_vm(&self, name: &str) -> Result<(), CoreError> {
+        info!(%name, "stopping VM");
         let record = self.lookup_vm(name)?;
         self.vmm.stop_vm(record.id).await?;
         self.state.update_vm_state(record.id, "stopped")?;
         Ok(())
     }
 
-    /// Destroy a VM and clean up resources.
+    /// Destroy a VM and clean up all associated resources.
     pub async fn destroy_vm(&self, name: &str) -> Result<(), CoreError> {
+        info!(%name, "destroying VM");
         let record = self.lookup_vm(name)?;
 
         self.vmm.destroy_vm(record.id).await?;
@@ -141,7 +222,7 @@ impl HuskCore {
         }
 
         if let Some(ref host_ip_str) = record.host_ip
-            && let Ok(host_ip) = host_ip_str.parse::<std::net::Ipv4Addr>()
+            && let Ok(host_ip) = host_ip_str.parse::<Ipv4Addr>()
         {
             let _ = self.ip_allocator.release(host_ip);
         }
@@ -152,16 +233,17 @@ impl HuskCore {
         let _ = tokio::fs::remove_dir_all(&vm_dir).await;
 
         self.state.delete_vm(record.id)?;
+        info!(%name, "VM destroyed");
         Ok(())
     }
 
     /// List all VMs.
-    pub fn list_vms(&self) -> Result<Vec<husk_state::VmRecord>, CoreError> {
+    pub fn list_vms(&self) -> Result<Vec<VmRecord>, CoreError> {
         Ok(self.state.list_vms()?)
     }
 
     /// Get info about a specific VM.
-    pub fn get_vm(&self, name: &str) -> Result<husk_state::VmRecord, CoreError> {
+    pub fn get_vm(&self, name: &str) -> Result<VmRecord, CoreError> {
         self.lookup_vm(name)
     }
 
@@ -174,11 +256,12 @@ impl HuskCore {
     ) -> Result<AgentConnection<tokio::net::UnixStream>, CoreError> {
         let record = self.lookup_vm(name)?;
         let vsock_path = self.runtime_dir.join(format!("{}.vsock", record.id));
+        debug!(%name, path = %vsock_path.display(), "connecting to agent");
         let conn = AgentClient::connect(&vsock_path, husk_agent_proto::AGENT_VSOCK_PORT).await?;
         Ok(conn)
     }
 
-    fn lookup_vm(&self, name: &str) -> Result<husk_state::VmRecord, CoreError> {
+    fn lookup_vm(&self, name: &str) -> Result<VmRecord, CoreError> {
         self.state.get_vm_by_name(name).map_err(|e| match e {
             husk_state::StateError::VmNotFoundByName(_) => CoreError::VmNotFound(name.into()),
             other => CoreError::State(other),
