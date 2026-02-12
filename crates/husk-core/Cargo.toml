@@ -1,0 +1,16 @@
+[package]
+name = "husk-core"
+description = "Core orchestration for husk microVM lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+husk-vmm = { workspace = true }
+husk-net = { workspace = true }
+husk-storage = { workspace = true }
+husk-state = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }

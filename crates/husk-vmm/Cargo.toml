@@ -1,0 +1,17 @@
+[package]
+name = "husk-vmm"
+description = "VMM abstraction layer with Firecracker and Cloud Hypervisor backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tower = { workspace = true }

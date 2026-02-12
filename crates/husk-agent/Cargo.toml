@@ -1,0 +1,17 @@
+[package]
+name = "husk-agent"
+description = "Guest agent binary for husk microVMs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "husk-agent"
+path = "src/main.rs"
+
+[dependencies]
+husk-agent-proto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
