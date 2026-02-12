@@ -16,6 +16,15 @@ pub enum AgentRequest {
 
     /// Check if the agent is alive.
     Ping,
+
+    /// Start an interactive shell session.
+    ShellStart(ShellStartRequest),
+
+    /// Send stdin data to the shell.
+    ShellData(ShellDataRequest),
+
+    /// Resize the shell terminal.
+    ShellResize(ShellResizeRequest),
 }
 
 /// Messages sent from the guest agent back to the host.
@@ -36,6 +45,15 @@ pub enum AgentResponse {
 
     /// An error occurred processing the request.
     Error(ErrorResponse),
+
+    /// Shell session started successfully.
+    ShellStarted,
+
+    /// Output data from the shell.
+    ShellData(ShellDataResponse),
+
+    /// Shell process exited.
+    ShellExit(ShellExitResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +99,38 @@ pub struct WriteFileResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellStartRequest {
+    /// Shell command to run (default: /bin/sh if None).
+    pub command: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellDataRequest {
+    /// Base64-encoded stdin data.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellResizeRequest {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellDataResponse {
+    /// Base64-encoded stdout/stderr data.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellExitResponse {
+    pub exit_code: i32,
 }
 
 /// Encode a message as a length-prefixed JSON frame.
@@ -383,5 +433,130 @@ mod tests {
     #[test]
     fn base64_decode_invalid_char() {
         assert!(base64_decode("QQ!=").is_err());
+    }
+
+    #[test]
+    fn roundtrip_shell_start() {
+        let req = AgentRequest::ShellStart(ShellStartRequest {
+            command: Some("/bin/bash".into()),
+            env: vec![("TERM".into(), "xterm-256color".into())],
+            cols: 80,
+            rows: 24,
+        });
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, consumed): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            AgentRequest::ShellStart(s) => {
+                assert_eq!(s.command.as_deref(), Some("/bin/bash"));
+                assert_eq!(s.cols, 80);
+                assert_eq!(s.rows, 24);
+                assert_eq!(s.env, vec![("TERM".into(), "xterm-256color".into())]);
+            }
+            _ => panic!("expected ShellStart"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shell_start_default_command() {
+        let req = AgentRequest::ShellStart(ShellStartRequest {
+            command: None,
+            env: vec![],
+            cols: 120,
+            rows: 40,
+        });
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, _): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentRequest::ShellStart(s) => {
+                assert!(s.command.is_none());
+                assert_eq!(s.cols, 120);
+                assert_eq!(s.rows, 40);
+            }
+            _ => panic!("expected ShellStart"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shell_data_request() {
+        let req = AgentRequest::ShellData(ShellDataRequest {
+            data: base64_encode(b"ls -la\n"),
+        });
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, _): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentRequest::ShellData(s) => {
+                let bytes = base64_decode(&s.data).unwrap();
+                assert_eq!(bytes, b"ls -la\n");
+            }
+            _ => panic!("expected ShellData"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shell_resize() {
+        let req = AgentRequest::ShellResize(ShellResizeRequest {
+            cols: 200,
+            rows: 50,
+        });
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, _): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentRequest::ShellResize(s) => {
+                assert_eq!(s.cols, 200);
+                assert_eq!(s.rows, 50);
+            }
+            _ => panic!("expected ShellResize"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shell_started() {
+        let resp = AgentResponse::ShellStarted;
+        let encoded = encode_message(&resp).unwrap();
+        let (decoded, _): (AgentResponse, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert!(matches!(decoded, AgentResponse::ShellStarted));
+    }
+
+    #[test]
+    fn roundtrip_shell_data_response() {
+        let resp = AgentResponse::ShellData(ShellDataResponse {
+            data: base64_encode(b"total 42\ndrwxr-xr-x"),
+        });
+        let encoded = encode_message(&resp).unwrap();
+        let (decoded, _): (AgentResponse, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentResponse::ShellData(s) => {
+                let bytes = base64_decode(&s.data).unwrap();
+                assert_eq!(bytes, b"total 42\ndrwxr-xr-x");
+            }
+            _ => panic!("expected ShellData response"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shell_exit() {
+        let resp = AgentResponse::ShellExit(ShellExitResponse { exit_code: 42 });
+        let encoded = encode_message(&resp).unwrap();
+        let (decoded, _): (AgentResponse, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentResponse::ShellExit(s) => {
+                assert_eq!(s.exit_code, 42);
+            }
+            _ => panic!("expected ShellExit response"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shell_exit_zero() {
+        let resp = AgentResponse::ShellExit(ShellExitResponse { exit_code: 0 });
+        let encoded = encode_message(&resp).unwrap();
+        let (decoded, _): (AgentResponse, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentResponse::ShellExit(s) => {
+                assert_eq!(s.exit_code, 0);
+            }
+            _ => panic!("expected ShellExit response"),
+        }
     }
 }

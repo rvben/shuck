@@ -233,6 +233,18 @@ pub async fn init_nat() -> Result<(), NetError> {
         ],
     )
     .await?;
+    run_cmd(
+        "nft",
+        &[
+            "add",
+            "chain",
+            "ip",
+            NFT_TABLE,
+            "prerouting",
+            "{ type nat hook prerouting priority dstnat; policy accept; }",
+        ],
+    )
+    .await?;
 
     Ok(())
 }
@@ -301,8 +313,10 @@ pub async fn add_vm_nat(
 /// Remove all NAT and forwarding rules for a VM.
 ///
 /// Queries the husk nftables table for rules tagged with the VM's TAP name
-/// and deletes them by handle.
+/// and deletes them by handle. Also removes any port forwards for this VM.
 pub async fn remove_vm_nat(tap_name: &str) -> Result<(), NetError> {
+    let _ = remove_all_port_forwards(tap_name).await;
+
     info!(tap = tap_name, "removing NAT rules");
 
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", NFT_TABLE]).await {
@@ -318,6 +332,113 @@ pub async fn remove_vm_nat(tap_name: &str) -> Result<(), NetError> {
 
     for (chain, handle) in rules {
         debug!(chain = %chain, handle, "deleting rule");
+        let _ = run_cmd(
+            "nft",
+            &[
+                "delete",
+                "rule",
+                "ip",
+                NFT_TABLE,
+                &chain,
+                "handle",
+                &handle.to_string(),
+            ],
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+// ── Port Forwarding ───────────────────────────────────────────────────
+
+/// Add a port forward from `host_port` to `guest_ip:guest_port`.
+///
+/// Creates two nftables rules tagged with a comment for later cleanup:
+/// - DNAT rule in the prerouting chain
+/// - Forward rule to allow traffic to the guest
+pub async fn add_port_forward(
+    host_port: u16,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+    tap_name: &str,
+) -> Result<(), NetError> {
+    let comment = format!("\"husk-pf:{}:{}\"", tap_name, host_port);
+    let dnat_target = format!("{}:{}", guest_ip, guest_port);
+
+    info!(host_port, %guest_ip, guest_port, tap = tap_name, "adding port forward");
+
+    // DNAT rule in prerouting chain
+    run_cmd(
+        "nft",
+        &[
+            "add", "rule", "ip", NFT_TABLE, "prerouting", "tcp", "dport",
+            &host_port.to_string(), "dnat", "to", &dnat_target, "comment", &comment,
+        ],
+    )
+    .await?;
+
+    // Forward rule to allow traffic to the guest
+    run_cmd(
+        "nft",
+        &[
+            "add", "rule", "ip", NFT_TABLE, "forward", "ip", "daddr",
+            &guest_ip.to_string(), "tcp", "dport", &guest_port.to_string(), "accept",
+            "comment", &comment,
+        ],
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Remove a specific port forward by host port and TAP name.
+///
+/// Queries the husk nftables table for rules tagged with the port forward
+/// comment and deletes them by handle.
+pub async fn remove_port_forward(host_port: u16, tap_name: &str) -> Result<(), NetError> {
+    info!(host_port, tap = tap_name, "removing port forward");
+
+    let output = match run_cmd("nft", &["-j", "list", "table", "ip", NFT_TABLE]).await {
+        Ok(output) => output,
+        Err(_) => return Ok(()),
+    };
+
+    let comment_tag = format!("husk-pf:{}:{}", tap_name, host_port);
+    let rules = find_rules_by_comment(&output, &comment_tag);
+
+    for (chain, handle) in rules {
+        debug!(chain = %chain, handle, "deleting port forward rule");
+        let _ = run_cmd(
+            "nft",
+            &[
+                "delete",
+                "rule",
+                "ip",
+                NFT_TABLE,
+                &chain,
+                "handle",
+                &handle.to_string(),
+            ],
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Remove all port forwards for a VM identified by its TAP name.
+pub async fn remove_all_port_forwards(tap_name: &str) -> Result<(), NetError> {
+    let output = match run_cmd("nft", &["-j", "list", "table", "ip", NFT_TABLE]).await {
+        Ok(output) => output,
+        Err(_) => return Ok(()),
+    };
+
+    let prefix = format!("husk-pf:{tap_name}:");
+    let rules = find_rules_by_comment_prefix(&output, &prefix);
+
+    for (chain, handle) in rules {
+        debug!(chain = %chain, handle, "deleting port forward rule");
         let _ = run_cmd(
             "nft",
             &[
@@ -371,6 +492,46 @@ fn find_rules_by_comment(nft_json: &str, comment_tag: &str) -> Vec<(String, u64)
         };
 
         if comment != comment_tag {
+            continue;
+        }
+
+        let chain = rule.get("chain").and_then(|c| c.as_str()).unwrap_or("");
+        let handle = rule.get("handle").and_then(|h| h.as_u64()).unwrap_or(0);
+
+        if !chain.is_empty() && handle > 0 {
+            results.push((chain.to_string(), handle));
+        }
+    }
+
+    results
+}
+
+/// Parse nft JSON output to find rules whose comment starts with a given prefix.
+///
+/// Returns `Vec<(chain_name, handle)>` for each matching rule.
+fn find_rules_by_comment_prefix(nft_json: &str, prefix: &str) -> Vec<(String, u64)> {
+    let parsed: serde_json::Value = match serde_json::from_str(nft_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse nft JSON output: {e}");
+            return Vec::new();
+        }
+    };
+
+    let Some(entries) = parsed.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+    for entry in entries {
+        let Some(rule) = entry.get("rule") else {
+            continue;
+        };
+        let Some(comment) = rule.get("comment").and_then(|c| c.as_str()) else {
+            continue;
+        };
+
+        if !comment.starts_with(prefix) {
             continue;
         }
 
@@ -638,5 +799,66 @@ mod tests {
     fn find_rules_empty_nftables_array() {
         let json = r#"{"nftables": []}"#;
         assert!(find_rules_by_comment(json, "husk:tap0").is_empty());
+    }
+
+    // ── Port Forward Comment Prefix Matching ──────────────────────────
+
+    #[test]
+    fn find_rules_by_prefix_matches() {
+        let json = r#"{"nftables": [
+            {"rule": {"chain": "prerouting", "handle": 10, "comment": "husk-pf:tap0:8080"}},
+            {"rule": {"chain": "forward", "handle": 11, "comment": "husk-pf:tap0:8080"}},
+            {"rule": {"chain": "prerouting", "handle": 12, "comment": "husk-pf:tap0:9090"}},
+            {"rule": {"chain": "forward", "handle": 13, "comment": "husk-pf:tap1:8080"}}
+        ]}"#;
+
+        let rules = find_rules_by_comment_prefix(json, "husk-pf:tap0:");
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0], ("prerouting".to_string(), 10));
+        assert_eq!(rules[1], ("forward".to_string(), 11));
+        assert_eq!(rules[2], ("prerouting".to_string(), 12));
+    }
+
+    #[test]
+    fn find_rules_by_prefix_no_match() {
+        let json = r#"{"nftables": [
+            {"rule": {"chain": "forward", "handle": 5, "comment": "husk-pf:tap1:8080"}}
+        ]}"#;
+        assert!(find_rules_by_comment_prefix(json, "husk-pf:tap0:").is_empty());
+    }
+
+    #[test]
+    fn find_rules_by_prefix_empty_json() {
+        assert!(find_rules_by_comment_prefix("{}", "husk-pf:tap0:").is_empty());
+    }
+
+    #[test]
+    fn find_rules_by_prefix_invalid_json() {
+        assert!(find_rules_by_comment_prefix("not json", "husk-pf:tap0:").is_empty());
+    }
+
+    #[test]
+    fn find_rules_by_prefix_skips_invalid_entries() {
+        let json = r#"{"nftables": [
+            {"rule": {"chain": "", "handle": 5, "comment": "husk-pf:tap0:80"}},
+            {"rule": {"chain": "forward", "handle": 0, "comment": "husk-pf:tap0:80"}},
+            {"rule": {"chain": "forward", "comment": "husk-pf:tap0:80"}},
+            {"rule": {"chain": "forward", "handle": 7, "comment": "husk-pf:tap0:80"}}
+        ]}"#;
+
+        let rules = find_rules_by_comment_prefix(json, "husk-pf:tap0:");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], ("forward".to_string(), 7));
+    }
+
+    #[test]
+    fn port_forward_comment_tag_format() {
+        let tap_name = "husk5";
+        let host_port: u16 = 8080;
+        let comment = format!("husk-pf:{}:{}", tap_name, host_port);
+        assert_eq!(comment, "husk-pf:husk5:8080");
+
+        let prefix = format!("husk-pf:{tap_name}:");
+        assert!(comment.starts_with(&prefix));
     }
 }

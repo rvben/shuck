@@ -17,6 +17,8 @@ pub enum StateError {
     VmNotFoundByName(String),
     #[error("VM already exists: {0}")]
     VmAlreadyExists(String),
+    #[error("port already forwarded: {0}")]
+    PortAlreadyForwarded(u16),
     #[error("lock poisoned")]
     LockPoisoned,
     #[error("IO error: {0}")]
@@ -45,6 +47,17 @@ pub struct VmRecord {
     pub rootfs_path: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Persistent port forward record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortForwardRecord {
+    pub id: i64,
+    pub vm_id: Uuid,
+    pub host_port: u16,
+    pub guest_port: u16,
+    pub protocol: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// SQLite-backed state store. Thread-safe via internal Mutex.
@@ -107,6 +120,15 @@ impl StateStore {
 
             CREATE TABLE IF NOT EXISTS freed_cids (
                 cid INTEGER PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS port_forwards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vm_id TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
+                host_port INTEGER NOT NULL UNIQUE,
+                guest_port INTEGER NOT NULL,
+                protocol TEXT NOT NULL DEFAULT 'tcp',
+                created_at TEXT NOT NULL
             );",
         )?;
         Ok(())
@@ -273,6 +295,82 @@ impl StateStore {
             params![cid],
         )?;
         debug!(cid, "released CID");
+        Ok(())
+    }
+
+    // ── Port Forwards ─────────────────────────────────────────────────
+
+    /// Insert a new port forward record.
+    ///
+    /// Returns `StateError::PortAlreadyForwarded` if the host port is already in use.
+    pub fn insert_port_forward(&self, record: &PortForwardRecord) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO port_forwards (vm_id, host_port, guest_port, protocol, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.vm_id.to_string(),
+                record.host_port,
+                record.guest_port,
+                record.protocol,
+                record.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::PortAlreadyForwarded(record.host_port)
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Delete a port forward by host port.
+    pub fn delete_port_forward(&self, host_port: u16) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM port_forwards WHERE host_port = ?1",
+            params![host_port],
+        )?;
+        Ok(())
+    }
+
+    /// List all port forwards for a VM, ordered by host port.
+    pub fn list_port_forwards_for_vm(
+        &self,
+        vm_id: Uuid,
+    ) -> Result<Vec<PortForwardRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, host_port, guest_port, protocol, created_at
+             FROM port_forwards WHERE vm_id = ?1 ORDER BY host_port",
+        )?;
+        let records = stmt
+            .query_map(params![vm_id.to_string()], |row| {
+                let vm_id_str: String = row.get(1)?;
+                let created_str: String = row.get(5)?;
+                Ok(PortForwardRecord {
+                    id: row.get(0)?,
+                    vm_id: parse_uuid(&vm_id_str)?,
+                    host_port: row.get::<_, u32>(2)? as u16,
+                    guest_port: row.get::<_, u32>(3)? as u16,
+                    protocol: row.get(4)?,
+                    created_at: parse_datetime(&created_str)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Delete all port forwards for a VM.
+    pub fn delete_port_forwards_for_vm(&self, vm_id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM port_forwards WHERE vm_id = ?1",
+            params![vm_id.to_string()],
+        )?;
         Ok(())
     }
 }
@@ -540,5 +638,132 @@ mod tests {
         let store = StateStore::open(&db_path).unwrap();
         let fetched = store.get_vm(id).unwrap();
         assert_eq!(fetched.name, "persistent");
+    }
+
+    // ── Port Forward CRUD ─────────────────────────────────────────────
+
+    fn make_port_forward(vm_id: Uuid, host_port: u16, guest_port: u16) -> PortForwardRecord {
+        PortForwardRecord {
+            id: 0,
+            vm_id,
+            host_port,
+            guest_port,
+            protocol: "tcp".into(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn insert_and_list_port_forwards() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-vm");
+        store.insert_vm(&vm).unwrap();
+
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8080, 80))
+            .unwrap();
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8443, 443))
+            .unwrap();
+
+        let forwards = store.list_port_forwards_for_vm(vm.id).unwrap();
+        assert_eq!(forwards.len(), 2);
+        assert_eq!(forwards[0].host_port, 8080);
+        assert_eq!(forwards[0].guest_port, 80);
+        assert_eq!(forwards[1].host_port, 8443);
+        assert_eq!(forwards[1].guest_port, 443);
+    }
+
+    #[test]
+    fn duplicate_host_port_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-dup");
+        store.insert_vm(&vm).unwrap();
+
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8080, 80))
+            .unwrap();
+
+        let err = store
+            .insert_port_forward(&make_port_forward(vm.id, 8080, 8080))
+            .unwrap_err();
+        assert!(
+            matches!(err, StateError::PortAlreadyForwarded(8080)),
+            "expected PortAlreadyForwarded(8080), got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_port_forward() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-del");
+        store.insert_vm(&vm).unwrap();
+
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8080, 80))
+            .unwrap();
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 9090, 90))
+            .unwrap();
+
+        store.delete_port_forward(8080).unwrap();
+
+        let forwards = store.list_port_forwards_for_vm(vm.id).unwrap();
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].host_port, 9090);
+    }
+
+    #[test]
+    fn delete_port_forwards_for_vm() {
+        let store = StateStore::open_memory().unwrap();
+        let vm1 = make_record("pf-vm1");
+        let vm2 = make_record("pf-vm2");
+        store.insert_vm(&vm1).unwrap();
+        store.insert_vm(&vm2).unwrap();
+
+        store
+            .insert_port_forward(&make_port_forward(vm1.id, 8080, 80))
+            .unwrap();
+        store
+            .insert_port_forward(&make_port_forward(vm1.id, 8443, 443))
+            .unwrap();
+        store
+            .insert_port_forward(&make_port_forward(vm2.id, 9090, 90))
+            .unwrap();
+
+        store.delete_port_forwards_for_vm(vm1.id).unwrap();
+
+        assert!(store.list_port_forwards_for_vm(vm1.id).unwrap().is_empty());
+        assert_eq!(store.list_port_forwards_for_vm(vm2.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cascade_delete_removes_port_forwards() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-cascade");
+        store.insert_vm(&vm).unwrap();
+
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8080, 80))
+            .unwrap();
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8443, 443))
+            .unwrap();
+
+        // Deleting the VM should cascade to port_forwards
+        store.delete_vm(vm.id).unwrap();
+
+        let forwards = store.list_port_forwards_for_vm(vm.id).unwrap();
+        assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn list_port_forwards_empty() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-empty");
+        store.insert_vm(&vm).unwrap();
+
+        let forwards = store.list_port_forwards_for_vm(vm.id).unwrap();
+        assert!(forwards.is_empty());
     }
 }
