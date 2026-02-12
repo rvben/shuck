@@ -567,9 +567,17 @@ name = "husk-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "http-body-util",
+ "husk-agent-proto",
  "husk-core",
+ "husk-net",
+ "husk-state",
+ "husk-storage",
+ "husk-vmm",
  "serde",
+ "serde_json",
  "tokio",
+ "tower",
  "tracing",
 ]
 

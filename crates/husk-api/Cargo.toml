@@ -7,7 +7,17 @@ rust-version.workspace = true
 
 [dependencies]
 husk-core = { workspace = true }
+husk-agent-proto = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+husk-vmm = { workspace = true }
+husk-state = { workspace = true }
+husk-net = { workspace = true }
+husk-storage = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
