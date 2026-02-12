@@ -15,3 +15,12 @@ http-body-util = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tower = { workspace = true }
+serde_json = { workspace = true }

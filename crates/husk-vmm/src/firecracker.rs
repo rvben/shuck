@@ -2,6 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use http_body_util::{BodyExt, Full};
+use hyper::Request;
+use hyper::body::Bytes;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -11,6 +16,8 @@ use crate::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
 struct FcInstance {
     info: VmInfo,
     socket_path: PathBuf,
+    vsock_path: PathBuf,
+    log_path: PathBuf,
     process: tokio::process::Child,
 }
 
@@ -18,11 +25,8 @@ struct FcInstance {
 ///
 /// Communicates with each Firecracker process via its HTTP-over-Unix-socket API.
 pub struct FirecrackerBackend {
-    /// Path to the firecracker binary.
     firecracker_bin: PathBuf,
-    /// Directory for runtime state (sockets, logs).
     runtime_dir: PathBuf,
-    /// Active VM instances.
     instances: Arc<Mutex<HashMap<Uuid, FcInstance>>>,
 }
 
@@ -35,19 +39,16 @@ impl FirecrackerBackend {
         }
     }
 
-    /// Send a PUT request to the Firecracker API over its Unix socket.
-    async fn fc_put(
-        &self,
+    /// Send an HTTP request to the Firecracker API over its Unix socket.
+    ///
+    /// Returns the response body as bytes. On non-2xx status, reads the error
+    /// body and includes it in the error message.
+    async fn fc_request(
         socket_path: &Path,
+        method: &str,
         path: &str,
-        body: &serde_json::Value,
-    ) -> Result<(), VmmError> {
-        use http_body_util::Full;
-        use hyper::Request;
-        use hyper::body::Bytes;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::{TokioExecutor, TokioIo};
-
+        body: Option<&serde_json::Value>,
+    ) -> Result<Bytes, VmmError> {
         let socket_path = socket_path.to_owned();
         let connector = tower::util::service_fn(move |_: hyper::Uri| {
             let path = socket_path.clone();
@@ -59,11 +60,15 @@ impl FirecrackerBackend {
 
         let client = Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(connector);
 
-        let body_bytes =
-            serde_json::to_vec(body).map_err(|e| VmmError::ApiError(format!("serialize: {e}")))?;
+        let body_bytes = match body {
+            Some(v) => {
+                serde_json::to_vec(v).map_err(|e| VmmError::ApiError(format!("serialize: {e}")))?
+            }
+            None => Vec::new(),
+        };
 
         let req = Request::builder()
-            .method("PUT")
+            .method(method)
             .uri(format!("http://localhost{path}"))
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(body_bytes)))
@@ -72,15 +77,33 @@ impl FirecrackerBackend {
         let resp = client
             .request(req)
             .await
-            .map_err(|e| VmmError::ApiError(format!("request failed: {e}")))?;
+            .map_err(|e| VmmError::ApiError(format!("{method} {path}: {e}")))?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        let resp_body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| VmmError::ApiError(format!("read response body: {e}")))?
+            .to_bytes();
+
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&resp_body);
             return Err(VmmError::ApiError(format!(
-                "Firecracker API returned {}",
-                resp.status()
+                "{method} {path} returned {status}: {detail}"
             )));
         }
 
+        Ok(resp_body)
+    }
+
+    /// Convenience wrapper for PUT requests (most Firecracker config endpoints).
+    async fn fc_put(
+        socket_path: &Path,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), VmmError> {
+        Self::fc_request(socket_path, "PUT", path, Some(body)).await?;
         Ok(())
     }
 
@@ -92,11 +115,19 @@ impl FirecrackerBackend {
 
 impl VmmBackend for FirecrackerBackend {
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        // Check for duplicate names
+        {
+            let instances = self.instances.lock().await;
+            if instances.values().any(|i| i.info.name == config.name) {
+                return Err(VmmError::VmAlreadyExists(config.name));
+            }
+        }
+
         let id = Uuid::new_v4();
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let log_path = self.runtime_dir.join(format!("{id}.log"));
+        let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
 
-        // Ensure runtime directory exists
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
 
         // Spawn the Firecracker process
@@ -113,7 +144,7 @@ impl VmmBackend for FirecrackerBackend {
 
         let pid = process.id();
 
-        // Wait for the socket to appear
+        // Wait for the API socket to appear
         for _ in 0..50 {
             if socket_path.exists() {
                 break;
@@ -122,22 +153,23 @@ impl VmmBackend for FirecrackerBackend {
         }
         if !socket_path.exists() {
             return Err(VmmError::ProcessError(
-                "Firecracker socket did not appear".into(),
+                "Firecracker socket did not appear within 5s".into(),
             ));
         }
 
         // Configure the VM via the Firecracker API
         let kernel_args = config.kernel_args.clone().unwrap_or_else(|| {
-            "console=ttyS0 reboot=k panic=1 pci=off ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off".to_string()
+            "console=ttyS0 reboot=k panic=1 pci=off \
+             ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off"
+                .to_string()
         });
 
         let kernel_path_str = Self::path_to_str(&config.kernel_path, "kernel_path")?;
         let rootfs_path_str = Self::path_to_str(&config.rootfs_path, "rootfs_path")?;
-        let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
         let vsock_path_str = Self::path_to_str(&vsock_path, "vsock_path")?;
 
-        // Set boot source
-        self.fc_put(
+        // Boot source
+        Self::fc_put(
             &socket_path,
             "/boot-source",
             &serde_json::json!({
@@ -147,8 +179,8 @@ impl VmmBackend for FirecrackerBackend {
         )
         .await?;
 
-        // Set root drive
-        self.fc_put(
+        // Root drive
+        Self::fc_put(
             &socket_path,
             "/drives/rootfs",
             &serde_json::json!({
@@ -160,8 +192,8 @@ impl VmmBackend for FirecrackerBackend {
         )
         .await?;
 
-        // Configure machine
-        self.fc_put(
+        // Machine config
+        Self::fc_put(
             &socket_path,
             "/machine-config",
             &serde_json::json!({
@@ -171,13 +203,13 @@ impl VmmBackend for FirecrackerBackend {
         )
         .await?;
 
-        // Configure network if TAP device is provided
+        // Network interface (optional)
         if let Some(ref tap) = config.tap_device {
             let mac = config
                 .guest_mac
                 .clone()
                 .unwrap_or_else(|| "AA:FC:00:00:00:01".into());
-            self.fc_put(
+            Self::fc_put(
                 &socket_path,
                 "/network-interfaces/eth0",
                 &serde_json::json!({
@@ -189,8 +221,8 @@ impl VmmBackend for FirecrackerBackend {
             .await?;
         }
 
-        // Configure vsock
-        self.fc_put(
+        // Vsock
+        Self::fc_put(
             &socket_path,
             "/vsock",
             &serde_json::json!({
@@ -201,7 +233,7 @@ impl VmmBackend for FirecrackerBackend {
         .await?;
 
         // Start the VM
-        self.fc_put(
+        Self::fc_put(
             &socket_path,
             "/actions",
             &serde_json::json!({
@@ -223,6 +255,8 @@ impl VmmBackend for FirecrackerBackend {
         let instance = FcInstance {
             info: info.clone(),
             socket_path,
+            vsock_path,
+            log_path,
             process,
         };
 
@@ -232,17 +266,25 @@ impl VmmBackend for FirecrackerBackend {
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        let mut instances = self.instances.lock().await;
-        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        // Extract what we need, then drop the lock before making the API call
+        let socket_path = {
+            let instances = self.instances.lock().await;
+            let instance = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            instance.socket_path.clone()
+        };
 
-        self.fc_put(
-            &instance.socket_path,
+        Self::fc_put(
+            &socket_path,
             "/actions",
             &serde_json::json!({ "action_type": "SendCtrlAltDel" }),
         )
         .await?;
 
-        instance.info.state = VmState::Stopped;
+        // Re-acquire lock to update state
+        let mut instances = self.instances.lock().await;
+        if let Some(instance) = instances.get_mut(&id) {
+            instance.info.state = VmState::Stopped;
+        }
         Ok(())
     }
 
@@ -250,46 +292,302 @@ impl VmmBackend for FirecrackerBackend {
         let mut instances = self.instances.lock().await;
         let mut instance = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
 
-        // Best-effort: kill even if already dead
         let _ = instance.process.kill().await;
         let _ = tokio::fs::remove_file(&instance.socket_path).await;
+        let _ = tokio::fs::remove_file(&instance.vsock_path).await;
+        let _ = tokio::fs::remove_file(&instance.log_path).await;
 
         Ok(())
     }
 
     async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
-        let instances = self.instances.lock().await;
-        let instance = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+        let mut instances = self.instances.lock().await;
+        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+
+        // Check if the process is still alive
+        if instance.info.state == VmState::Running || instance.info.state == VmState::Paused {
+            match instance.process.try_wait() {
+                Ok(Some(_)) => {
+                    // Process exited — mark as stopped
+                    instance.info.state = VmState::Stopped;
+                    instance.info.pid = None;
+                }
+                Ok(None) => {} // Still running
+                Err(_) => {
+                    instance.info.state = VmState::Failed;
+                    instance.info.pid = None;
+                }
+            }
+        }
+
         Ok(instance.info.clone())
     }
 
     async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        let mut instances = self.instances.lock().await;
-        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        let socket_path = {
+            let instances = self.instances.lock().await;
+            let instance = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            instance.socket_path.clone()
+        };
 
-        self.fc_put(
-            &instance.socket_path,
+        Self::fc_put(
+            &socket_path,
             "/vm",
             &serde_json::json!({ "state": "Paused" }),
         )
         .await?;
 
-        instance.info.state = VmState::Paused;
+        let mut instances = self.instances.lock().await;
+        if let Some(instance) = instances.get_mut(&id) {
+            instance.info.state = VmState::Paused;
+        }
         Ok(())
     }
 
     async fn resume_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        let mut instances = self.instances.lock().await;
-        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        let socket_path = {
+            let instances = self.instances.lock().await;
+            let instance = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            instance.socket_path.clone()
+        };
 
-        self.fc_put(
-            &instance.socket_path,
+        Self::fc_put(
+            &socket_path,
             "/vm",
             &serde_json::json!({ "state": "Resumed" }),
         )
         .await?;
 
-        instance.info.state = VmState::Running;
+        let mut instances = self.instances.lock().await;
+        if let Some(instance) = instances.get_mut(&id) {
+            instance.info.state = VmState::Running;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_state_display() {
+        assert_eq!(VmState::Creating.to_string(), "creating");
+        assert_eq!(VmState::Running.to_string(), "running");
+        assert_eq!(VmState::Paused.to_string(), "paused");
+        assert_eq!(VmState::Stopped.to_string(), "stopped");
+        assert_eq!(VmState::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn vm_state_json_roundtrip() {
+        for state in [
+            VmState::Creating,
+            VmState::Running,
+            VmState::Paused,
+            VmState::Stopped,
+            VmState::Failed,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let parsed: VmState = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+
+    #[test]
+    fn vm_config_serialization() {
+        let config = VmConfig {
+            name: "test".into(),
+            vcpu_count: 2,
+            mem_size_mib: 256,
+            kernel_path: "/var/lib/husk/kernels/vmlinux".into(),
+            rootfs_path: "/var/lib/husk/images/ubuntu.ext4".into(),
+            kernel_args: None,
+            vsock_cid: 3,
+            tap_device: Some("husk3".into()),
+            guest_mac: Some("AA:FC:00:00:00:03".into()),
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["vcpu_count"], 2);
+        assert_eq!(json["mem_size_mib"], 256);
+        assert!(json["kernel_args"].is_null());
+        assert_eq!(json["tap_device"], "husk3");
+    }
+
+    #[test]
+    fn vm_info_serialization() {
+        let id = Uuid::new_v4();
+        let info = VmInfo {
+            id,
+            name: "myvm".into(),
+            state: VmState::Running,
+            pid: Some(1234),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 5,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["name"], "myvm");
+        assert_eq!(json["state"], "running");
+        assert_eq!(json["pid"], 1234);
+        assert_eq!(json["vsock_cid"], 5);
+
+        let parsed: VmInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.state, VmState::Running);
+    }
+
+    #[test]
+    fn path_to_str_valid() {
+        let path = Path::new("/tmp/test.sock");
+        assert_eq!(
+            FirecrackerBackend::path_to_str(path, "test").unwrap(),
+            "/tmp/test.sock"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+
+        // Manually insert a fake instance
+        let id = Uuid::new_v4();
+        let instance = FcInstance {
+            info: VmInfo {
+                id,
+                name: "existing".into(),
+                state: VmState::Running,
+                pid: Some(999),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 3,
+            },
+            socket_path: dir.path().join("fake.sock"),
+            vsock_path: dir.path().join("fake.vsock"),
+            log_path: dir.path().join("fake.log"),
+            process: tokio::process::Command::new("true").spawn().unwrap(),
+        };
+        backend.instances.lock().await.insert(id, instance);
+
+        let config = VmConfig {
+            name: "existing".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/tmp/vmlinux".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_args: None,
+            vsock_cid: 4,
+            tap_device: None,
+            guest_mac: None,
+        };
+
+        let err = backend.create_vm(config).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::VmAlreadyExists(ref name) if name == "existing"),
+            "expected VmAlreadyExists, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let id = Uuid::new_v4();
+
+        assert!(matches!(
+            backend.vm_info(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.stop_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.destroy_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.pause_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.resume_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn destroy_cleans_up_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+
+        let id = Uuid::new_v4();
+        let socket_path = dir.path().join("test.sock");
+        let vsock_path = dir.path().join("test.vsock");
+        let log_path = dir.path().join("test.log");
+
+        // Create the files
+        tokio::fs::write(&socket_path, b"").await.unwrap();
+        tokio::fs::write(&vsock_path, b"").await.unwrap();
+        tokio::fs::write(&log_path, b"").await.unwrap();
+
+        let instance = FcInstance {
+            info: VmInfo {
+                id,
+                name: "cleanup-test".into(),
+                state: VmState::Running,
+                pid: Some(999),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 3,
+            },
+            socket_path: socket_path.clone(),
+            vsock_path: vsock_path.clone(),
+            log_path: log_path.clone(),
+            process: tokio::process::Command::new("true").spawn().unwrap(),
+        };
+        backend.instances.lock().await.insert(id, instance);
+
+        backend.destroy_vm(id).await.unwrap();
+
+        assert!(!socket_path.exists());
+        assert!(!vsock_path.exists());
+        assert!(!log_path.exists());
+    }
+
+    #[tokio::test]
+    async fn vm_info_detects_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+
+        let id = Uuid::new_v4();
+        // Spawn a process that exits immediately
+        let process = tokio::process::Command::new("true").spawn().unwrap();
+
+        let instance = FcInstance {
+            info: VmInfo {
+                id,
+                name: "dead-test".into(),
+                state: VmState::Running,
+                pid: process.id(),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 3,
+            },
+            socket_path: dir.path().join("test.sock"),
+            vsock_path: dir.path().join("test.vsock"),
+            log_path: dir.path().join("test.log"),
+            process,
+        };
+        backend.instances.lock().await.insert(id, instance);
+
+        // Give the process time to exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let info = backend.vm_info(id).await.unwrap();
+        assert_eq!(info.state, VmState::Stopped);
+        assert!(info.pid.is_none());
     }
 }
