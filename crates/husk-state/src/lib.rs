@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -14,6 +15,8 @@ pub enum StateError {
     VmNotFound(Uuid),
     #[error("VM not found by name: {0}")]
     VmNotFoundByName(String),
+    #[error("VM already exists: {0}")]
+    VmAlreadyExists(String),
     #[error("lock poisoned")]
     LockPoisoned,
     #[error("IO error: {0}")]
@@ -100,12 +103,18 @@ impl StateStore {
                 next_cid INTEGER NOT NULL DEFAULT 3
             );
 
-            INSERT OR IGNORE INTO cid_allocator (id, next_cid) VALUES (1, 3);",
+            INSERT OR IGNORE INTO cid_allocator (id, next_cid) VALUES (1, 3);
+
+            CREATE TABLE IF NOT EXISTS freed_cids (
+                cid INTEGER PRIMARY KEY
+            );",
         )?;
         Ok(())
     }
 
     /// Insert a new VM record.
+    ///
+    /// Returns `StateError::VmAlreadyExists` if a VM with the same name exists.
     pub fn insert_vm(&self, record: &VmRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
         conn.execute(
@@ -129,7 +138,15 @@ impl StateStore {
                 record.created_at.to_rfc3339(),
                 record.updated_at.to_rfc3339(),
             ],
-        )?;
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::VmAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
         Ok(())
     }
 
@@ -197,19 +214,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Update a VM's PID.
-    pub fn update_vm_pid(&self, id: Uuid, pid: Option<u32>) -> Result<(), StateError> {
-        let conn = self.lock()?;
-        let updated = conn.execute(
-            "UPDATE vms SET pid = ?1, updated_at = ?2 WHERE id = ?3",
-            params![pid, Utc::now().to_rfc3339(), id.to_string()],
-        )?;
-        if updated == 0 {
-            return Err(StateError::VmNotFound(id));
-        }
-        Ok(())
-    }
-
     /// Delete a VM record.
     pub fn delete_vm(&self, id: Uuid) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -221,18 +225,55 @@ impl StateStore {
     }
 
     /// Allocate the next vsock CID.
+    ///
+    /// Reuses previously released CIDs (lowest first) before incrementing.
+    /// CIDs start at 3 (0=hypervisor, 1=reserved, 2=host).
     pub fn allocate_cid(&self) -> Result<u32, StateError> {
-        let conn = self.lock()?;
-        let cid: u32 = conn.query_row(
-            "SELECT next_cid FROM cid_allocator WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "UPDATE cid_allocator SET next_cid = next_cid + 1 WHERE id = 1",
-            [],
-        )?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // Try freed CIDs first (lowest available)
+        let freed: Option<u32> = tx
+            .query_row(
+                "SELECT cid FROM freed_cids ORDER BY cid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let cid = if let Some(cid) = freed {
+            tx.execute("DELETE FROM freed_cids WHERE cid = ?1", params![cid])?;
+            debug!(cid, "reusing freed CID");
+            cid
+        } else {
+            let cid: u32 = tx.query_row(
+                "SELECT next_cid FROM cid_allocator WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE cid_allocator SET next_cid = next_cid + 1 WHERE id = 1",
+                [],
+            )?;
+            debug!(cid, "allocated new CID");
+            cid
+        };
+
+        tx.commit()?;
         Ok(cid)
+    }
+
+    /// Release a vsock CID back to the pool.
+    ///
+    /// Idempotent — releasing an already-freed CID is a no-op.
+    pub fn release_cid(&self, cid: u32) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO freed_cids (cid) VALUES (?1)",
+            params![cid],
+        )?;
+        debug!(cid, "released CID");
+        Ok(())
     }
 }
 
@@ -377,5 +418,127 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let result = store.get_vm_by_name("nonexistent");
         assert!(matches!(result, Err(StateError::VmNotFoundByName(_))));
+    }
+
+    // ── CID Recycling ──────────────────────────────────────────────────
+
+    #[test]
+    fn cid_release_and_reuse() {
+        let store = StateStore::open_memory().unwrap();
+        let cid1 = store.allocate_cid().unwrap(); // 3
+        let cid2 = store.allocate_cid().unwrap(); // 4
+        assert_eq!(cid1, 3);
+        assert_eq!(cid2, 4);
+
+        // Release CID 3
+        store.release_cid(cid1).unwrap();
+
+        // Next allocation reuses CID 3
+        let reused = store.allocate_cid().unwrap();
+        assert_eq!(reused, 3);
+
+        // Then fresh CID 5
+        let fresh = store.allocate_cid().unwrap();
+        assert_eq!(fresh, 5);
+    }
+
+    #[test]
+    fn cid_release_reuses_lowest() {
+        let store = StateStore::open_memory().unwrap();
+        let cid3 = store.allocate_cid().unwrap(); // 3
+        let _cid4 = store.allocate_cid().unwrap(); // 4
+        let cid5 = store.allocate_cid().unwrap(); // 5
+
+        // Release 5 then 3
+        store.release_cid(cid5).unwrap();
+        store.release_cid(cid3).unwrap();
+
+        // Lowest freed (3) is reused first
+        assert_eq!(store.allocate_cid().unwrap(), 3);
+        assert_eq!(store.allocate_cid().unwrap(), 5);
+        // Then fresh
+        assert_eq!(store.allocate_cid().unwrap(), 6);
+    }
+
+    #[test]
+    fn cid_double_release_is_idempotent() {
+        let store = StateStore::open_memory().unwrap();
+        let cid = store.allocate_cid().unwrap();
+
+        store.release_cid(cid).unwrap();
+        // Double release should not error
+        store.release_cid(cid).unwrap();
+
+        // Only allocated once on reuse
+        assert_eq!(store.allocate_cid().unwrap(), cid);
+        // Next is fresh, not cid again
+        assert_eq!(store.allocate_cid().unwrap(), 4);
+    }
+
+    // ── Duplicate Name ─────────────────────────────────────────────────
+
+    #[test]
+    fn duplicate_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_vm(&make_record("dup")).unwrap();
+
+        let mut dup = make_record("dup");
+        dup.id = Uuid::new_v4(); // different ID, same name
+        let err = store.insert_vm(&dup).unwrap_err();
+        assert!(
+            matches!(err, StateError::VmAlreadyExists(ref name) if name == "dup"),
+            "expected VmAlreadyExists, got: {err}"
+        );
+    }
+
+    // ── Update / Delete Edge Cases ─────────────────────────────────────
+
+    #[test]
+    fn update_state_nonexistent_vm() {
+        let store = StateStore::open_memory().unwrap();
+        let result = store.update_vm_state(Uuid::new_v4(), "stopped");
+        assert!(matches!(result, Err(StateError::VmNotFound(_))));
+    }
+
+    #[test]
+    fn delete_nonexistent_vm() {
+        let store = StateStore::open_memory().unwrap();
+        let result = store.delete_vm(Uuid::new_v4());
+        assert!(matches!(result, Err(StateError::VmNotFound(_))));
+    }
+
+    #[test]
+    fn update_state_updates_timestamp() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("ts-update");
+        store.insert_vm(&rec).unwrap();
+
+        let before = store.get_vm(rec.id).unwrap().updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.update_vm_state(rec.id, "stopped").unwrap();
+        let after = store.get_vm(rec.id).unwrap().updated_at;
+
+        assert!(after >= before);
+    }
+
+    // ── File-backed Store ──────────────────────────────────────────────
+
+    #[test]
+    fn file_backed_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let id;
+        {
+            let store = StateStore::open(&db_path).unwrap();
+            let rec = make_record("persistent");
+            id = rec.id;
+            store.insert_vm(&rec).unwrap();
+        }
+
+        // Reopen and verify data persists
+        let store = StateStore::open(&db_path).unwrap();
+        let fetched = store.get_vm(id).unwrap();
+        assert_eq!(fetched.name, "persistent");
     }
 }

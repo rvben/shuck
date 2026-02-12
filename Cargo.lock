@@ -608,7 +608,9 @@ dependencies = [
  "chrono",
  "rusqlite",
  "serde",
+ "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 

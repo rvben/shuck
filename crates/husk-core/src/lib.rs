@@ -146,6 +146,8 @@ impl HuskCore {
             let _ = self.ip_allocator.release(host_ip);
         }
 
+        self.state.release_cid(record.vsock_cid)?;
+
         let vm_dir = self.storage.vm_dir(&record.name);
         let _ = tokio::fs::remove_dir_all(&vm_dir).await;
 
