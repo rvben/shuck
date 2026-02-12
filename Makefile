@@ -1,4 +1,6 @@
-.PHONY: build build-release build-agent test test-unit lint fmt check clean install
+.PHONY: all build build-release build-agent test test-unit lint fmt fmt-check clippy check clean install run-daemon
+
+all: lint test
 
 # Build all crates (debug)
 build:
