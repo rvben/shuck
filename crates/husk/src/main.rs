@@ -430,15 +430,77 @@ fn parse_cp_path(s: &str) -> CpPath {
     CpPath::Local(PathBuf::from(s))
 }
 
+fn load_config(path: &Path) -> Config {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
+            eprintln!("Warning: invalid config file: {e}");
+            Config::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read config file {}: {e}",
+                path.display()
+            );
+            Config::default()
+        }
+    }
+}
+
+async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
+    tracing::info!("starting husk daemon");
+
+    let runtime_dir = config.data_dir.join("run");
+    let db_path = config.data_dir.join("husk.db");
+
+    // Ensure directories exist
+    std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
+    std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
+
+    // Initialize subsystems
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(&config.firecracker_bin, &runtime_dir);
+
+    let state = husk_state::StateStore::open(&db_path).context("opening state database")?;
+
+    let ip_allocator = husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 16);
+
+    let storage = husk_storage::StorageConfig {
+        data_dir: config.data_dir,
+    };
+
+    // Initialize nftables (non-fatal on macOS / non-root)
+    if let Err(e) = husk_net::init_nat().await {
+        tracing::warn!("failed to initialize nftables: {e} (VM networking may not work)");
+    }
+
+    let core = Arc::new(husk_core::HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        runtime_dir.clone(),
+        config.host_interface,
+    ));
+
+    husk_api::serve(core, listen).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_cp_path_local() {
-        assert!(matches!(parse_cp_path("/tmp/file.txt"), CpPath::Local(p) if p == PathBuf::from("/tmp/file.txt")));
-        assert!(matches!(parse_cp_path("relative.txt"), CpPath::Local(p) if p == PathBuf::from("relative.txt")));
-        assert!(matches!(parse_cp_path("./dir/file"), CpPath::Local(p) if p == PathBuf::from("./dir/file")));
+        assert!(
+            matches!(parse_cp_path("/tmp/file.txt"), CpPath::Local(p) if p == Path::new("/tmp/file.txt"))
+        );
+        assert!(
+            matches!(parse_cp_path("relative.txt"), CpPath::Local(p) if p == Path::new("relative.txt"))
+        );
+        assert!(
+            matches!(parse_cp_path("./dir/file"), CpPath::Local(p) if p == Path::new("./dir/file"))
+        );
     }
 
     #[test]
@@ -498,60 +560,4 @@ mod tests {
         assert!(parse_octal_mode("abc").is_err());
         assert!(parse_octal_mode("").is_err());
     }
-}
-
-fn load_config(path: &Path) -> Config {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
-            eprintln!("Warning: invalid config file: {e}");
-            Config::default()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(e) => {
-            eprintln!(
-                "Warning: could not read config file {}: {e}",
-                path.display()
-            );
-            Config::default()
-        }
-    }
-}
-
-async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
-    tracing::info!("starting husk daemon");
-
-    let runtime_dir = config.data_dir.join("run");
-    let db_path = config.data_dir.join("husk.db");
-
-    // Ensure directories exist
-    std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
-    std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
-
-    // Initialize subsystems
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(&config.firecracker_bin, &runtime_dir);
-
-    let state = husk_state::StateStore::open(&db_path).context("opening state database")?;
-
-    let ip_allocator = husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 16);
-
-    let storage = husk_storage::StorageConfig {
-        data_dir: config.data_dir,
-    };
-
-    // Initialize nftables (non-fatal on macOS / non-root)
-    if let Err(e) = husk_net::init_nat().await {
-        tracing::warn!("failed to initialize nftables: {e} (VM networking may not work)");
-    }
-
-    let core = Arc::new(husk_core::HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        runtime_dir.clone(),
-        config.host_interface,
-    ));
-
-    husk_api::serve(core, listen).await?;
-    Ok(())
 }
