@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 
 #[derive(Parser)]
 #[command(name = "husk", about = "An open source microVM manager", version)]
@@ -50,6 +51,10 @@ enum Commands {
         /// Memory in MiB
         #[arg(long, default_value = "128")]
         memory: u32,
+
+        /// Path to userdata script to execute after VM boots
+        #[arg(long)]
+        userdata: Option<PathBuf>,
     },
 
     /// List running VMs
@@ -105,6 +110,42 @@ enum Commands {
         #[arg(long, value_parser = parse_octal_mode)]
         mode: Option<u32>,
     },
+
+    /// Manage port forwards for a VM
+    #[command(alias = "pf")]
+    PortForward {
+        /// VM name
+        name: String,
+        #[command(subcommand)]
+        action: PortForwardAction,
+    },
+
+    /// Open an interactive shell in a VM
+    Shell {
+        /// VM name
+        name: String,
+        /// Shell command (default: /bin/sh)
+        #[arg(long)]
+        command: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PortForwardAction {
+    /// Add a port forward
+    Add {
+        /// Host port
+        host_port: u16,
+        /// Guest port
+        guest_port: u16,
+    },
+    /// Remove a port forward
+    Remove {
+        /// Host port
+        host_port: u16,
+    },
+    /// List port forwards
+    List,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +209,7 @@ async fn main() -> Result<()> {
             kernel,
             cpus,
             memory,
+            userdata,
         } => {
             let config = load_config(&cli.config);
             let kernel = kernel.unwrap_or(config.default_kernel);
@@ -195,6 +237,87 @@ async fn main() -> Result<()> {
                 println!("  State: {}", vm["state"]);
                 println!("  CPUs:  {}", vm["vcpu_count"]);
                 println!("  RAM:   {} MiB", vm["mem_size_mib"]);
+
+                if let Some(ref userdata_path) = userdata {
+                    println!(
+                        "Running userdata script: {}",
+                        userdata_path.display()
+                    );
+                    let script = std::fs::read(userdata_path).with_context(|| {
+                        format!("reading userdata script {}", userdata_path.display())
+                    })?;
+                    let encoded = husk_agent_proto::base64_encode(&script);
+
+                    let write_body = serde_json::json!({
+                        "path": "/tmp/husk-userdata.sh",
+                        "data": encoded,
+                        "mode": 0o755_u32,
+                    });
+
+                    // Wait for agent to be ready
+                    let mut agent_ready = false;
+                    for attempt in 0..30 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let check = client
+                            .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
+                            .json(&serde_json::json!({"command": "true", "args": []}))
+                            .send()
+                            .await;
+                        if let Ok(r) = check
+                            && r.status().is_success()
+                        {
+                            agent_ready = true;
+                            break;
+                        }
+                        if attempt % 5 == 4 {
+                            eprintln!("Waiting for agent to be ready...");
+                        }
+                    }
+
+                    if !agent_ready {
+                        eprintln!("Warning: agent not ready, skipping userdata script");
+                    } else {
+                        // Write the script into the VM
+                        let resp = client
+                            .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
+                            .json(&write_body)
+                            .send()
+                            .await
+                            .context("writing userdata script")?;
+
+                        if !resp.status().is_success() {
+                            eprintln!("Warning: failed to write userdata script");
+                        } else {
+                            // Execute it
+                            let exec_body = serde_json::json!({
+                                "command": "sh",
+                                "args": ["/tmp/husk-userdata.sh"],
+                            });
+                            let resp = client
+                                .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
+                                .json(&exec_body)
+                                .send()
+                                .await
+                                .context("executing userdata script")?;
+
+                            if resp.status().is_success() {
+                                let result: serde_json::Value = resp.json().await?;
+                                let exit_code =
+                                    result["exit_code"].as_i64().unwrap_or(-1);
+                                if exit_code != 0 {
+                                    eprintln!(
+                                        "Warning: userdata script exited with code {}",
+                                        exit_code
+                                    );
+                                } else {
+                                    println!("Userdata script completed successfully");
+                                }
+                            } else {
+                                eprintln!("Warning: failed to execute userdata script");
+                            }
+                        }
+                    }
+                }
             } else {
                 let err: serde_json::Value = resp.json().await?;
                 eprintln!("Error: {}", err["error"]);
@@ -404,6 +527,141 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::PortForward { name, action } => {
+            let client = reqwest::Client::new();
+            match action {
+                PortForwardAction::Add {
+                    host_port,
+                    guest_port,
+                } => {
+                    let resp = client
+                        .post(format!("{}/v1/vms/{name}/ports", cli.api_url))
+                        .json(&serde_json::json!({
+                            "host_port": host_port,
+                            "guest_port": guest_port,
+                        }))
+                        .send()
+                        .await
+                        .context("connecting to daemon")?;
+                    if resp.status().is_success() {
+                        println!("Port forward added: {host_port} -> {name}:{guest_port}");
+                    } else {
+                        let err: serde_json::Value = resp.json().await?;
+                        eprintln!("Error: {}", err["error"]);
+                        std::process::exit(1);
+                    }
+                }
+                PortForwardAction::Remove { host_port } => {
+                    let resp = client
+                        .delete(format!(
+                            "{}/v1/vms/{name}/ports/{host_port}",
+                            cli.api_url
+                        ))
+                        .send()
+                        .await
+                        .context("connecting to daemon")?;
+                    if resp.status().is_success() {
+                        println!("Port forward removed: {host_port}");
+                    } else {
+                        let err: serde_json::Value = resp.json().await?;
+                        eprintln!("Error: {}", err["error"]);
+                        std::process::exit(1);
+                    }
+                }
+                PortForwardAction::List => {
+                    let resp = client
+                        .get(format!("{}/v1/vms/{name}/ports", cli.api_url))
+                        .send()
+                        .await
+                        .context("connecting to daemon")?;
+                    if resp.status().is_success() {
+                        let forwards: Vec<serde_json::Value> = resp.json().await?;
+                        if forwards.is_empty() {
+                            println!("No port forwards for {name}");
+                        } else {
+                            println!(
+                                "{:<12} {:<12} {:<10}",
+                                "HOST PORT", "GUEST PORT", "PROTOCOL"
+                            );
+                            for pf in forwards {
+                                println!(
+                                    "{:<12} {:<12} {:<10}",
+                                    pf["host_port"],
+                                    pf["guest_port"],
+                                    pf["protocol"].as_str().unwrap_or("tcp"),
+                                );
+                            }
+                        }
+                    } else {
+                        let err: serde_json::Value = resp.json().await?;
+                        eprintln!("Error: {}", err["error"]);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Commands::Shell { name, command } => {
+            // Get VM info to find the vsock path
+            let client = reqwest::Client::new();
+            let resp = client
+                .get(format!("{}/v1/vms/{name}", cli.api_url))
+                .send()
+                .await
+                .context("connecting to daemon")?;
+
+            if !resp.status().is_success() {
+                let err: serde_json::Value = resp.json().await?;
+                eprintln!("Error: {}", err["error"]);
+                std::process::exit(1);
+            }
+
+            let vm: serde_json::Value = resp.json().await?;
+            let vm_id = vm["id"].as_str().context("missing VM id")?;
+
+            let config = load_config(&cli.config);
+            let runtime_dir = config.data_dir.join("run");
+            let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
+
+            // Connect to agent
+            let mut conn = husk_core::AgentClient::connect(
+                &vsock_path,
+                husk_agent_proto::AGENT_VSOCK_PORT,
+            )
+            .await
+            .context("connecting to agent")?;
+
+            // Get terminal size
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+            // Start shell
+            conn.shell_start(command.as_deref(), cols, rows)
+                .await
+                .context("starting shell")?;
+
+            // Enable raw mode
+            crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+
+            // Bidirectional bridge
+            let result = run_shell_bridge(&mut conn).await;
+
+            // Restore terminal
+            crossterm::terminal::disable_raw_mode().ok();
+            println!();
+
+            match result {
+                Ok(exit_code) => {
+                    if exit_code != 0 {
+                        std::process::exit(exit_code);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Shell error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -428,6 +686,39 @@ fn parse_cp_path(s: &str) -> CpPath {
         }
     }
     CpPath::Local(PathBuf::from(s))
+}
+
+async fn run_shell_bridge(
+    conn: &mut husk_core::AgentConnection<tokio::net::UnixStream>,
+) -> Result<i32> {
+    let mut stdin = tokio::io::stdin();
+    let mut stdin_buf = vec![0u8; 1024];
+
+    loop {
+        tokio::select! {
+            result = stdin.read(&mut stdin_buf) => {
+                match result {
+                    Ok(0) => return Ok(0),
+                    Ok(n) => {
+                        conn.shell_send(&stdin_buf[..n]).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            event = conn.shell_recv() => {
+                match event? {
+                    husk_core::ShellEvent::Data(data) => {
+                        use std::io::Write;
+                        std::io::stdout().write_all(&data)?;
+                        std::io::stdout().flush()?;
+                    }
+                    husk_core::ShellEvent::Exit(code) => {
+                        return Ok(code);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn load_config(path: &Path) -> Config {

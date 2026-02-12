@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use husk_core::agent_client::{AgentClient, AgentConnection};
+use husk_core::ShellEvent;
 
 /// Spawn the agent handler on a temporary Unix socket.
 async fn spawn_agent() -> (tempfile::TempDir, PathBuf) {
@@ -363,4 +364,138 @@ async fn exec_mixed_stdout_stderr() {
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stdout.trim(), "stdout-msg");
     assert_eq!(result.stderr.trim(), "stderr-msg");
+}
+
+// ── Shell Client Integration ────────────────────────────────────────
+
+#[tokio::test]
+async fn shell_start_and_echo_via_cat() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    conn.shell_start(Some("cat"), 80, 24).await.unwrap();
+
+    conn.shell_send(b"hello\n").await.unwrap();
+
+    match conn.shell_recv().await.unwrap() {
+        ShellEvent::Data(data) => assert_eq!(data, b"hello\n"),
+        ShellEvent::Exit(code) => panic!("unexpected exit with code {code}"),
+    }
+}
+
+#[tokio::test]
+async fn shell_with_echo_command() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    // `echo` with no args outputs a newline and exits
+    conn.shell_start(Some("echo"), 80, 24).await.unwrap();
+
+    // Collect all output until exit
+    let mut output = Vec::new();
+    let exit_code = loop {
+        match conn.shell_recv().await.unwrap() {
+            ShellEvent::Data(data) => output.extend(data),
+            ShellEvent::Exit(code) => break code,
+        }
+    };
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, b"\n");
+}
+
+#[tokio::test]
+async fn shell_exit_code() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    conn.shell_start(Some("sh"), 80, 24).await.unwrap();
+
+    // Send exit 42 to the shell
+    conn.shell_send(b"exit 42\n").await.unwrap();
+
+    let exit_code = loop {
+        match conn.shell_recv().await.unwrap() {
+            ShellEvent::Data(_) => {}
+            ShellEvent::Exit(code) => break code,
+        }
+    };
+
+    assert_eq!(exit_code, 42);
+}
+
+#[tokio::test]
+async fn shell_resize_does_not_disrupt_session() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    conn.shell_start(Some("cat"), 80, 24).await.unwrap();
+
+    // Resize should succeed without error
+    conn.shell_resize(120, 40).await.unwrap();
+
+    // Session should still be functional after resize
+    conn.shell_send(b"after-resize\n").await.unwrap();
+
+    match conn.shell_recv().await.unwrap() {
+        ShellEvent::Data(data) => {
+            assert_eq!(data, b"after-resize\n");
+        }
+        ShellEvent::Exit(code) => panic!("unexpected exit with code {code}"),
+    }
+}
+
+#[tokio::test]
+async fn shell_nonexistent_command_returns_error() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    let result = conn
+        .shell_start(Some("nonexistent_cmd_xyz_999"), 80, 24)
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("failed to start shell"),
+        "expected error about shell start, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn shell_bidirectional_data_exchange() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    conn.shell_start(Some("sh"), 80, 24).await.unwrap();
+
+    // Send a command that produces known output
+    conn.shell_send(b"echo MARKER_START && echo MARKER_END\nexit 0\n")
+        .await
+        .unwrap();
+
+    let mut output = Vec::new();
+    let exit_code = loop {
+        match conn.shell_recv().await.unwrap() {
+            ShellEvent::Data(data) => output.extend(data),
+            ShellEvent::Exit(code) => break code,
+        }
+    };
+
+    assert_eq!(exit_code, 0);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("MARKER_START"),
+        "expected MARKER_START in output, got: {text}"
+    );
+    assert!(
+        text.contains("MARKER_END"),
+        "expected MARKER_END in output, got: {text}"
+    );
 }

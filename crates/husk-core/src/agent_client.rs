@@ -2,8 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use husk_agent_proto::{
-    AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, WriteFileRequest, base64_decode,
-    base64_encode, read_message, write_message,
+    AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ShellDataRequest,
+    ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode, base64_encode,
+    read_message, write_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -175,6 +176,67 @@ where
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
+
+    /// Start an interactive shell session.
+    ///
+    /// After calling this, use `shell_send`, `shell_recv`, and `shell_resize`
+    /// to interact with the shell. The connection is no longer usable for
+    /// regular requests after starting a shell.
+    pub async fn shell_start(
+        &mut self,
+        command: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), AgentError> {
+        let request = AgentRequest::ShellStart(ShellStartRequest {
+            command: command.map(Into::into),
+            env: Vec::new(),
+            cols,
+            rows,
+        });
+        write_message(&mut self.stream, &request).await?;
+        let response: AgentResponse = read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?;
+        match response {
+            AgentResponse::ShellStarted => Ok(()),
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// Send stdin data to the shell.
+    pub async fn shell_send(&mut self, data: &[u8]) -> Result<(), AgentError> {
+        let request = AgentRequest::ShellData(ShellDataRequest {
+            data: base64_encode(data),
+        });
+        write_message(&mut self.stream, &request).await?;
+        Ok(())
+    }
+
+    /// Receive output or exit event from the shell.
+    pub async fn shell_recv(&mut self) -> Result<ShellEvent, AgentError> {
+        let response: AgentResponse = read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?;
+        match response {
+            AgentResponse::ShellData(r) => {
+                let data = base64_decode(&r.data)
+                    .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}")))?;
+                Ok(ShellEvent::Data(data))
+            }
+            AgentResponse::ShellExit(r) => Ok(ShellEvent::Exit(r.exit_code)),
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// Resize the shell terminal.
+    pub async fn shell_resize(&mut self, cols: u16, rows: u16) -> Result<(), AgentError> {
+        let request = AgentRequest::ShellResize(ShellResizeRequest { cols, rows });
+        write_message(&mut self.stream, &request).await?;
+        Ok(())
+    }
 }
 
 /// Result of executing a command inside a VM.
@@ -183,4 +245,13 @@ pub struct ExecResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Events received during a shell session.
+#[derive(Debug)]
+pub enum ShellEvent {
+    /// Output data from the shell.
+    Data(Vec<u8>),
+    /// Shell process exited.
+    Exit(i32),
 }

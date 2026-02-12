@@ -11,6 +11,8 @@ husk-agent-proto = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -20,6 +22,4 @@ husk-net = { workspace = true }
 husk-storage = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
 uuid = { workspace = true }

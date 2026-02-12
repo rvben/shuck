@@ -51,6 +51,9 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Terminal
+crossterm = "0.28"
+
 # Hyper for Unix socket HTTP
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }

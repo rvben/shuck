@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub use husk_state::VmRecord;
 pub use husk_vmm::{VmInfo, VmState};
 
-pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult};
+pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, ShellEvent};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -228,6 +228,7 @@ impl HuskCore {
         }
 
         self.state.release_cid(record.vsock_cid)?;
+        self.state.delete_port_forwards_for_vm(record.id)?;
 
         let vm_dir = self.storage.vm_dir(&record.name);
         let _ = tokio::fs::remove_dir_all(&vm_dir).await;
@@ -259,6 +260,79 @@ impl HuskCore {
         debug!(%name, path = %vsock_path.display(), "connecting to agent");
         let conn = AgentClient::connect(&vsock_path, husk_agent_proto::AGENT_VSOCK_PORT).await?;
         Ok(conn)
+    }
+
+    /// Add a port forward from a host port to a guest port on a VM.
+    pub async fn add_port_forward(
+        &self,
+        name: &str,
+        host_port: u16,
+        guest_port: u16,
+    ) -> Result<(), CoreError> {
+        let record = self.lookup_vm(name)?;
+        let guest_ip: std::net::Ipv4Addr = record
+            .guest_ip
+            .as_deref()
+            .ok_or_else(|| CoreError::VmNotFound(format!("{name}: no guest IP")))?
+            .parse()
+            .map_err(|_| CoreError::VmNotFound(format!("{name}: invalid guest IP")))?;
+        let tap_name = record
+            .tap_device
+            .as_deref()
+            .ok_or_else(|| CoreError::VmNotFound(format!("{name}: no TAP device")))?;
+
+        husk_net::add_port_forward(host_port, guest_ip, guest_port, tap_name).await?;
+
+        let pf_record = husk_state::PortForwardRecord {
+            id: 0,
+            vm_id: record.id,
+            host_port,
+            guest_port,
+            protocol: "tcp".into(),
+            created_at: chrono::Utc::now(),
+        };
+        self.state
+            .insert_port_forward(&pf_record)
+            .map_err(|e| match e {
+                husk_state::StateError::PortAlreadyForwarded(port) => {
+                    CoreError::Network(husk_net::NetError::CommandFailed {
+                        cmd: "port forward".into(),
+                        message: format!("host port {port} is already forwarded"),
+                    })
+                }
+                other => CoreError::State(other),
+            })?;
+
+        info!(%name, host_port, guest_port, "port forward added");
+        Ok(())
+    }
+
+    /// Remove a port forward.
+    pub async fn remove_port_forward(
+        &self,
+        name: &str,
+        host_port: u16,
+    ) -> Result<(), CoreError> {
+        let record = self.lookup_vm(name)?;
+        let tap_name = record
+            .tap_device
+            .as_deref()
+            .ok_or_else(|| CoreError::VmNotFound(format!("{name}: no TAP device")))?;
+
+        husk_net::remove_port_forward(host_port, tap_name).await?;
+        self.state.delete_port_forward(host_port)?;
+
+        info!(%name, host_port, "port forward removed");
+        Ok(())
+    }
+
+    /// List port forwards for a VM.
+    pub fn list_port_forwards(
+        &self,
+        name: &str,
+    ) -> Result<Vec<husk_state::PortForwardRecord>, CoreError> {
+        let record = self.lookup_vm(name)?;
+        Ok(self.state.list_port_forwards_for_vm(record.id)?)
     }
 
     fn lookup_vm(&self, name: &str) -> Result<VmRecord, CoreError> {

@@ -7,6 +7,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use axum::routing::delete;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -80,6 +81,22 @@ struct WriteFileResponse {
     bytes_written: u64,
 }
 
+// ── Port Forward Types ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct AddPortForwardRequest {
+    host_port: u16,
+    guest_port: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct PortForwardResponse {
+    host_port: u16,
+    guest_port: u16,
+    protocol: String,
+    created_at: String,
+}
+
 // ── Router ────────────────────────────────────────────────────────────
 
 /// Build the API router.
@@ -91,6 +108,14 @@ pub fn router(core: Arc<HuskCore>) -> Router {
         .route("/v1/vms/{name}/exec", post(exec_vm))
         .route("/v1/vms/{name}/files/read", post(read_file_handler))
         .route("/v1/vms/{name}/files/write", post(write_file_handler))
+        .route(
+            "/v1/vms/{name}/ports",
+            get(list_port_forwards_handler).post(add_port_forward_handler),
+        )
+        .route(
+            "/v1/vms/{name}/ports/{host_port}",
+            delete(remove_port_forward_handler),
+        )
         .route("/v1/health", get(health))
         .layer(axum::middleware::from_fn(trace_request))
         .with_state(core)
@@ -227,6 +252,55 @@ async fn write_file_handler(
         .await
         .map_err(|e| map_error(e.into()))?;
     Ok(Json(WriteFileResponse { bytes_written }))
+}
+
+// ── Port Forward Handlers ─────────────────────────────────────────────
+
+async fn add_port_forward_handler(
+    State(core): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<AddPortForwardRequest>,
+) -> Result<(StatusCode, Json<PortForwardResponse>), (StatusCode, Json<ErrorResponse>)> {
+    core.add_port_forward(&name, req.host_port, req.guest_port)
+        .await
+        .map_err(map_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PortForwardResponse {
+            host_port: req.host_port,
+            guest_port: req.guest_port,
+            protocol: "tcp".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    ))
+}
+
+async fn list_port_forwards_handler(
+    State(core): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<PortForwardResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let forwards = core.list_port_forwards(&name).map_err(map_error)?;
+    Ok(Json(
+        forwards
+            .into_iter()
+            .map(|pf| PortForwardResponse {
+                host_port: pf.host_port,
+                guest_port: pf.guest_port,
+                protocol: pf.protocol,
+                created_at: pf.created_at.to_rfc3339(),
+            })
+            .collect(),
+    ))
+}
+
+async fn remove_port_forward_handler(
+    State(core): State<AppState>,
+    Path((name, host_port)): Path<(String, u16)>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.remove_port_forward(&name, host_port)
+        .await
+        .map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Error Mapping ─────────────────────────────────────────────────────

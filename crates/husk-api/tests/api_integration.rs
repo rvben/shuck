@@ -562,6 +562,154 @@ async fn write_file_missing_data_returns_422() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+// ── Port Forward Endpoints ───────────────────────────────────────────
+
+#[tokio::test]
+async fn add_port_forward_nonexistent_vm_returns_404() {
+    let app = router(test_core());
+    let body = serde_json::json!({
+        "host_port": 8080,
+        "guest_port": 80,
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/vms/ghost/ports")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = response_json(response).await;
+    assert!(json["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn list_port_forwards_nonexistent_vm_returns_404() {
+    let app = router(test_core());
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/ghost/ports")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = response_json(response).await;
+    assert!(json["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn remove_port_forward_nonexistent_vm_returns_404() {
+    let app = router(test_core());
+    let response = app
+        .oneshot(
+            Request::delete("/v1/vms/ghost/ports/8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = response_json(response).await;
+    assert!(json["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn add_port_forward_missing_fields_returns_422() {
+    let app = router(test_core());
+    let body = serde_json::json!({
+        "host_port": 8080,
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/vms/some-vm/ports")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn add_port_forward_invalid_json_returns_400() {
+    let app = router(test_core());
+    let response = app
+        .oneshot(
+            Request::post("/v1/vms/some-vm/ports")
+                .header("content-type", "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_port_forwards_empty_for_existing_vm() {
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let record = husk_state::VmRecord {
+        id: uuid::Uuid::new_v4(),
+        name: "pf-test".into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: Some("husk0".into()),
+        host_ip: Some("172.20.0.1".into()),
+        guest_ip: Some("172.20.0.2".into()),
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+    };
+    state.insert_vm(&record).unwrap();
+
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        PathBuf::from("/tmp"),
+        "eth0".into(),
+    ));
+
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/pf-test/ports")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    let arr = json.as_array().expect("response should be a JSON array");
+    assert!(arr.is_empty());
+}
+
 // ── VmResponse Null Fields ───────────────────────────────────────────
 
 #[tokio::test]
