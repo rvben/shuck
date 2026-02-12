@@ -1,3 +1,5 @@
+pub mod agent_client;
+
 use std::path::PathBuf;
 
 use husk_vmm::VmmBackend;
@@ -6,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 pub use husk_state::VmRecord;
 pub use husk_vmm::{VmInfo, VmState};
+
+pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -19,6 +23,8 @@ pub enum CoreError {
     Storage(#[from] husk_storage::StorageError),
     #[error("state error: {0}")]
     State(#[from] husk_state::StateError),
+    #[error("agent error: {0}")]
+    Agent(#[from] AgentError),
 }
 
 /// Parameters for creating a new VM.
@@ -37,6 +43,7 @@ pub struct HuskCore {
     state: husk_state::StateStore,
     ip_allocator: husk_net::IpAllocator,
     storage: husk_storage::StorageConfig,
+    runtime_dir: PathBuf,
 }
 
 impl HuskCore {
@@ -45,12 +52,14 @@ impl HuskCore {
         state: husk_state::StateStore,
         ip_allocator: husk_net::IpAllocator,
         storage: husk_storage::StorageConfig,
+        runtime_dir: PathBuf,
     ) -> Self {
         Self {
             vmm,
             state,
             ip_allocator,
             storage,
+            runtime_dir,
         }
     }
 
@@ -141,6 +150,19 @@ impl HuskCore {
     /// Get info about a specific VM.
     pub fn get_vm(&self, name: &str) -> Result<husk_state::VmRecord, CoreError> {
         self.lookup_vm(name)
+    }
+
+    /// Connect to the guest agent for a running VM.
+    ///
+    /// Uses the Firecracker vsock UDS proxy path: `{runtime_dir}/{vm_id}.vsock_{port}`.
+    pub async fn agent_connect(
+        &self,
+        name: &str,
+    ) -> Result<AgentConnection<tokio::net::UnixStream>, CoreError> {
+        let record = self.lookup_vm(name)?;
+        let vsock_path = self.runtime_dir.join(format!("{}.vsock", record.id));
+        let conn = AgentClient::connect(&vsock_path, husk_agent_proto::AGENT_VSOCK_PORT).await?;
+        Ok(conn)
     }
 
     fn lookup_vm(&self, name: &str) -> Result<husk_state::VmRecord, CoreError> {

@@ -10,7 +10,13 @@ husk-vmm = { workspace = true }
 husk-net = { workspace = true }
 husk-storage = { workspace = true }
 husk-state = { workspace = true }
+husk-agent-proto = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+husk-agent = { path = "../husk-agent" }
+tempfile = "3"

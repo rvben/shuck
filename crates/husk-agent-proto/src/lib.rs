@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Messages sent from the host to the guest agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,12 +125,139 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Default vsock port the guest agent listens on.
 pub const AGENT_VSOCK_PORT: u32 = 52;
 
+/// Read a single length-prefixed JSON message from an async stream.
+///
+/// Returns `None` on clean EOF (stream closed with no partial data).
+/// Returns an error on truncated messages or protocol violations.
+pub async fn read_message<T, S>(stream: &mut S) -> Result<Option<T>, ProtocolError>
+where
+    T: for<'de> Deserialize<'de>,
+    S: tokio::io::AsyncRead + Unpin,
+{
+    // Read the 4-byte length prefix
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(ProtocolError::MessageTooLarge { size: len });
+    }
+
+    // Read the JSON payload
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+
+    let msg = serde_json::from_slice(&payload)?;
+    Ok(Some(msg))
+}
+
+/// Write a single length-prefixed JSON message to an async stream.
+pub async fn write_message<T, S>(stream: &mut S, msg: &T) -> Result<(), ProtocolError>
+where
+    T: Serialize,
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let json = serde_json::to_vec(msg)?;
+    if json.len() > MAX_MESSAGE_SIZE {
+        return Err(ProtocolError::MessageTooLarge { size: json.len() });
+    }
+    let len = (json.len() as u32).to_be_bytes();
+    stream.write_all(&len).await?;
+    stream.write_all(&json).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("message too large: {size} bytes (max {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { size: usize },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// --- Base64 encoding/decoding ---
+// Both the guest agent and host-side client need base64 for file transfer.
+
+const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn base64_encode(data: &[u8]) -> String {
+    let mut output = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+
+    while i + 2 < data.len() {
+        output.push(B64_CHARS[(data[i] >> 2) as usize]);
+        output.push(B64_CHARS[(((data[i] & 0x03) << 4) | (data[i + 1] >> 4)) as usize]);
+        output.push(B64_CHARS[(((data[i + 1] & 0x0f) << 2) | (data[i + 2] >> 6)) as usize]);
+        output.push(B64_CHARS[(data[i + 2] & 0x3f) as usize]);
+        i += 3;
+    }
+
+    let remaining = data.len() - i;
+    match remaining {
+        1 => {
+            output.push(B64_CHARS[(data[i] >> 2) as usize]);
+            output.push(B64_CHARS[((data[i] & 0x03) << 4) as usize]);
+            output.push(b'=');
+            output.push(b'=');
+        }
+        2 => {
+            output.push(B64_CHARS[(data[i] >> 2) as usize]);
+            output.push(B64_CHARS[(((data[i] & 0x03) << 4) | (data[i + 1] >> 4)) as usize]);
+            output.push(B64_CHARS[((data[i + 1] & 0x0f) << 2) as usize]);
+            output.push(b'=');
+        }
+        _ => {}
+    }
+
+    // B64_CHARS only contains ASCII bytes, so this is always valid UTF-8
+    String::from_utf8(output).expect("base64 output is always valid UTF-8")
+}
+
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let input = input.as_bytes();
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+
+    let decode_char = |c: u8| -> Result<u8, String> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            b'=' => Ok(0),
+            _ => Err(format!("invalid base64 character: {c}")),
+        }
+    };
+
+    let mut i = 0;
+    while i < input.len() {
+        if i + 4 > input.len() {
+            return Err("invalid base64 length".into());
+        }
+        let a = decode_char(input[i])?;
+        let b = decode_char(input[i + 1])?;
+        let c = decode_char(input[i + 2])?;
+        let d = decode_char(input[i + 3])?;
+
+        output.push((a << 2) | (b >> 4));
+        if input[i + 2] != b'=' {
+            output.push((b << 4) | (c >> 2));
+        }
+        if input[i + 3] != b'=' {
+            output.push((c << 6) | d);
+        }
+
+        i += 4;
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -192,5 +320,68 @@ mod tests {
         buf[..4].copy_from_slice(&bogus_len);
         let result: Result<Option<(AgentRequest, usize)>, _> = decode_message(&buf);
         assert!(matches!(result, Err(ProtocolError::MessageTooLarge { .. })));
+    }
+
+    #[test]
+    fn base64_roundtrip_empty() {
+        let data = b"";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_roundtrip_one_byte() {
+        let data = b"A";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "QQ==");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_roundtrip_two_bytes() {
+        let data = b"AB";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "QUI=");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_roundtrip_three_bytes() {
+        let data = b"ABC";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "QUJD");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_roundtrip_hello_world() {
+        let data = b"Hello, World!";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "SGVsbG8sIFdvcmxkIQ==");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_roundtrip_binary_data() {
+        let data: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&data);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_decode_invalid_length() {
+        assert!(base64_decode("QQ=").is_err());
+    }
+
+    #[test]
+    fn base64_decode_invalid_char() {
+        assert!(base64_decode("QQ!=").is_err());
     }
 }

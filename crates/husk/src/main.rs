@@ -293,7 +293,13 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         data_dir: config.data_dir,
     };
 
-    let core = Arc::new(husk_core::HuskCore::new(vmm, state, ip_allocator, storage));
+    let core = Arc::new(husk_core::HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        runtime_dir.clone(),
+    ));
 
     husk_api::serve(core, listen).await?;
     Ok(())
