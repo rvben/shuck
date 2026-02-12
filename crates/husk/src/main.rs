@@ -84,6 +84,8 @@ struct Config {
     data_dir: PathBuf,
     #[serde(default = "default_kernel_path")]
     default_kernel: PathBuf,
+    #[serde(default = "default_host_interface")]
+    host_interface: String,
 }
 
 fn default_firecracker_bin() -> PathBuf {
@@ -98,12 +100,17 @@ fn default_kernel_path() -> PathBuf {
     PathBuf::from("/var/lib/husk/kernels/vmlinux")
 }
 
+fn default_host_interface() -> String {
+    "eth0".into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             firecracker_bin: default_firecracker_bin(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
+            host_interface: default_host_interface(),
         }
     }
 }
@@ -293,12 +300,18 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         data_dir: config.data_dir,
     };
 
+    // Initialize nftables (non-fatal on macOS / non-root)
+    if let Err(e) = husk_net::init_nat().await {
+        tracing::warn!("failed to initialize nftables: {e} (VM networking may not work)");
+    }
+
     let core = Arc::new(husk_core::HuskCore::new(
         vmm,
         state,
         ip_allocator,
         storage,
         runtime_dir.clone(),
+        config.host_interface,
     ));
 
     husk_api::serve(core, listen).await?;

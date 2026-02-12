@@ -595,8 +595,10 @@ dependencies = [
 name = "husk-net"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

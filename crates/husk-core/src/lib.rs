@@ -44,6 +44,7 @@ pub struct HuskCore {
     ip_allocator: husk_net::IpAllocator,
     storage: husk_storage::StorageConfig,
     runtime_dir: PathBuf,
+    host_interface: String,
 }
 
 impl HuskCore {
@@ -53,6 +54,7 @@ impl HuskCore {
         ip_allocator: husk_net::IpAllocator,
         storage: husk_storage::StorageConfig,
         runtime_dir: PathBuf,
+        host_interface: String,
     ) -> Self {
         Self {
             vmm,
@@ -60,6 +62,7 @@ impl HuskCore {
             ip_allocator,
             storage,
             runtime_dir,
+            host_interface,
         }
     }
 
@@ -74,6 +77,7 @@ impl HuskCore {
         let mac = husk_net::generate_mac(cid);
 
         husk_net::create_tap(&tap_name, host_ip).await?;
+        husk_net::add_vm_nat(&tap_name, host_ip, &self.host_interface).await?;
 
         let vm_rootfs = self.storage.vm_dir(&req.name).join("rootfs.ext4");
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
@@ -132,7 +136,14 @@ impl HuskCore {
         self.vmm.destroy_vm(record.id).await?;
 
         if let Some(ref tap) = record.tap_device {
+            let _ = husk_net::remove_vm_nat(tap).await;
             let _ = husk_net::delete_tap(tap).await;
+        }
+
+        if let Some(ref host_ip_str) = record.host_ip
+            && let Ok(host_ip) = host_ip_str.parse::<std::net::Ipv4Addr>()
+        {
+            let _ = self.ip_allocator.release(host_ip);
         }
 
         let vm_dir = self.storage.vm_dir(&record.name);
