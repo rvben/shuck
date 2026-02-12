@@ -16,6 +16,7 @@ husk-vmm = { workspace = true }
 husk-net = { workspace = true }
 husk-storage = { workspace = true }
 husk-state = { workspace = true }
+husk-agent-proto = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

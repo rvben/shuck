@@ -74,6 +74,37 @@ enum Commands {
         /// VM name
         name: String,
     },
+
+    /// Execute a command in a VM
+    Exec {
+        /// VM name
+        name: String,
+
+        /// Working directory inside the VM
+        #[arg(long, short = 'w')]
+        workdir: Option<String>,
+
+        /// Command and arguments (after --)
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// Copy files between host and VM
+    ///
+    /// Use vmname:/path syntax for VM paths:
+    ///   husk cp local.txt myvm:/tmp/local.txt
+    ///   husk cp myvm:/var/log/syslog ./syslog
+    Cp {
+        /// Source (local path or vmname:/guest/path)
+        source: String,
+
+        /// Destination (local path or vmname:/guest/path)
+        dest: String,
+
+        /// File mode (octal, e.g. 755) when copying to VM
+        #[arg(long, value_parser = parse_octal_mode)]
+        mode: Option<u32>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +290,213 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Exec {
+            name,
+            workdir,
+            command,
+        } => {
+            let (cmd, args) = command.split_first().context("command required after --")?;
+
+            let mut body = serde_json::json!({
+                "command": cmd,
+                "args": args,
+            });
+            if let Some(ref wd) = workdir {
+                body["working_dir"] = serde_json::json!(wd);
+            }
+
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
+                .json(&body)
+                .send()
+                .await
+                .context("connecting to daemon")?;
+
+            if resp.status().is_success() {
+                let result: serde_json::Value = resp.json().await?;
+                let stdout = result["stdout"].as_str().unwrap_or("");
+                let stderr = result["stderr"].as_str().unwrap_or("");
+                if !stdout.is_empty() {
+                    print!("{stdout}");
+                }
+                if !stderr.is_empty() {
+                    eprint!("{stderr}");
+                }
+                let exit_code = result["exit_code"].as_i64().unwrap_or(1) as i32;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+            } else {
+                let err: serde_json::Value = resp.json().await?;
+                eprintln!("Error: {}", err["error"]);
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Commands::Cp { source, dest, mode } => {
+            let src = parse_cp_path(&source);
+            let dst = parse_cp_path(&dest);
+
+            match (src, dst) {
+                (CpPath::Local(local), CpPath::Vm { name, path }) => {
+                    let data = std::fs::read(&local)
+                        .with_context(|| format!("reading {}", local.display()))?;
+                    let encoded = husk_agent_proto::base64_encode(&data);
+
+                    let mut body = serde_json::json!({
+                        "path": path,
+                        "data": encoded,
+                    });
+                    if let Some(m) = mode {
+                        body["mode"] = serde_json::json!(m);
+                    }
+
+                    let client = reqwest::Client::new();
+                    let resp = client
+                        .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
+                        .json(&body)
+                        .send()
+                        .await
+                        .context("connecting to daemon")?;
+
+                    if resp.status().is_success() {
+                        let result: serde_json::Value = resp.json().await?;
+                        let bytes = result["bytes_written"].as_u64().unwrap_or(0);
+                        println!("{bytes} bytes copied to {name}:{path}");
+                    } else {
+                        let err: serde_json::Value = resp.json().await?;
+                        eprintln!("Error: {}", err["error"]);
+                        std::process::exit(1);
+                    }
+                }
+                (CpPath::Vm { name, path }, CpPath::Local(local)) => {
+                    let client = reqwest::Client::new();
+                    let resp = client
+                        .post(format!("{}/v1/vms/{name}/files/read", cli.api_url))
+                        .json(&serde_json::json!({ "path": path }))
+                        .send()
+                        .await
+                        .context("connecting to daemon")?;
+
+                    if resp.status().is_success() {
+                        let result: serde_json::Value = resp.json().await?;
+                        let b64 = result["data"].as_str().unwrap_or("");
+                        let data = husk_agent_proto::base64_decode(b64)
+                            .map_err(|e| anyhow::anyhow!("invalid base64 from server: {e}"))?;
+                        std::fs::write(&local, &data)
+                            .with_context(|| format!("writing {}", local.display()))?;
+                        println!("{} bytes copied from {name}:{path}", data.len());
+                    } else {
+                        let err: serde_json::Value = resp.json().await?;
+                        eprintln!("Error: {}", err["error"]);
+                        std::process::exit(1);
+                    }
+                }
+                (CpPath::Local(_), CpPath::Local(_)) => {
+                    anyhow::bail!(
+                        "both source and destination are local paths; prefix one with vmname:"
+                    );
+                }
+                (CpPath::Vm { .. }, CpPath::Vm { .. }) => {
+                    anyhow::bail!("VM-to-VM copy is not supported; copy to local first");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+enum CpPath {
+    Local(PathBuf),
+    Vm { name: String, path: String },
+}
+
+fn parse_octal_mode(s: &str) -> Result<u32, String> {
+    u32::from_str_radix(s, 8).map_err(|e| format!("invalid octal mode: {e}"))
+}
+
+fn parse_cp_path(s: &str) -> CpPath {
+    if let Some(colon_pos) = s.find(':') {
+        let name = &s[..colon_pos];
+        let path = &s[colon_pos + 1..];
+        if !name.is_empty() && !path.is_empty() {
+            return CpPath::Vm {
+                name: name.to_string(),
+                path: path.to_string(),
+            };
+        }
+    }
+    CpPath::Local(PathBuf::from(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cp_path_local() {
+        assert!(matches!(parse_cp_path("/tmp/file.txt"), CpPath::Local(p) if p == PathBuf::from("/tmp/file.txt")));
+        assert!(matches!(parse_cp_path("relative.txt"), CpPath::Local(p) if p == PathBuf::from("relative.txt")));
+        assert!(matches!(parse_cp_path("./dir/file"), CpPath::Local(p) if p == PathBuf::from("./dir/file")));
+    }
+
+    #[test]
+    fn parse_cp_path_vm() {
+        match parse_cp_path("myvm:/tmp/file.txt") {
+            CpPath::Vm { name, path } => {
+                assert_eq!(name, "myvm");
+                assert_eq!(path, "/tmp/file.txt");
+            }
+            CpPath::Local(_) => panic!("expected Vm"),
+        }
+    }
+
+    #[test]
+    fn parse_cp_path_vm_relative_guest_path() {
+        match parse_cp_path("myvm:relative/path") {
+            CpPath::Vm { name, path } => {
+                assert_eq!(name, "myvm");
+                assert_eq!(path, "relative/path");
+            }
+            CpPath::Local(_) => panic!("expected Vm"),
+        }
+    }
+
+    #[test]
+    fn parse_cp_path_multiple_colons() {
+        match parse_cp_path("myvm:/path:with:colons") {
+            CpPath::Vm { name, path } => {
+                assert_eq!(name, "myvm");
+                assert_eq!(path, "/path:with:colons");
+            }
+            CpPath::Local(_) => panic!("expected Vm"),
+        }
+    }
+
+    #[test]
+    fn parse_cp_path_empty_name_is_local() {
+        assert!(matches!(parse_cp_path(":/tmp/file"), CpPath::Local(_)));
+    }
+
+    #[test]
+    fn parse_cp_path_empty_path_is_local() {
+        assert!(matches!(parse_cp_path("vmname:"), CpPath::Local(_)));
+    }
+
+    #[test]
+    fn octal_mode_parsing() {
+        assert_eq!(parse_octal_mode("755").unwrap(), 0o755);
+        assert_eq!(parse_octal_mode("644").unwrap(), 0o644);
+        assert_eq!(parse_octal_mode("777").unwrap(), 0o777);
+        assert_eq!(parse_octal_mode("400").unwrap(), 0o400);
+    }
+
+    #[test]
+    fn octal_mode_invalid() {
+        assert!(parse_octal_mode("999").is_err());
+        assert!(parse_octal_mode("abc").is_err());
+        assert!(parse_octal_mode("").is_err());
     }
 }
 

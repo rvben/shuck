@@ -521,6 +521,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "husk-agent-proto",
  "husk-api",
  "husk-core",
  "husk-net",
