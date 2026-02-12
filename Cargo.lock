@@ -568,6 +568,7 @@ name = "husk-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "http-body-util",
  "husk-agent-proto",
  "husk-core",
@@ -580,6 +581,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
