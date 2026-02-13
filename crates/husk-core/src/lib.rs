@@ -41,6 +41,9 @@ pub struct CreateVmRequest {
     pub rootfs_path: PathBuf,
     pub vcpu_count: Option<u32>,
     pub mem_size_mib: Option<u32>,
+    /// Path to an initramfs/initrd image (needed for kernels with modular drivers).
+    #[serde(default)]
+    pub initrd_path: Option<PathBuf>,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -163,6 +166,7 @@ impl<B: VmmBackend> HuskCore<B> {
                 "console=ttyS0 reboot=k panic=1 pci=off \
                  ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
             )),
+            initrd_path: req.initrd_path.clone(),
             vsock_cid: cid,
             tap_device: Some(tap_name.clone()),
             guest_mac: Some(mac),
@@ -216,13 +220,20 @@ impl<B: VmmBackend> HuskCore<B> {
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
         resources.vm_dir = Some(vm_dir);
 
+        // Resolve initrd: use explicit path, or look for conventional location
+        let initrd_path = req.initrd_path.clone().or_else(|| {
+            let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
+            conventional.exists().then_some(conventional)
+        });
+
         let vm_config = husk_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
             mem_size_mib: req.mem_size_mib.unwrap_or(128),
             kernel_path: req.kernel_path.clone(),
             rootfs_path: vm_rootfs,
-            kernel_args: None,
+            kernel_args: Some("console=hvc0 root=/dev/vda rw init=/sbin/init".into()),
+            initrd_path,
             vsock_cid: cid,
             tap_device: None,
             guest_mac: None,

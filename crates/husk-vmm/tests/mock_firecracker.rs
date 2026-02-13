@@ -192,6 +192,7 @@ async fn create_vm_missing_binary() {
         kernel_path: "/tmp/vmlinux".into(),
         rootfs_path: "/tmp/rootfs.ext4".into(),
         kernel_args: None,
+        initrd_path: None,
         vsock_cid: 3,
         tap_device: None,
         guest_mac: None,

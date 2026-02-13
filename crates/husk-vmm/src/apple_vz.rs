@@ -12,10 +12,11 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
-    VZVirtioBlockDeviceConfiguration, VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection,
-    VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration,
+    VZDiskImageStorageDeviceAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
+    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -230,6 +231,13 @@ impl VmmBackend for AppleVzBackend {
                 if let Some(ref args) = config.kernel_args {
                     unsafe { boot_loader.setCommandLine(&NSString::from_str(args)) };
                 }
+                if let Some(ref initrd) = config.initrd_path {
+                    let initrd_str = initrd.to_str().ok_or_else(|| {
+                        VmmError::InvalidConfig("initrd path not valid UTF-8".into())
+                    })?;
+                    let initrd_url = NSURL::fileURLWithPath(&NSString::from_str(initrd_str));
+                    unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
+                }
 
                 let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
                 unsafe {
@@ -277,6 +285,21 @@ impl VmmBackend for AppleVzBackend {
                 let socket_config = socket_device.into_super();
                 unsafe {
                     vz_config.setSocketDevices(&NSArray::from_retained_slice(&[socket_config]));
+                }
+
+                // Platform (required for Linux on ARM64)
+                let platform = unsafe { VZGenericPlatformConfiguration::new() };
+                unsafe {
+                    vz_config.setPlatform(&platform);
+                }
+
+                // Serial console (hvc0 — virtio console)
+                // Attach to /dev/null for reading and writing to discard output.
+                // A proper console (pty, pipe) can be added later for interactive use.
+                let serial_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+                let serial_config = serial_port.into_super();
+                unsafe {
+                    vz_config.setSerialPorts(&NSArray::from_retained_slice(&[serial_config]));
                 }
 
                 // Validate

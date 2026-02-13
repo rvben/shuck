@@ -45,6 +45,10 @@ enum Commands {
         #[arg(long)]
         kernel: Option<PathBuf>,
 
+        /// Path to initrd/initramfs (auto-detected if not specified)
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+
         /// Number of vCPUs
         #[arg(long, default_value = "1")]
         cpus: u32,
@@ -214,6 +218,7 @@ async fn main() -> Result<()> {
             rootfs,
             name,
             kernel,
+            initrd,
             cpus,
             memory,
             userdata,
@@ -223,16 +228,21 @@ async fn main() -> Result<()> {
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
+            let mut body = serde_json::json!({
+                "name": name,
+                "kernel_path": kernel,
+                "rootfs_path": rootfs,
+                "vcpu_count": cpus,
+                "mem_size_mib": memory,
+            });
+            if let Some(ref initrd_path) = initrd {
+                body["initrd_path"] = serde_json::json!(initrd_path);
+            }
+
             let client = reqwest::Client::new();
             let resp = client
                 .post(format!("{}/v1/vms", cli.api_url))
-                .json(&serde_json::json!({
-                    "name": name,
-                    "kernel_path": kernel,
-                    "rootfs_path": rootfs,
-                    "vcpu_count": cpus,
-                    "mem_size_mib": memory,
-                }))
+                .json(&body)
                 .send()
                 .await
                 .context("connecting to daemon")?;

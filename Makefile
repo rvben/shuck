@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-release-macos sign-macos test test-unit test-macos lint fmt fmt-check clippy check check-macos clean install run-daemon
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos lint fmt fmt-check clippy check check-macos clean install run-daemon
 
 all: lint test
 
@@ -10,9 +10,14 @@ build:
 build-release:
 	cargo build --workspace --release
 
-# Build only the guest agent (optimized for size)
+# Build only the guest agent (optimized for size, x86_64)
 build-agent:
 	cargo build --package husk-agent --profile agent --target x86_64-unknown-linux-musl
+
+# Build guest agent for ARM64 (for macOS/VZ guests)
+build-agent-aarch64:
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
+	cargo build --package husk-agent --profile agent --target aarch64-unknown-linux-musl
 
 # Build release for macOS (no linux-net, with entitlement signing)
 build-release-macos:

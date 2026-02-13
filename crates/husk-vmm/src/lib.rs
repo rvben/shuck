@@ -21,6 +21,7 @@ pub struct VmConfig {
     pub kernel_path: PathBuf,
     pub rootfs_path: PathBuf,
     pub kernel_args: Option<String>,
+    pub initrd_path: Option<PathBuf>,
     pub vsock_cid: u32,
     pub tap_device: Option<String>,
     pub guest_mac: Option<String>,
