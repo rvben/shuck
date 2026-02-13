@@ -12,8 +12,8 @@ use tokio::io::AsyncReadExt;
 #[command(name = "husk", about = "An open source microVM manager", version)]
 struct Cli {
     /// Path to config file
-    #[arg(long, default_value = "/etc/husk/config.toml")]
-    config: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Daemon API address (for client commands)
     #[arg(long, default_value = "http://127.0.0.1:7777")]
@@ -173,11 +173,21 @@ fn default_firecracker_bin() -> PathBuf {
 }
 
 fn default_data_dir() -> PathBuf {
+    if cfg!(target_os = "macos")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(".local/share/husk");
+    }
     PathBuf::from("/var/lib/husk")
 }
 
 fn default_kernel_path() -> PathBuf {
-    PathBuf::from("/var/lib/husk/kernels/vmlinux")
+    let data_dir = default_data_dir();
+    if cfg!(target_os = "macos") {
+        data_dir.join("kernels/Image-virt")
+    } else {
+        data_dir.join("kernels/vmlinux")
+    }
 }
 
 #[cfg(feature = "linux-net")]
@@ -211,7 +221,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon { listen } => {
-            let config = load_config(&cli.config);
+            let config = load_config(cli.config.as_deref());
             start_daemon(config, listen).await
         }
         Commands::Run {
@@ -223,7 +233,7 @@ async fn main() -> Result<()> {
             memory,
             userdata,
         } => {
-            let config = load_config(&cli.config);
+            let config = load_config(cli.config.as_deref());
             let kernel = kernel.unwrap_or(config.default_kernel);
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
@@ -625,7 +635,7 @@ async fn main() -> Result<()> {
 #[cfg(feature = "linux-net")]
 async fn run_shell(
     api_url: String,
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
     name: String,
     command: Option<String>,
 ) -> Result<()> {
@@ -645,7 +655,7 @@ async fn run_shell(
     let vm: serde_json::Value = resp.json().await?;
     let vm_id = vm["id"].as_str().context("missing VM id")?;
 
-    let config = load_config(&config_path);
+    let config = load_config(config_path.as_deref());
     let runtime_dir = config.data_dir.join("run");
     let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
 
@@ -683,7 +693,7 @@ async fn run_shell(
 #[cfg(not(feature = "linux-net"))]
 async fn run_shell(
     _api_url: String,
-    _config_path: PathBuf,
+    _config_path: Option<PathBuf>,
     _name: String,
     _command: Option<String>,
 ) -> Result<()> {
@@ -747,8 +757,26 @@ async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
     }
 }
 
-fn load_config(path: &Path) -> Config {
-    match std::fs::read_to_string(path) {
+/// Resolve the config file path by checking (in order):
+/// 1. Explicit path from --config flag
+/// 2. `~/.config/husk/config.toml` (XDG user config)
+/// 3. `/etc/husk/config.toml` (system config)
+fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_owned();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_config = PathBuf::from(home).join(".config/husk/config.toml");
+        if user_config.exists() {
+            return user_config;
+        }
+    }
+    PathBuf::from("/etc/husk/config.toml")
+}
+
+fn load_config(explicit_path: Option<&Path>) -> Config {
+    let path = resolve_config_path(explicit_path);
+    match std::fs::read_to_string(&path) {
         Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
             eprintln!("Warning: invalid config file: {e}");
             Config::default()
