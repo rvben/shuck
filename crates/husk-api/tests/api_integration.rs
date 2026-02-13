@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use husk_api::{VmResponse, router};
 use husk_core::HuskCore;
 
-fn test_core() -> Arc<HuskCore> {
+fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
     let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
@@ -35,7 +35,6 @@ fn test_core() -> Arc<HuskCore> {
         state,
         ip_allocator,
         storage,
-        PathBuf::from("/tmp"),
         "eth0".into(),
     ))
 }
@@ -380,7 +379,6 @@ async fn vm_response_json_structure() {
         state,
         ip_allocator,
         storage,
-        PathBuf::from("/tmp"),
         "eth0".into(),
     ));
 
@@ -459,7 +457,6 @@ async fn list_vms_returns_all_records() {
         state,
         ip_allocator,
         storage,
-        PathBuf::from("/tmp"),
         "eth0".into(),
     ));
 
@@ -690,7 +687,6 @@ async fn list_port_forwards_empty_for_existing_vm() {
         state,
         ip_allocator,
         storage,
-        PathBuf::from("/tmp"),
         "eth0".into(),
     ));
 
@@ -747,7 +743,6 @@ async fn vm_response_with_null_optional_fields() {
         state,
         ip_allocator,
         storage,
-        PathBuf::from("/tmp"),
         "eth0".into(),
     ));
 

@@ -10,8 +10,8 @@
 
 use std::path::PathBuf;
 
-use husk_core::agent_client::{AgentClient, AgentConnection};
 use husk_core::ShellEvent;
+use husk_core::agent_client::{AgentClient, AgentConnection};
 
 /// Spawn the agent handler on a temporary Unix socket.
 async fn spawn_agent() -> (tempfile::TempDir, PathBuf) {

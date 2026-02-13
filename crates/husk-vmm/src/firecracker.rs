@@ -114,6 +114,8 @@ impl FirecrackerBackend {
 }
 
 impl VmmBackend for FirecrackerBackend {
+    type VsockStream = tokio::net::UnixStream;
+
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
         // Check for duplicate names
         {
@@ -129,6 +131,9 @@ impl VmmBackend for FirecrackerBackend {
         let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
+
+        // Firecracker requires the log file to exist before startup
+        tokio::fs::write(&log_path, b"").await?;
 
         // Spawn the Firecracker process
         let process = tokio::process::Command::new(&self.firecracker_bin)
@@ -363,6 +368,41 @@ impl VmmBackend for FirecrackerBackend {
             instance.info.state = VmState::Running;
         }
         Ok(())
+    }
+
+    async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
+        let vsock_path = {
+            let instances = self.instances.lock().await;
+            let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            inst.vsock_path.clone()
+        };
+
+        let stream = tokio::net::UnixStream::connect(&vsock_path)
+            .await
+            .map_err(|e| VmmError::ProcessError(format!("vsock connect: {e}")))?;
+
+        // Firecracker vsock CONNECT handshake
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut buf_stream = BufReader::new(stream);
+        buf_stream
+            .get_mut()
+            .write_all(format!("CONNECT {port}\n").as_bytes())
+            .await
+            .map_err(|e| VmmError::ProcessError(format!("vsock handshake write: {e}")))?;
+
+        let mut response = String::new();
+        buf_stream
+            .read_line(&mut response)
+            .await
+            .map_err(|e| VmmError::ProcessError(format!("vsock handshake read: {e}")))?;
+
+        if !response.starts_with("OK ") {
+            return Err(VmmError::ProcessError(format!(
+                "vsock CONNECT rejected (port {port})"
+            )));
+        }
+
+        Ok(buf_stream.into_inner())
     }
 }
 

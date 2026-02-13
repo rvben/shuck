@@ -16,6 +16,14 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-virtualization = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }

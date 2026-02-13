@@ -372,7 +372,11 @@ async fn normal_requests_still_work_with_shell_protocol() {
 
     // Write + Read file
     let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("shell_test.txt").to_string_lossy().into_owned();
+    let file_path = dir
+        .path()
+        .join("shell_test.txt")
+        .to_string_lossy()
+        .into_owned();
     let content = b"shell protocol regression";
 
     let request = AgentRequest::WriteFile(WriteFileRequest {

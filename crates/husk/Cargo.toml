@@ -9,11 +9,15 @@ rust-version.workspace = true
 name = "husk"
 path = "src/main.rs"
 
+[features]
+default = ["linux-net"]
+linux-net = ["husk-core/linux-net", "husk-api/linux-net", "husk-net"]
+
 [dependencies]
 husk-api = { workspace = true }
 husk-core = { workspace = true }
 husk-vmm = { workspace = true }
-husk-net = { workspace = true }
+husk-net = { workspace = true, optional = true }
 husk-storage = { workspace = true }
 husk-state = { workspace = true }
 husk-agent-proto = { workspace = true }

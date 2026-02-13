@@ -5,8 +5,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["linux-net"]
+linux-net = ["husk-core/linux-net"]
+
 [dependencies]
 husk-core = { workspace = true }
+husk-vmm = { workspace = true }
 husk-agent-proto = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

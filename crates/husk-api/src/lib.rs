@@ -6,14 +6,16 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+#[cfg(feature = "linux-net")]
 use axum::routing::delete;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use husk_core::{CoreError, CreateVmRequest, HuskCore, VmRecord};
+use husk_vmm::VmmBackend;
 
-type AppState = Arc<HuskCore>;
+type AppState<B> = Arc<HuskCore<B>>;
 
 // ── Response Types ────────────────────────────────────────────────────
 
@@ -83,12 +85,14 @@ struct WriteFileResponse {
 
 // ── Port Forward Types ────────────────────────────────────────────────
 
+#[cfg(feature = "linux-net")]
 #[derive(Debug, Deserialize)]
 struct AddPortForwardRequest {
     host_port: u16,
     guest_port: u16,
 }
 
+#[cfg(feature = "linux-net")]
 #[derive(Debug, Serialize)]
 struct PortForwardResponse {
     host_port: u16,
@@ -100,29 +104,37 @@ struct PortForwardResponse {
 // ── Router ────────────────────────────────────────────────────────────
 
 /// Build the API router.
-pub fn router(core: Arc<HuskCore>) -> Router {
-    Router::new()
-        .route("/v1/vms", get(list_vms).post(create_vm))
-        .route("/v1/vms/{name}", get(get_vm).delete(destroy_vm))
-        .route("/v1/vms/{name}/stop", post(stop_vm))
-        .route("/v1/vms/{name}/exec", post(exec_vm))
-        .route("/v1/vms/{name}/files/read", post(read_file_handler))
-        .route("/v1/vms/{name}/files/write", post(write_file_handler))
+pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
+    let router = Router::new()
+        .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
+        .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
+        .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
+        .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
+        .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
+        .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>));
+
+    #[cfg(feature = "linux-net")]
+    let router = router
         .route(
             "/v1/vms/{name}/ports",
-            get(list_port_forwards_handler).post(add_port_forward_handler),
+            get(list_port_forwards_handler::<B>).post(add_port_forward_handler::<B>),
         )
         .route(
             "/v1/vms/{name}/ports/{host_port}",
-            delete(remove_port_forward_handler),
-        )
+            delete(remove_port_forward_handler::<B>),
+        );
+
+    router
         .route("/v1/health", get(health))
         .layer(axum::middleware::from_fn(trace_request))
         .with_state(core)
 }
 
 /// Start the API server.
-pub async fn serve(core: Arc<HuskCore>, addr: SocketAddr) -> std::io::Result<()> {
+pub async fn serve<B: VmmBackend + 'static>(
+    core: Arc<HuskCore<B>>,
+    addr: SocketAddr,
+) -> std::io::Result<()> {
     let app = router(core);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husk daemon listening");
@@ -154,47 +166,47 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn list_vms(
-    State(core): State<AppState>,
+async fn list_vms<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
 ) -> Result<Json<Vec<VmResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let vms = core.list_vms().map_err(map_error)?;
     Ok(Json(vms.into_iter().map(record_to_response).collect()))
 }
 
-async fn create_vm(
-    State(core): State<AppState>,
+async fn create_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Json(req): Json<CreateVmRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
     let record = core.create_vm(req).await.map_err(map_error)?;
     Ok((StatusCode::CREATED, Json(record_to_response(record))))
 }
 
-async fn get_vm(
-    State(core): State<AppState>,
+async fn get_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<VmResponse>, (StatusCode, Json<ErrorResponse>)> {
     let record = core.get_vm(&name).map_err(map_error)?;
     Ok(Json(record_to_response(record)))
 }
 
-async fn stop_vm(
-    State(core): State<AppState>,
+async fn stop_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.stop_vm(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn destroy_vm(
-    State(core): State<AppState>,
+async fn destroy_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.destroy_vm(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn exec_vm(
-    State(core): State<AppState>,
+async fn exec_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -216,8 +228,8 @@ async fn exec_vm(
     }))
 }
 
-async fn read_file_handler(
-    State(core): State<AppState>,
+async fn read_file_handler<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<Json<ReadFileResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -233,8 +245,8 @@ async fn read_file_handler(
     }))
 }
 
-async fn write_file_handler(
-    State(core): State<AppState>,
+async fn write_file_handler<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
     Json(req): Json<WriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -256,8 +268,9 @@ async fn write_file_handler(
 
 // ── Port Forward Handlers ─────────────────────────────────────────────
 
-async fn add_port_forward_handler(
-    State(core): State<AppState>,
+#[cfg(feature = "linux-net")]
+async fn add_port_forward_handler<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
     Json(req): Json<AddPortForwardRequest>,
 ) -> Result<(StatusCode, Json<PortForwardResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -275,8 +288,9 @@ async fn add_port_forward_handler(
     ))
 }
 
-async fn list_port_forwards_handler(
-    State(core): State<AppState>,
+#[cfg(feature = "linux-net")]
+async fn list_port_forwards_handler<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<PortForwardResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let forwards = core.list_port_forwards(&name).map_err(map_error)?;
@@ -293,8 +307,9 @@ async fn list_port_forwards_handler(
     ))
 }
 
-async fn remove_port_forward_handler(
-    State(core): State<AppState>,
+#[cfg(feature = "linux-net")]
+async fn remove_port_forward_handler<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
     Path((name, host_port)): Path<(String, u16)>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.remove_port_forward(&name, host_port)
@@ -345,7 +360,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn test_core() -> Arc<HuskCore> {
+    fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
             std::path::Path::new("/nonexistent"),
             std::path::Path::new("/tmp"),
@@ -360,7 +375,6 @@ mod tests {
             state,
             ip_allocator,
             storage,
-            PathBuf::from("/tmp"),
             "eth0".into(),
         ))
     }

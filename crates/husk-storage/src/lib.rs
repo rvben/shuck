@@ -45,7 +45,8 @@ impl StorageConfig {
 
 /// Create a copy-on-write clone of a rootfs for a VM.
 ///
-/// Uses `cp --reflink=auto` to avoid copying data on filesystems that support it.
+/// Uses reflink (clonefile on macOS/APFS, FICLONE on Linux/btrfs/XFS) when the
+/// filesystem supports it, falling back to a regular copy otherwise.
 pub async fn clone_rootfs(source: &Path, dest: &Path) -> Result<(), StorageError> {
     if !source.exists() {
         return Err(StorageError::RootfsNotFound(source.to_owned()));
@@ -55,18 +56,12 @@ pub async fn clone_rootfs(source: &Path, dest: &Path) -> Result<(), StorageError
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let output = tokio::process::Command::new("cp")
-        .arg("--reflink=auto")
-        .arg(source)
-        .arg(dest)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Err(StorageError::CommandFailed(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
-    }
+    let src = source.to_owned();
+    let dst = dest.to_owned();
+    tokio::task::spawn_blocking(move || reflink_copy::reflink_or_copy(&src, &dst))
+        .await
+        .map_err(|e| StorageError::CommandFailed(format!("spawn_blocking join: {e}")))?
+        .map_err(StorageError::Io)?;
 
     Ok(())
 }

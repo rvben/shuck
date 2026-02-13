@@ -43,8 +43,8 @@ async fn listen_vsock() -> Result<()> {
     let port = husk_agent_proto::AGENT_VSOCK_PORT;
     info!("listening on vsock port {port}");
 
-    let listener =
-        VsockListener::bind(libc::VMADDR_CID_ANY, port).context("binding vsock listener")?;
+    let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, port);
+    let mut listener = VsockListener::bind(addr).context("binding vsock listener")?;
 
     loop {
         let (stream, addr) = listener.accept().await?;

@@ -56,17 +56,17 @@ crossterm = "0.28"
 
 # Hyper for Unix socket HTTP
 hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 
 # Internal crates
-husk-core = { path = "crates/husk-core" }
+husk-core = { path = "crates/husk-core", default-features = false }
 husk-vmm = { path = "crates/husk-vmm" }
 husk-net = { path = "crates/husk-net" }
 husk-storage = { path = "crates/husk-storage" }
 husk-agent-proto = { path = "crates/husk-agent-proto" }
-husk-api = { path = "crates/husk-api" }
+husk-api = { path = "crates/husk-api", default-features = false }
 husk-state = { path = "crates/husk-state" }
 
 [profile.release]

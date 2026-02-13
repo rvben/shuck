@@ -1,8 +1,8 @@
 use anyhow::Result;
 use husk_agent_proto::{
-    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, ReadFileResponse,
-    ShellDataResponse, ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode,
-    base64_encode, read_message, write_message,
+    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, ReadFileResponse, ShellDataResponse,
+    ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode, base64_encode,
+    read_message, write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;

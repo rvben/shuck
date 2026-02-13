@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+#[cfg(feature = "linux-net")]
 use tokio::io::AsyncReadExt;
 
 #[derive(Parser)]
@@ -150,16 +151,19 @@ enum PortForwardAction {
 
 #[derive(Debug, Deserialize)]
 struct Config {
+    #[cfg(feature = "linux-net")]
     #[serde(default = "default_firecracker_bin")]
     firecracker_bin: PathBuf,
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
     #[serde(default = "default_kernel_path")]
     default_kernel: PathBuf,
+    #[cfg(feature = "linux-net")]
     #[serde(default = "default_host_interface")]
     host_interface: String,
 }
 
+#[cfg(feature = "linux-net")]
 fn default_firecracker_bin() -> PathBuf {
     PathBuf::from("firecracker")
 }
@@ -172,6 +176,7 @@ fn default_kernel_path() -> PathBuf {
     PathBuf::from("/var/lib/husk/kernels/vmlinux")
 }
 
+#[cfg(feature = "linux-net")]
 fn default_host_interface() -> String {
     "eth0".into()
 }
@@ -179,9 +184,11 @@ fn default_host_interface() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "linux-net")]
             firecracker_bin: default_firecracker_bin(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
+            #[cfg(feature = "linux-net")]
             host_interface: default_host_interface(),
         }
     }
@@ -239,10 +246,7 @@ async fn main() -> Result<()> {
                 println!("  RAM:   {} MiB", vm["mem_size_mib"]);
 
                 if let Some(ref userdata_path) = userdata {
-                    println!(
-                        "Running userdata script: {}",
-                        userdata_path.display()
-                    );
+                    println!("Running userdata script: {}", userdata_path.display());
                     let script = std::fs::read(userdata_path).with_context(|| {
                         format!("reading userdata script {}", userdata_path.display())
                     })?;
@@ -302,8 +306,7 @@ async fn main() -> Result<()> {
 
                             if resp.status().is_success() {
                                 let result: serde_json::Value = resp.json().await?;
-                                let exit_code =
-                                    result["exit_code"].as_i64().unwrap_or(-1);
+                                let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
                                 if exit_code != 0 {
                                     eprintln!(
                                         "Warning: userdata script exited with code {}",
@@ -553,10 +556,7 @@ async fn main() -> Result<()> {
                 }
                 PortForwardAction::Remove { host_port } => {
                     let resp = client
-                        .delete(format!(
-                            "{}/v1/vms/{name}/ports/{host_port}",
-                            cli.api_url
-                        ))
+                        .delete(format!("{}/v1/vms/{name}/ports/{host_port}", cli.api_url))
                         .send()
                         .await
                         .context("connecting to daemon")?;
@@ -602,67 +602,82 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Shell { name, command } => {
-            // Get VM info to find the vsock path
-            let client = reqwest::Client::new();
-            let resp = client
-                .get(format!("{}/v1/vms/{name}", cli.api_url))
-                .send()
-                .await
-                .context("connecting to daemon")?;
-
-            if !resp.status().is_success() {
-                let err: serde_json::Value = resp.json().await?;
-                eprintln!("Error: {}", err["error"]);
-                std::process::exit(1);
-            }
-
-            let vm: serde_json::Value = resp.json().await?;
-            let vm_id = vm["id"].as_str().context("missing VM id")?;
-
-            let config = load_config(&cli.config);
-            let runtime_dir = config.data_dir.join("run");
-            let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
-
-            // Connect to agent
-            let mut conn = husk_core::AgentClient::connect(
-                &vsock_path,
-                husk_agent_proto::AGENT_VSOCK_PORT,
-            )
-            .await
-            .context("connecting to agent")?;
-
-            // Get terminal size
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-
-            // Start shell
-            conn.shell_start(command.as_deref(), cols, rows)
-                .await
-                .context("starting shell")?;
-
-            // Enable raw mode
-            crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
-
-            // Bidirectional bridge
-            let result = run_shell_bridge(&mut conn).await;
-
-            // Restore terminal
-            crossterm::terminal::disable_raw_mode().ok();
-            println!();
-
-            match result {
-                Ok(exit_code) => {
-                    if exit_code != 0 {
-                        std::process::exit(exit_code);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Shell error: {e}");
-                    std::process::exit(1);
-                }
-            }
-            Ok(())
+            run_shell(cli.api_url, cli.config, name, command).await
         }
     }
+}
+
+/// Run an interactive shell session inside a VM.
+///
+/// On Linux, connects directly to the Firecracker vsock UDS proxy.
+/// On macOS, the VZ vsock device is owned by the daemon process, so direct
+/// shell access from the CLI is not yet supported.
+#[cfg(feature = "linux-net")]
+async fn run_shell(
+    api_url: String,
+    config_path: PathBuf,
+    name: String,
+    command: Option<String>,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/v1/vms/{name}", api_url))
+        .send()
+        .await
+        .context("connecting to daemon")?;
+
+    if !resp.status().is_success() {
+        let err: serde_json::Value = resp.json().await?;
+        eprintln!("Error: {}", err["error"]);
+        std::process::exit(1);
+    }
+
+    let vm: serde_json::Value = resp.json().await?;
+    let vm_id = vm["id"].as_str().context("missing VM id")?;
+
+    let config = load_config(&config_path);
+    let runtime_dir = config.data_dir.join("run");
+    let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
+
+    let mut conn = husk_core::AgentClient::connect(&vsock_path, husk_agent_proto::AGENT_VSOCK_PORT)
+        .await
+        .context("connecting to agent")?;
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+    conn.shell_start(command.as_deref(), cols, rows)
+        .await
+        .context("starting shell")?;
+
+    crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+
+    let result = run_shell_bridge(&mut conn).await;
+
+    crossterm::terminal::disable_raw_mode().ok();
+    println!();
+
+    match result {
+        Ok(exit_code) => {
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Err(e) => {
+            eprintln!("Shell error: {e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "linux-net"))]
+async fn run_shell(
+    _api_url: String,
+    _config_path: PathBuf,
+    _name: String,
+    _command: Option<String>,
+) -> Result<()> {
+    anyhow::bail!("interactive shell not yet supported on macOS; use `husk exec` instead")
 }
 
 enum CpPath {
@@ -688,8 +703,9 @@ fn parse_cp_path(s: &str) -> CpPath {
     CpPath::Local(PathBuf::from(s))
 }
 
-async fn run_shell_bridge(
-    conn: &mut husk_core::AgentConnection<tokio::net::UnixStream>,
+#[cfg(feature = "linux-net")]
+async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    conn: &mut husk_core::AgentConnection<S>,
 ) -> Result<i32> {
     let mut stdin = tokio::io::stdin();
     let mut stdin_buf = vec![0u8; 1024];
@@ -744,37 +760,43 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     let runtime_dir = config.data_dir.join("run");
     let db_path = config.data_dir.join("husk.db");
 
-    // Ensure directories exist
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
     std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
 
-    // Initialize subsystems
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(&config.firecracker_bin, &runtime_dir);
-
     let state = husk_state::StateStore::open(&db_path).context("opening state database")?;
-
-    let ip_allocator = husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 16);
-
     let storage = husk_storage::StorageConfig {
         data_dir: config.data_dir,
     };
 
-    // Initialize nftables (non-fatal on macOS / non-root)
-    if let Err(e) = husk_net::init_nat().await {
-        tracing::warn!("failed to initialize nftables: {e} (VM networking may not work)");
+    #[cfg(feature = "linux-net")]
+    {
+        let vmm =
+            husk_vmm::firecracker::FirecrackerBackend::new(&config.firecracker_bin, &runtime_dir);
+        let ip_allocator = husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 16);
+
+        if let Err(e) = husk_net::init_nat().await {
+            tracing::warn!("failed to initialize nftables: {e} (VM networking may not work)");
+        }
+
+        let core = Arc::new(husk_core::HuskCore::new(
+            vmm,
+            state,
+            ip_allocator,
+            storage,
+            config.host_interface,
+        ));
+        husk_api::serve(core, listen).await?;
+        Ok(())
     }
 
-    let core = Arc::new(husk_core::HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        runtime_dir.clone(),
-        config.host_interface,
-    ));
+    #[cfg(not(feature = "linux-net"))]
+    {
+        let vmm = husk_vmm::apple_vz::AppleVzBackend::new();
 
-    husk_api::serve(core, listen).await?;
-    Ok(())
+        let core = Arc::new(husk_core::HuskCore::new(vmm, state, storage));
+        husk_api::serve(core, listen).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent test test-unit lint fmt fmt-check clippy check clean install run-daemon
+.PHONY: all build build-release build-agent build-release-macos sign-macos test test-unit lint fmt fmt-check clippy check check-macos clean install run-daemon
 
 all: lint test
 
@@ -13,6 +13,19 @@ build-release:
 # Build only the guest agent (optimized for size)
 build-agent:
 	cargo build --package husk-agent --profile agent --target x86_64-unknown-linux-musl
+
+# Build release for macOS (no linux-net, with entitlement signing)
+build-release-macos:
+	cargo build --workspace --release --no-default-features
+	$(MAKE) sign-macos
+
+# Sign macOS binary with virtualization entitlement
+sign-macos:
+	codesign --entitlements husk.entitlements --force --sign - target/release/husk
+
+# Check compilation without linux-net (macOS path)
+check-macos:
+	cargo check --workspace --no-default-features
 
 # Run all tests
 test:

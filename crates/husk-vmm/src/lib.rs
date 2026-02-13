@@ -1,8 +1,12 @@
 pub mod firecracker;
 
+#[cfg(target_os = "macos")]
+pub mod apple_vz;
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 /// Configuration for creating a new VM.
@@ -71,10 +75,13 @@ pub enum VmmError {
 
 /// Trait abstracting over different VMM implementations.
 ///
-/// Each backend (Firecracker, Cloud Hypervisor) implements this trait.
+/// Each backend (Firecracker, Apple VZ) implements this trait.
 /// Uses desugared async methods with `Send` bounds for compatibility with
 /// multi-threaded runtimes. Implementations can use `async fn` syntax.
 pub trait VmmBackend: Send + Sync {
+    /// The stream type returned by vsock connections.
+    type VsockStream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+
     /// Create and boot a new VM with the given configuration.
     fn create_vm(
         &self,
@@ -102,4 +109,16 @@ pub trait VmmBackend: Send + Sync {
     /// Resume a paused VM (if supported).
     fn resume_vm(&self, id: Uuid)
     -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
+
+    /// Connect to a VM's vsock at the given port.
+    ///
+    /// Returns an async stream that can be used for bidirectional communication
+    /// with the guest. The connection method is backend-specific:
+    /// - Firecracker: UDS proxy with CONNECT handshake
+    /// - Apple VZ: VZVirtioSocketDevice connectToPort
+    fn vsock_connect(
+        &self,
+        id: Uuid,
+        port: u32,
+    ) -> impl std::future::Future<Output = Result<Self::VsockStream, VmmError>> + Send;
 }

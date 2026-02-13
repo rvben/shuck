@@ -372,8 +372,19 @@ pub async fn add_port_forward(
     run_cmd(
         "nft",
         &[
-            "add", "rule", "ip", NFT_TABLE, "prerouting", "tcp", "dport",
-            &host_port.to_string(), "dnat", "to", &dnat_target, "comment", &comment,
+            "add",
+            "rule",
+            "ip",
+            NFT_TABLE,
+            "prerouting",
+            "tcp",
+            "dport",
+            &host_port.to_string(),
+            "dnat",
+            "to",
+            &dnat_target,
+            "comment",
+            &comment,
         ],
     )
     .await?;
@@ -382,9 +393,20 @@ pub async fn add_port_forward(
     run_cmd(
         "nft",
         &[
-            "add", "rule", "ip", NFT_TABLE, "forward", "ip", "daddr",
-            &guest_ip.to_string(), "tcp", "dport", &guest_port.to_string(), "accept",
-            "comment", &comment,
+            "add",
+            "rule",
+            "ip",
+            NFT_TABLE,
+            "forward",
+            "ip",
+            "daddr",
+            &guest_ip.to_string(),
+            "tcp",
+            "dport",
+            &guest_port.to_string(),
+            "accept",
+            "comment",
+            &comment,
         ],
     )
     .await?;

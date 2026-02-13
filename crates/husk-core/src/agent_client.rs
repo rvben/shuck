@@ -6,12 +6,14 @@ use husk_agent_proto::{
     ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode, base64_encode,
     read_message, write_message,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("connection failed: {0}")]
     Connection(std::io::Error),
+    #[error("vsock CONNECT rejected by Firecracker (port {0})")]
+    VsockConnectRejected(u32),
     #[error("protocol error: {0}")]
     Protocol(#[from] husk_agent_proto::ProtocolError),
     #[error("unexpected response from agent")]
@@ -28,13 +30,43 @@ pub struct AgentClient;
 impl AgentClient {
     /// Connect to the agent via Firecracker's vsock UDS proxy.
     ///
-    /// Firecracker exposes vsock as a Unix domain socket at `{uds_path}_{port}`.
+    /// Firecracker exposes guest vsock as a Unix domain socket. To connect to a
+    /// specific guest port, the host must:
+    /// 1. Connect to the UDS at `vsock_uds_path`
+    /// 2. Send `CONNECT {port}\n`
+    /// 3. Read the response — `OK {local_port}\n` on success
+    ///
+    /// After the handshake, the stream is transparently bridged to the guest.
     pub async fn connect(
         vsock_uds_path: &Path,
         port: u32,
     ) -> Result<AgentConnection<tokio::net::UnixStream>, AgentError> {
-        let path = format!("{}_{port}", vsock_uds_path.display());
-        Self::connect_unix(Path::new(&path)).await
+        let stream = tokio::net::UnixStream::connect(vsock_uds_path)
+            .await
+            .map_err(AgentError::Connection)?;
+
+        // Firecracker vsock CONNECT handshake
+        let mut buf_stream = BufReader::new(stream);
+        buf_stream
+            .get_mut()
+            .write_all(format!("CONNECT {port}\n").as_bytes())
+            .await
+            .map_err(AgentError::Connection)?;
+
+        let mut response = String::new();
+        buf_stream
+            .read_line(&mut response)
+            .await
+            .map_err(AgentError::Connection)?;
+
+        if !response.starts_with("OK ") {
+            return Err(AgentError::VsockConnectRejected(port));
+        }
+
+        // Reconstruct the UnixStream from the BufReader. Any buffered data
+        // beyond the OK line belongs to the agent protocol.
+        let stream = buf_stream.into_inner();
+        Ok(AgentConnection { stream })
     }
 
     /// Connect to the agent via a Unix socket path directly.
