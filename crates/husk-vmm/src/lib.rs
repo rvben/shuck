@@ -1,5 +1,8 @@
 pub mod firecracker;
 
+#[cfg(unix)]
+pub mod fd_stream;
+
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
 

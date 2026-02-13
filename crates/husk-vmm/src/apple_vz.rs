@@ -4,11 +4,7 @@
 //! VZVirtualMachine's queue-affinity requirement.
 
 use std::collections::HashMap;
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::task::{Context, Poll, ready};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -21,135 +17,33 @@ use objc2_virtualization::{
     VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
     VZVirtualMachineConfiguration,
 };
-use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::fd_stream::FdStream;
 use crate::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
 
 // ── Send/Sync wrappers ──────────────────────────────────────────────────
 
 /// Wrapper that marks an ObjC type as Send + Sync.
 ///
-/// # Safety
+/// # Invariants
 ///
-/// The caller must ensure the wrapped value is only accessed from a context
-/// where it is safe to do so — in our case, from the VM's dedicated serial
-/// dispatch queue.
+/// The wrapped value must only be accessed from a single serial dispatch queue.
+/// `VZVirtualMachine` requires that all method calls happen on the queue it was
+/// created on. By confining access to that queue (via `dispatch_sync_result` and
+/// `dispatch_vz_op`), the `Send + Sync` impl is sound: the value is moved
+/// between threads only inside closures dispatched to the correct queue.
 struct QueueConfined<T>(T);
 
-// Safety: VzInstance values are only accessed from their associated serial
-// dispatch queue, satisfying VZVirtualMachine's queue-affinity requirement.
+// Safety: Values are only accessed from their associated serial dispatch queue,
+// satisfying VZVirtualMachine's queue-affinity requirement. Cross-thread moves
+// happen only via dispatch queue submission, not direct access.
 unsafe impl<T> Send for QueueConfined<T> {}
 unsafe impl<T> Sync for QueueConfined<T> {}
 
-// ── VzVsockStream ───────────────────────────────────────────────────────
-
-/// Async stream wrapping a VZ vsock file descriptor.
-///
-/// The fd is obtained from `VZVirtioSocketConnection.fileDescriptor()`,
-/// duplicated via `dup(2)` so we own it independently, and wrapped with
-/// tokio's `AsyncFd` for non-blocking I/O.
-pub struct VzVsockStream {
-    fd: AsyncFd<OwnedFd>,
-}
-
-impl VzVsockStream {
-    /// Create from a raw file descriptor (e.g. from VZVirtioSocketConnection).
-    ///
-    /// Duplicates the fd so the caller retains ownership of the original.
-    fn from_vz_fd(raw_fd: RawFd) -> io::Result<Self> {
-        let dup_fd = unsafe { libc::dup(raw_fd) };
-        if dup_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Set non-blocking for async I/O
-        unsafe {
-            let flags = libc::fcntl(dup_fd, libc::F_GETFL);
-            if flags < 0 {
-                libc::close(dup_fd);
-                return Err(io::Error::last_os_error());
-            }
-            if libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                libc::close(dup_fd);
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-        let async_fd = AsyncFd::new(owned)?;
-        Ok(Self { fd: async_fd })
-    }
-}
-
-impl AsyncRead for VzVsockStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.fd.poll_read_ready(cx))?;
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let b = buf.initialize_unfilled();
-                let n = unsafe { libc::read(fd, b.as_mut_ptr().cast::<libc::c_void>(), b.len()) };
-                if n >= 0 {
-                    Ok(n as usize)
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }) {
-                Ok(result) => {
-                    let n = result?;
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-impl AsyncWrite for VzVsockStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            let mut guard = ready!(self.fd.poll_write_ready(cx))?;
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let n = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
-                if n >= 0 {
-                    Ok(n as usize)
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let fd = self.fd.get_ref().as_raw_fd();
-        let result = unsafe { libc::shutdown(fd, libc::SHUT_WR) };
-        if result == 0 {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Ready(Err(io::Error::last_os_error()))
-        }
-    }
-}
+/// Type alias — the vsock stream is a cross-platform `FdStream` from `fd_stream.rs`.
+pub type VzVsockStream = FdStream;
 
 // ── Instance tracking ───────────────────────────────────────────────────
 
@@ -189,29 +83,61 @@ impl AppleVzBackend {
     }
 }
 
+impl Drop for AppleVzBackend {
+    fn drop(&mut self) {
+        // Best-effort cleanup: request each VM to stop.
+        // Uses try_lock to avoid blocking if the mutex is held elsewhere during
+        // teardown. The actual VZVirtualMachine deallocation is handled by ObjC
+        // ARC when the Retained<VZVirtualMachine> refcount drops to zero.
+        if let Ok(mut instances) = self.instances.try_lock() {
+            for (_, instance) in instances.drain() {
+                let vm = instance.vm;
+                instance.queue.exec_async(move || {
+                    let _capture_whole = &vm;
+                    // Safety: requestStopWithError is called on the VM's serial
+                    // dispatch queue. Errors are ignored (best-effort cleanup).
+                    unsafe {
+                        let _ = vm.0.requestStopWithError();
+                    }
+                });
+            }
+        }
+    }
+}
+
 // ── Dispatch helpers ────────────────────────────────────────────────────
 
 /// Run a closure on a dispatch queue from async context and return its result.
+///
+/// Uses a oneshot channel to transfer the result from the dispatch queue thread
+/// back to the async caller, avoiding any mutex unwrap.
 async fn dispatch_sync_result<T: Send + 'static>(
     queue: DispatchRetained<DispatchQueue>,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, VmmError> {
-    let result: Arc<StdMutex<Option<T>>> = Arc::new(StdMutex::new(None));
-    let result_inner = result.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
 
     tokio::task::spawn_blocking(move || {
         queue.exec_sync(|| {
-            *result_inner.lock().unwrap() = Some(f());
+            let _ = tx.send(f());
         });
     })
     .await
     .map_err(|e| VmmError::ProcessError(format!("dispatch join: {e}")))?;
 
-    result
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or_else(|| VmmError::ProcessError("dispatch produced no result".into()))
+    rx.await
+        .map_err(|_| VmmError::ProcessError("dispatch produced no result".into()))
+}
+
+/// Run a fallible closure on a dispatch queue and flatten the nested Result.
+///
+/// Convenience wrapper over `dispatch_sync_result` for closures that return
+/// `Result<T, VmmError>`, avoiding the `??` pattern at call sites.
+async fn dispatch_sync_fallible<T: Send + 'static>(
+    queue: DispatchRetained<DispatchQueue>,
+    f: impl FnOnce() -> Result<T, VmmError> + Send + 'static,
+) -> Result<T, VmmError> {
+    dispatch_sync_result(queue, f).await?
 }
 
 /// Dispatch a VZ completion-handler operation on a queue and await the result.
@@ -239,13 +165,17 @@ async fn dispatch_vz_op(
                 let result = if error.is_null() {
                     Ok(())
                 } else {
+                    // Safety: non-null NSError pointer from VZ completion handler;
+                    // valid for the duration of the callback under ObjC ARC.
                     let desc = unsafe { (*error).localizedDescription() };
                     Err(VmmError::ProcessError(desc.to_string()))
                 };
-                if let Some(tx) = tx_inner.lock().unwrap().take() {
+                if let Some(tx) = tx_inner.lock().ok().and_then(|mut g| g.take()) {
                     let _ = tx.send(result);
                 }
             });
+            // Safety: VZ methods called on the VM's dedicated serial dispatch queue.
+            // The handler block is retained by VZ until the operation completes.
             unsafe {
                 match op {
                     VzOp::Start => vm.0.startWithCompletionHandler(&handler),
@@ -280,9 +210,13 @@ impl VmmBackend for AppleVzBackend {
         let queue = DispatchQueue::new(&format!("com.husk.vm.{id}"), None);
 
         // Create the VM on its dedicated dispatch queue.
-        let vm = dispatch_sync_result(queue.clone(), {
+        let vm = dispatch_sync_fallible(queue.clone(), {
             let config = config.clone();
             let queue_for_vm = queue.clone();
+            // Safety: All VZ API calls in this closure execute on the VM's dedicated
+            // serial dispatch queue via `dispatch_sync_fallible`. The objc2 bindings
+            // are `unsafe` because they call into Objective-C; the VZ framework
+            // guarantees thread-safety when called from the correct queue.
             move || -> Result<QueueConfined<Retained<VZVirtualMachine>>, VmmError> {
                 // Boot loader
                 let kernel_path = config
@@ -297,12 +231,10 @@ impl VmmBackend for AppleVzBackend {
                     unsafe { boot_loader.setCommandLine(&NSString::from_str(args)) };
                 }
 
-                // VM configuration
                 let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
                 unsafe {
                     vz_config.setCPUCount(config.vcpu_count as usize);
                     vz_config.setMemorySize(u64::from(config.mem_size_mib) * 1024 * 1024);
-                    // Deref coercion: &VZLinuxBootLoader -> &VZBootLoader
                     vz_config.setBootLoader(Some(&*boot_loader));
                 }
 
@@ -326,7 +258,6 @@ impl VmmBackend for AppleVzBackend {
                         &disk_attachment,
                     )
                 };
-                // Upcast to base class for NSArray
                 let storage_device = block_device.into_super();
                 unsafe {
                     vz_config.setStorageDevices(&NSArray::from_retained_slice(&[storage_device]));
@@ -335,7 +266,6 @@ impl VmmBackend for AppleVzBackend {
                 // Network (NAT — VZ handles it internally)
                 let nat = unsafe { VZNATNetworkDeviceAttachment::new() };
                 let net_device = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-                // Deref coercion: &VZNATNetworkDeviceAttachment -> &VZNetworkDeviceAttachment
                 unsafe { net_device.setAttachment(Some(&*nat)) };
                 let net_config = net_device.into_super();
                 unsafe {
@@ -367,7 +297,7 @@ impl VmmBackend for AppleVzBackend {
                 Ok(QueueConfined(vm))
             }
         })
-        .await??;
+        .await?;
 
         // Start the VM (temporarily move out of QueueConfined for the op)
         let vm_inner = vm.0.clone();
@@ -403,15 +333,15 @@ impl VmmBackend for AppleVzBackend {
         };
 
         // Send ACPI power button (graceful shutdown)
-        dispatch_sync_result(queue, move || -> Result<(), VmmError> {
-            // Force capture of entire `vm` (QueueConfined, Send) not just vm.0.
+        dispatch_sync_fallible(queue, move || -> Result<(), VmmError> {
             let _capture_whole = &vm;
+            // Safety: Called on the VM's serial dispatch queue via dispatch_sync_fallible.
             unsafe {
                 vm.0.requestStopWithError()
                     .map_err(|e| VmmError::ApiError(format!("requestStop: {e}")))
             }
         })
-        .await??;
+        .await?;
 
         let mut instances = self.instances.lock().await;
         if let Some(inst) = instances.get_mut(&id) {
@@ -487,12 +417,13 @@ impl VmmBackend for AppleVzBackend {
             queue.exec_sync(move || {
                 let _capture_whole = &vm;
 
+                // Safety: Called on the VM's serial dispatch queue.
                 let socket_devices = unsafe { vm.0.socketDevices() };
                 let socket_device = match socket_devices.firstObject() {
                     Some(dev) => match Retained::downcast::<VZVirtioSocketDevice>(dev) {
                         Ok(dev) => dev,
                         Err(_) => {
-                            if let Some(tx) = tx.lock().unwrap().take() {
+                            if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
                                 let _ = tx.send(Err(VmmError::ProcessError(
                                     "socket device is not a VZVirtioSocketDevice".into(),
                                 )));
@@ -501,7 +432,7 @@ impl VmmBackend for AppleVzBackend {
                         }
                     },
                     None => {
-                        if let Some(tx) = tx.lock().unwrap().take() {
+                        if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
                             let _ = tx.send(Err(VmmError::ProcessError(
                                 "no socket devices configured".into(),
                             )));
@@ -513,11 +444,20 @@ impl VmmBackend for AppleVzBackend {
                 let handler = RcBlock::new(
                     move |conn: *mut VZVirtioSocketConnection, error: *mut NSError| {
                         let result = if error.is_null() && !conn.is_null() {
-                            // Retain the connection object
-                            let conn = unsafe { Retained::retain(conn) }
-                                .expect("VZVirtioSocketConnection should not be null");
+                            // Safety: conn is non-null (checked above) and points to a
+                            // valid ObjC object from the VZ completion handler.
+                            let Some(conn) = (unsafe { Retained::retain(conn) }) else {
+                                if let Some(tx) = tx_inner.lock().ok().and_then(|mut g| g.take()) {
+                                    let _ = tx.send(Err(VmmError::ProcessError(
+                                        "failed to retain VZVirtioSocketConnection".into(),
+                                    )));
+                                }
+                                return;
+                            };
                             Ok(QueueConfined(conn))
                         } else if !error.is_null() {
+                            // Safety: non-null NSError pointer from VZ completion handler;
+                            // valid for the duration of the callback under ObjC ARC.
                             let desc = unsafe { (*error).localizedDescription() };
                             Err(VmmError::ProcessError(format!("vsock connect: {desc}")))
                         } else {
@@ -525,12 +465,14 @@ impl VmmBackend for AppleVzBackend {
                                 "vsock connect returned null connection".into(),
                             ))
                         };
-                        if let Some(tx) = tx_inner.lock().unwrap().take() {
+                        if let Some(tx) = tx_inner.lock().ok().and_then(|mut g| g.take()) {
                             let _ = tx.send(result);
                         }
                     },
                 );
 
+                // Safety: Called on the VM's serial dispatch queue. The handler
+                // block is retained by VZ until the connection completes or fails.
                 unsafe {
                     socket_device.connectToPort_completionHandler(port, &handler);
                 }
@@ -543,7 +485,8 @@ impl VmmBackend for AppleVzBackend {
             .await
             .map_err(|_| VmmError::ProcessError("vsock completion channel closed".into()))??;
 
-        // Extract the file descriptor and create an async stream.
+        // Safety: fileDescriptor() returns the raw fd from VZVirtioSocketConnection.
+        // The connection object is alive (held by `connection`) for the duration.
         let raw_fd = unsafe { connection.0.fileDescriptor() };
         if raw_fd < 0 {
             return Err(VmmError::ProcessError(
@@ -551,8 +494,85 @@ impl VmmBackend for AppleVzBackend {
             ));
         }
 
-        VzVsockStream::from_vz_fd(raw_fd).map_err(|e| {
+        FdStream::from_dup_raw_fd(raw_fd).map_err(|e| {
             VmmError::ProcessError(format!("failed to create async vsock stream: {e}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_has_no_instances() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let backend = AppleVzBackend::new();
+        rt.block_on(async {
+            let instances = backend.instances.lock().await;
+            assert!(instances.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn vm_not_found_errors() {
+        let backend = AppleVzBackend::new();
+        let id = Uuid::new_v4();
+
+        assert!(matches!(
+            backend.vm_info(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.stop_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.destroy_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.pause_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.resume_vm(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            backend.vsock_connect(id, 52).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_sync_result_returns_value() {
+        let queue = DispatchQueue::new("com.husk.test.dispatch", None);
+        let result = dispatch_sync_result(queue, || 42).await.unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn dispatch_sync_fallible_propagates_error() {
+        let queue = DispatchQueue::new("com.husk.test.fallible", None);
+        let result: Result<(), VmmError> =
+            dispatch_sync_fallible(queue, || Err(VmmError::ProcessError("test error".into())))
+                .await;
+        assert!(matches!(result, Err(VmmError::ProcessError(ref msg)) if msg == "test error"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_sync_fallible_returns_ok() {
+        let queue = DispatchQueue::new("com.husk.test.fallible-ok", None);
+        let result: Result<String, VmmError> =
+            dispatch_sync_fallible(queue, || Ok("hello".to_string())).await;
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn drop_on_empty_backend_is_safe() {
+        let backend = AppleVzBackend::new();
+        drop(backend);
+        // No panic = pass
     }
 }

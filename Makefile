@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-release-macos sign-macos test test-unit lint fmt fmt-check clippy check check-macos clean install run-daemon
+.PHONY: all build build-release build-agent build-release-macos sign-macos test test-unit test-macos lint fmt fmt-check clippy check check-macos clean install run-daemon
 
 all: lint test
 
@@ -26,6 +26,11 @@ sign-macos:
 # Check compilation without linux-net (macOS path)
 check-macos:
 	cargo check --workspace --no-default-features
+
+# Run tests on macOS (without linux-net feature)
+# Excludes husk-api whose integration tests require linux-net
+test-macos:
+	cargo nextest run --workspace --no-default-features --exclude husk-api 2>/dev/null || cargo test --workspace --no-default-features --exclude husk-api
 
 # Run all tests
 test:
