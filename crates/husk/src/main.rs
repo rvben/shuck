@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-#[cfg(feature = "linux-net")]
 use tokio::io::AsyncReadExt;
+use tokio_tungstenite::tungstenite;
 
 #[derive(Parser)]
 #[command(name = "husk", about = "An open source microVM manager", version)]
@@ -627,11 +628,16 @@ async fn main() -> Result<()> {
     }
 }
 
+use husk_api::{WsShellInput, WsShellOutput};
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 /// Run an interactive shell session inside a VM.
 ///
-/// On Linux, connects directly to the Firecracker vsock UDS proxy.
-/// On macOS, the VZ vsock device is owned by the daemon process, so direct
-/// shell access from the CLI is not yet supported.
+/// On Linux, connects directly to the Firecracker vsock UDS proxy for lower
+/// latency. Falls back to the WebSocket path if the vsock socket is missing.
+/// On macOS, always uses the WebSocket path through the daemon.
 #[cfg(feature = "linux-net")]
 async fn run_shell(
     api_url: String,
@@ -659,19 +665,100 @@ async fn run_shell(
     let runtime_dir = config.data_dir.join("run");
     let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
 
-    let mut conn = husk_core::AgentClient::connect(&vsock_path, husk_agent_proto::AGENT_VSOCK_PORT)
+    // Try direct vsock first (lower latency), fall back to WebSocket.
+    if vsock_path.exists() {
+        let mut conn =
+            husk_core::AgentClient::connect(&vsock_path, husk_agent_proto::AGENT_VSOCK_PORT)
+                .await
+                .context("connecting to agent")?;
+
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+        conn.shell_start(command.as_deref(), cols, rows)
+            .await
+            .context("starting shell")?;
+
+        crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+
+        let result = run_shell_bridge(&mut conn).await;
+
+        crossterm::terminal::disable_raw_mode().ok();
+        println!();
+
+        match result {
+            Ok(exit_code) => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+            }
+            Err(e) => {
+                eprintln!("Shell error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // Direct vsock unavailable — use WebSocket through daemon.
+    run_shell_ws(&api_url, &name, command.as_deref()).await
+}
+
+#[cfg(not(feature = "linux-net"))]
+async fn run_shell(
+    api_url: String,
+    _config_path: Option<PathBuf>,
+    name: String,
+    command: Option<String>,
+) -> Result<()> {
+    run_shell_ws(&api_url, &name, command.as_deref()).await
+}
+
+/// WebSocket-based interactive shell, works on both Linux and macOS.
+async fn run_shell_ws(api_url: &str, name: &str, command: Option<&str>) -> Result<()> {
+    let ws_url = api_url
+        .replacen("http://", "ws://", 1)
+        .replacen("https://", "wss://", 1);
+    let url = format!("{ws_url}/v1/vms/{name}/shell");
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
-        .context("connecting to agent")?;
+        .context("connecting to daemon WebSocket")?;
+
+    let (mut ws_sink, mut ws_recv) = ws_stream.split();
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    conn.shell_start(command.as_deref(), cols, rows)
+    let start_msg = serde_json::to_string(&WsShellInput::Start {
+        command: command.map(String::from),
+        cols,
+        rows,
+    })?;
+    ws_sink
+        .send(tungstenite::Message::Text(start_msg.into()))
         .await
-        .context("starting shell")?;
+        .context("sending start message")?;
+
+    // Wait for Started response.
+    let started = ws_recv.next().await.context("no response from server")?;
+    match started {
+        Ok(tungstenite::Message::Text(text)) => {
+            let msg: WsShellOutput =
+                serde_json::from_str(&text).context("invalid server message")?;
+            match msg {
+                WsShellOutput::Started => {}
+                WsShellOutput::Error { message } => {
+                    anyhow::bail!("server error: {message}");
+                }
+                _ => anyhow::bail!("unexpected response from server"),
+            }
+        }
+        Ok(_) => anyhow::bail!("unexpected message type from server"),
+        Err(e) => anyhow::bail!("WebSocket error: {e}"),
+    }
 
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
 
-    let result = run_shell_bridge(&mut conn).await;
+    let result = run_shell_ws_bridge(&mut ws_sink, &mut ws_recv).await;
 
     crossterm::terminal::disable_raw_mode().ok();
     println!();
@@ -690,14 +777,72 @@ async fn run_shell(
     Ok(())
 }
 
-#[cfg(not(feature = "linux-net"))]
-async fn run_shell(
-    _api_url: String,
-    _config_path: Option<PathBuf>,
-    _name: String,
-    _command: Option<String>,
-) -> Result<()> {
-    anyhow::bail!("interactive shell not yet supported on macOS; use `husk exec` instead")
+/// Bridge raw stdin/stdout to a WebSocket shell session.
+///
+/// Reads raw stdin bytes directly (preserving escape sequences as-is) and
+/// detects terminal resizes via SIGWINCH. Handles SIGHUP for graceful shutdown.
+async fn run_shell_ws_bridge(
+    ws_sink: &mut futures_util::stream::SplitSink<WsStream, tungstenite::Message>,
+    ws_recv: &mut futures_util::stream::SplitStream<WsStream>,
+) -> Result<i32> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdin_buf = vec![0u8; 1024];
+    let mut sigwinch = signal(SignalKind::window_change()).context("registering SIGWINCH")?;
+    let mut sighup = signal(SignalKind::hangup()).context("registering SIGHUP")?;
+
+    loop {
+        tokio::select! {
+            result = stdin.read(&mut stdin_buf) => {
+                match result {
+                    Ok(0) => return Ok(0),
+                    Ok(n) => {
+                        let encoded = husk_agent_proto::base64_encode(&stdin_buf[..n]);
+                        let msg = serde_json::to_string(&WsShellInput::Data { data: encoded })?;
+                        ws_sink.send(tungstenite::Message::Text(msg.into())).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            _ = sigwinch.recv() => {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    let msg = serde_json::to_string(&WsShellInput::Resize { cols, rows })?;
+                    ws_sink.send(tungstenite::Message::Text(msg.into())).await?;
+                }
+            }
+            _ = sighup.recv() => {
+                let _ = ws_sink.send(tungstenite::Message::Close(None)).await;
+                return Ok(0);
+            }
+            ws_msg = ws_recv.next() => {
+                match ws_msg {
+                    Some(Ok(tungstenite::Message::Text(text))) => {
+                        let msg: WsShellOutput = serde_json::from_str(&text)?;
+                        match msg {
+                            WsShellOutput::Data { data } => {
+                                let bytes = husk_agent_proto::base64_decode(&data)
+                                    .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
+                                use std::io::Write;
+                                std::io::stdout().write_all(&bytes)?;
+                                std::io::stdout().flush()?;
+                            }
+                            WsShellOutput::Exit { exit_code } => {
+                                return Ok(exit_code);
+                            }
+                            WsShellOutput::Error { message } => {
+                                return Err(anyhow::anyhow!("agent error: {message}"));
+                            }
+                            WsShellOutput::Started => {}
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => return Ok(0),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(anyhow::anyhow!("WebSocket error: {e}")),
+                }
+            }
+        }
+    }
 }
 
 enum CpPath {
