@@ -4,15 +4,17 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 #[cfg(feature = "linux-net")]
 use axum::routing::delete;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info, warn};
 
-use husk_core::{CoreError, CreateVmRequest, HuskCore, VmRecord};
+use husk_core::{CoreError, CreateVmRequest, HuskCore, ShellEvent, VmRecord};
 use husk_vmm::VmmBackend;
 
 type AppState<B> = Arc<HuskCore<B>>;
@@ -101,6 +103,45 @@ struct PortForwardResponse {
     created_at: String,
 }
 
+// ── WebSocket Shell Types ─────────────────────────────────────────────
+
+/// Messages sent by the client to the server over the shell WebSocket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsShellInput {
+    Start {
+        command: Option<String>,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default = "default_rows")]
+        rows: u16,
+    },
+    Data {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+}
+
+fn default_cols() -> u16 {
+    80
+}
+fn default_rows() -> u16 {
+    24
+}
+
+/// Messages sent by the server to the client over the shell WebSocket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsShellOutput {
+    Started,
+    Data { data: String },
+    Exit { exit_code: i32 },
+    Error { message: String },
+}
+
 // ── Router ────────────────────────────────────────────────────────────
 
 /// Build the API router.
@@ -111,7 +152,8 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
-        .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>));
+        .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
+        .route("/v1/vms/{name}/shell", get(shell_ws::<B>));
 
     #[cfg(feature = "linux-net")]
     let router = router
@@ -264,6 +306,167 @@ async fn write_file_handler<B: VmmBackend + 'static>(
         .await
         .map_err(|e| map_error(e.into()))?;
     Ok(Json(WriteFileResponse { bytes_written }))
+}
+
+// ── WebSocket Shell Handler ───────────────────────────────────────────
+
+async fn shell_ws<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| shell_ws_session(core, name, socket))
+}
+
+async fn shell_ws_session<B: VmmBackend + 'static>(
+    core: Arc<HuskCore<B>>,
+    name: String,
+    mut ws: WebSocket,
+) {
+    // Wait for the Start message from the client.
+    let (command, cols, rows) = match ws.recv().await {
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsShellInput>(&text) {
+            Ok(WsShellInput::Start {
+                command,
+                cols,
+                rows,
+            }) => (command, cols, rows),
+            Ok(_) => {
+                let _ = send_ws_output(
+                    &mut ws,
+                    &WsShellOutput::Error {
+                        message: "expected 'start' message".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                let _ = send_ws_output(
+                    &mut ws,
+                    &WsShellOutput::Error {
+                        message: format!("invalid message: {e}"),
+                    },
+                )
+                .await;
+                return;
+            }
+        },
+        _ => return,
+    };
+
+    // Connect to the guest agent.
+    let mut conn = match core.agent_connect(&name).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            let _ = send_ws_output(
+                &mut ws,
+                &WsShellOutput::Error {
+                    message: format!("agent connect failed: {e}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Start the shell session inside the guest.
+    if let Err(e) = conn.shell_start(command.as_deref(), cols, rows).await {
+        let _ = send_ws_output(
+            &mut ws,
+            &WsShellOutput::Error {
+                message: format!("shell start failed: {e}"),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let _ = send_ws_output(&mut ws, &WsShellOutput::Started).await;
+
+    debug!(%name, "shell WebSocket session started");
+
+    // Bridge loop: relay data between WebSocket and agent shell.
+    //
+    // Backpressure: ws.send().await blocks when the TCP write buffer is full,
+    // which prevents the select loop from reading the next agent event until
+    // the client catches up. No additional buffering or flow control is needed.
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    ping_interval.reset(); // Don't fire immediately.
+
+    loop {
+        tokio::select! {
+            ws_msg = ws.recv() => {
+                match ws_msg {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<WsShellInput>(&text) {
+                            Ok(WsShellInput::Data { data }) => {
+                                let bytes = match husk_agent_proto::base64_decode(&data) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!("invalid base64 from client: {e}");
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = conn.shell_send(&bytes).await {
+                                    warn!("shell_send failed: {e}");
+                                    break;
+                                }
+                            }
+                            Ok(WsShellInput::Resize { cols, rows }) => {
+                                if let Err(e) = conn.shell_resize(cols, rows).await {
+                                    warn!("shell_resize failed: {e}");
+                                    break;
+                                }
+                            }
+                            Ok(WsShellInput::Start { .. }) => {}
+                            Err(e) => {
+                                warn!("invalid WS message: {e}");
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        warn!("WebSocket error: {e}");
+                        break;
+                    }
+                }
+            }
+            agent_event = conn.shell_recv() => {
+                match agent_event {
+                    Ok(ShellEvent::Data(data)) => {
+                        let encoded = husk_agent_proto::base64_encode(&data);
+                        if send_ws_output(&mut ws, &WsShellOutput::Data { data: encoded }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ShellEvent::Exit(code)) => {
+                        let _ = send_ws_output(&mut ws, &WsShellOutput::Exit { exit_code: code }).await;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = send_ws_output(&mut ws, &WsShellOutput::Error {
+                            message: format!("agent error: {e}"),
+                        }).await;
+                        break;
+                    }
+                }
+            }
+            _ = ping_interval.tick() => {
+                if ws.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    debug!(%name, "shell WebSocket session ended");
+}
+
+async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(msg).expect("WsShellOutput is always serializable");
+    ws.send(Message::Text(text.into())).await
 }
 
 // ── Port Forward Handlers ─────────────────────────────────────────────

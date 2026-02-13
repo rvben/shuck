@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # Web framework
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -53,6 +53,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Terminal
 crossterm = "0.28"
+
+# WebSocket
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
 
 # Hyper for Unix socket HTTP
 hyper = { version = "1", features = ["client", "http1"] }
