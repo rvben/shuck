@@ -47,6 +47,8 @@ pub struct VmRecord {
     pub rootfs_path: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub userdata: Option<String>,
+    pub userdata_status: Option<String>,
 }
 
 /// Persistent port forward record.
@@ -131,6 +133,11 @@ impl StateStore {
                 created_at TEXT NOT NULL
             );",
         )?;
+
+        // Migration: add userdata columns (idempotent via suppressed errors)
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata TEXT", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_status TEXT", []);
+
         Ok(())
     }
 
@@ -142,8 +149,8 @@ impl StateStore {
         conn.execute(
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                              created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                              created_at, updated_at, userdata, userdata_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -159,6 +166,8 @@ impl StateStore {
                 record.rootfs_path,
                 record.created_at.to_rfc3339(),
                 record.updated_at.to_rfc3339(),
+                record.userdata,
+                record.userdata_status,
             ],
         )
         .map_err(|e| match &e {
@@ -178,7 +187,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at
+                    created_at, updated_at, userdata, userdata_status
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -195,7 +204,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at
+                    created_at, updated_at, userdata, userdata_status
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -212,7 +221,7 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at
+                    created_at, updated_at, userdata, userdata_status
              FROM vms ORDER BY created_at",
         )?;
 
@@ -364,17 +373,39 @@ impl StateStore {
         Ok(records)
     }
 
+    /// Update the userdata execution status for a VM.
+    pub fn update_userdata_status(&self, id: Uuid, status: &str) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE vms SET userdata_status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Mark all VMs in transient states (`running`, `creating`, `paused`) as `stopped`.
     ///
     /// Called on daemon startup to reconcile persisted state with reality —
     /// VMs cannot survive a daemon restart, so any that claim to be running
     /// or paused are stale. Returns the number of VMs that were transitioned.
+    ///
+    /// Also resets any `userdata_status = 'running'` to `'pending'` so that
+    /// userdata interrupted by a daemon crash will be retried.
     pub fn mark_stale_vms_stopped(&self) -> Result<usize, StateError> {
         let conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
         let count = conn.execute(
             "UPDATE vms SET state = 'stopped', updated_at = ?1
              WHERE state IN ('running', 'creating', 'paused')",
-            params![Utc::now().to_rfc3339()],
+            params![now],
+        )?;
+        conn.execute(
+            "UPDATE vms SET userdata_status = 'pending', updated_at = ?1
+             WHERE userdata_status = 'running'",
+            params![now],
         )?;
         Ok(count)
     }
@@ -422,6 +453,8 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         rootfs_path: row.get(11)?,
         created_at: parse_datetime(&created_str)?,
         updated_at: parse_datetime(&updated_str)?,
+        userdata: row.get(14)?,
+        userdata_status: row.get(15)?,
     })
 }
 
@@ -445,6 +478,8 @@ mod tests {
             rootfs_path: "/images/rootfs.ext4".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            userdata: None,
+            userdata_status: None,
         }
     }
 
@@ -831,5 +866,90 @@ mod tests {
 
         let count = store.mark_stale_vms_stopped().unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ── Userdata ──────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_get_with_userdata() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("ud-vm");
+        rec.userdata = Some("#!/bin/sh\necho hello".into());
+        rec.userdata_status = Some("pending".into());
+        store.insert_vm(&rec).unwrap();
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.userdata.as_deref(), Some("#!/bin/sh\necho hello"));
+        assert_eq!(fetched.userdata_status.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn insert_without_userdata_returns_none() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("no-ud-vm");
+        store.insert_vm(&rec).unwrap();
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert!(fetched.userdata.is_none());
+        assert!(fetched.userdata_status.is_none());
+    }
+
+    #[test]
+    fn update_userdata_status() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("ud-status");
+        rec.userdata = Some("#!/bin/sh".into());
+        rec.userdata_status = Some("pending".into());
+        store.insert_vm(&rec).unwrap();
+
+        store.update_userdata_status(rec.id, "running").unwrap();
+        assert_eq!(
+            store.get_vm(rec.id).unwrap().userdata_status.as_deref(),
+            Some("running")
+        );
+
+        store.update_userdata_status(rec.id, "completed").unwrap();
+        assert_eq!(
+            store.get_vm(rec.id).unwrap().userdata_status.as_deref(),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn update_userdata_status_nonexistent_vm() {
+        let store = StateStore::open_memory().unwrap();
+        let result = store.update_userdata_status(Uuid::new_v4(), "running");
+        assert!(matches!(result, Err(StateError::VmNotFound(_))));
+    }
+
+    #[test]
+    fn mark_stale_resets_running_userdata() {
+        let store = StateStore::open_memory().unwrap();
+
+        let mut rec = make_record("ud-stale");
+        rec.userdata = Some("#!/bin/sh".into());
+        rec.userdata_status = Some("running".into());
+        store.insert_vm(&rec).unwrap();
+
+        store.mark_stale_vms_stopped().unwrap();
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.state, "stopped");
+        assert_eq!(fetched.userdata_status.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn mark_stale_preserves_completed_userdata() {
+        let store = StateStore::open_memory().unwrap();
+
+        let mut rec = make_record("ud-complete");
+        rec.userdata = Some("#!/bin/sh".into());
+        rec.userdata_status = Some("completed".into());
+        store.insert_vm(&rec).unwrap();
+
+        store.mark_stale_vms_stopped().unwrap();
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.userdata_status.as_deref(), Some("completed"));
     }
 }

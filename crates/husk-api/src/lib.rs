@@ -34,6 +34,8 @@ pub struct VmResponse {
     pub guest_ip: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userdata_status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +224,17 @@ async fn create_vm<B: VmmBackend + 'static>(
     Json(req): Json<CreateVmRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
     let record = core.create_vm(req).await.map_err(map_error)?;
+
+    if record.userdata.is_some() {
+        let core = Arc::clone(&core);
+        let vm_name = record.name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = core.run_userdata(&vm_name).await {
+                warn!(%vm_name, error = %e, "userdata execution failed");
+            }
+        });
+    }
+
     Ok((StatusCode::CREATED, Json(record_to_response(record))))
 }
 
@@ -571,6 +584,7 @@ fn record_to_response(r: VmRecord) -> VmResponse {
         guest_ip: r.guest_ip,
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
+        userdata_status: r.userdata_status,
     }
 }
 

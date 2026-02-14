@@ -362,6 +362,8 @@ async fn vm_response_json_structure() {
         rootfs_path: "/images/rootfs.ext4".into(),
         created_at: now,
         updated_at: now,
+        userdata: None,
+        userdata_status: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -440,6 +442,8 @@ async fn list_vms_returns_all_records() {
             rootfs_path: "/images/rootfs.ext4".into(),
             created_at: now,
             updated_at: now,
+            userdata: None,
+            userdata_status: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -671,6 +675,8 @@ async fn list_port_forwards_empty_for_existing_vm() {
         rootfs_path: "/images/rootfs.ext4".into(),
         created_at: now,
         updated_at: now,
+        userdata: None,
+        userdata_status: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -727,6 +733,8 @@ async fn vm_response_with_null_optional_fields() {
         rootfs_path: "/images/rootfs.ext4".into(),
         created_at: now,
         updated_at: now,
+        userdata: None,
+        userdata_status: None,
     };
     state.insert_vm(&record).unwrap();
 

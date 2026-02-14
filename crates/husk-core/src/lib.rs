@@ -50,6 +50,9 @@ pub struct CreateVmRequest {
     /// Path to an initramfs/initrd image (needed for kernels with modular drivers).
     #[serde(default)]
     pub initrd_path: Option<PathBuf>,
+    /// Userdata script to execute after VM boots.
+    #[serde(default)]
+    pub userdata: Option<String>,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -196,6 +199,7 @@ impl<B: VmmBackend> HuskCore<B> {
         let info = self.vmm.create_vm(vm_config).await?;
         resources.vm_id = Some(info.id);
 
+        let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
         let now = chrono::Utc::now();
         let record = VmRecord {
             id: info.id,
@@ -212,6 +216,8 @@ impl<B: VmmBackend> HuskCore<B> {
             rootfs_path: req.rootfs_path.to_string_lossy().into_owned(),
             created_at: now,
             updated_at: now,
+            userdata: req.userdata,
+            userdata_status,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -267,6 +273,7 @@ impl<B: VmmBackend> HuskCore<B> {
         let info = self.vmm.create_vm(vm_config).await?;
         resources.vm_id = Some(info.id);
 
+        let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
         let now = chrono::Utc::now();
         let record = VmRecord {
             id: info.id,
@@ -283,6 +290,8 @@ impl<B: VmmBackend> HuskCore<B> {
             rootfs_path: req.rootfs_path.to_string_lossy().into_owned(),
             created_at: now,
             updated_at: now,
+            userdata: req.userdata,
+            userdata_status,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -442,6 +451,78 @@ impl<B: VmmBackend> HuskCore<B> {
             .vsock_connect(record.id, husk_agent_proto::AGENT_VSOCK_PORT)
             .await?;
         Ok(AgentConnection::new(stream))
+    }
+
+    /// Execute the userdata script inside a running VM.
+    ///
+    /// Retries agent connection with exponential backoff (up to 30s total),
+    /// writes the script to `/tmp/husk-userdata.sh`, executes it via `sh`,
+    /// and updates `userdata_status` to `completed` or `failed`.
+    pub async fn run_userdata(&self, name: &str) -> Result<(), CoreError> {
+        let record = self.lookup_vm(name)?;
+        let script = match record.userdata {
+            Some(ref s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        self.state.update_userdata_status(record.id, "running")?;
+
+        let result: Result<(), CoreError> = async {
+            // Retry agent connection with backoff — the guest agent may
+            // not be listening yet immediately after VM boot. Only retry
+            // transient connection errors; bail immediately on state errors
+            // (e.g. VM destroyed or stopped while we were waiting).
+            let mut conn = {
+                let mut backoff = std::time::Duration::from_secs(1);
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    match self.agent_connect(name).await {
+                        Ok(c) => break c,
+                        Err(ref e @ (CoreError::Vmm(_) | CoreError::Agent(_)))
+                            if tokio::time::Instant::now() + backoff < deadline =>
+                        {
+                            debug!(
+                                %name,
+                                error = %e,
+                                retry_in = ?backoff,
+                                "agent not ready, retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+
+            conn.write_file("/tmp/husk-userdata.sh", script.as_bytes(), Some(0o755))
+                .await?;
+
+            let exec_result = conn
+                .exec("sh", &["/tmp/husk-userdata.sh"], None, &[])
+                .await?;
+
+            if exec_result.exit_code == 0 {
+                self.state.update_userdata_status(record.id, "completed")?;
+            } else {
+                warn!(
+                    %name,
+                    exit_code = exec_result.exit_code,
+                    stderr = %exec_result.stderr,
+                    "userdata script failed"
+                );
+                self.state.update_userdata_status(record.id, "failed")?;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(ref e) = result {
+            warn!(%name, error = %e, "userdata execution error");
+            let _ = self.state.update_userdata_status(record.id, "failed");
+        }
+
+        result
     }
 
     /// Add a port forward from a host port to a guest port on a VM.

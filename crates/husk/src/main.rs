@@ -297,6 +297,12 @@ async fn main() -> Result<()> {
             if let Some(ref initrd_path) = initrd {
                 body["initrd_path"] = serde_json::json!(initrd_path);
             }
+            if let Some(ref userdata_path) = userdata {
+                let script = std::fs::read_to_string(userdata_path).with_context(|| {
+                    format!("reading userdata script {}", userdata_path.display())
+                })?;
+                body["userdata"] = serde_json::json!(script);
+            }
 
             let client = reqwest::Client::new();
             let resp =
@@ -318,81 +324,8 @@ async fn main() -> Result<()> {
             println!("  CPUs:  {}", vm["vcpu_count"]);
             println!("  RAM:   {} MiB", vm["mem_size_mib"]);
 
-            if let Some(ref userdata_path) = userdata {
-                println!("Running userdata script: {}", userdata_path.display());
-                let script = std::fs::read(userdata_path).with_context(|| {
-                    format!("reading userdata script {}", userdata_path.display())
-                })?;
-                let encoded = husk_agent_proto::base64_encode(&script);
-
-                let write_body = serde_json::json!({
-                    "path": "/tmp/husk-userdata.sh",
-                    "data": encoded,
-                    "mode": 0o755_u32,
-                });
-
-                // Wait for agent to be ready
-                let mut agent_ready = false;
-                for attempt in 0..30 {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let check = client
-                        .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
-                        .json(&serde_json::json!({"command": "true", "args": []}))
-                        .send()
-                        .await;
-                    if let Ok(r) = check
-                        && r.status().is_success()
-                    {
-                        agent_ready = true;
-                        break;
-                    }
-                    if attempt % 5 == 4 {
-                        eprintln!("Waiting for agent to be ready...");
-                    }
-                }
-
-                if !agent_ready {
-                    eprintln!("Warning: agent not ready, skipping userdata script");
-                } else {
-                    // Write the script into the VM
-                    let resp = client
-                        .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
-                        .json(&write_body)
-                        .send()
-                        .await
-                        .context("writing userdata script")?;
-
-                    if !resp.status().is_success() {
-                        eprintln!("Warning: failed to write userdata script");
-                    } else {
-                        // Execute it
-                        let exec_body = serde_json::json!({
-                            "command": "sh",
-                            "args": ["/tmp/husk-userdata.sh"],
-                        });
-                        let resp = client
-                            .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
-                            .json(&exec_body)
-                            .send()
-                            .await
-                            .context("executing userdata script")?;
-
-                        if resp.status().is_success() {
-                            let result: serde_json::Value = resp.json().await?;
-                            let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
-                            if exit_code != 0 {
-                                eprintln!(
-                                    "Warning: userdata script exited with code {}",
-                                    exit_code
-                                );
-                            } else {
-                                println!("Userdata script completed successfully");
-                            }
-                        } else {
-                            eprintln!("Warning: failed to execute userdata script");
-                        }
-                    }
-                }
+            if userdata.is_some() {
+                println!("  Userdata script queued (check status with `husk info {name}`)");
             }
             Ok(())
         }
@@ -446,6 +379,9 @@ async fn main() -> Result<()> {
             }
             if let Some(ip) = vm["host_ip"].as_str() {
                 println!("Host IP:   {ip}");
+            }
+            if let Some(status) = vm["userdata_status"].as_str() {
+                println!("Userdata:  {status}");
             }
             println!("ID:        {}", s("id"));
             Ok(())

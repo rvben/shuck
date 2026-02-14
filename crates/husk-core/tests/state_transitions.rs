@@ -124,6 +124,8 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskCore<MockVmm>>, Uuid) 
         rootfs_path: "/images/rootfs.ext4".into(),
         created_at: now,
         updated_at: now,
+        userdata: None,
+        userdata_status: None,
     };
     state_store.insert_vm(&record).unwrap();
 
