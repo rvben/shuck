@@ -307,11 +307,21 @@ impl<B: VmmBackend> HuskCore<B> {
     }
 
     /// Destroy a VM and clean up all associated resources.
+    ///
+    /// If the VM is already stopped or the VMM backend no longer tracks it
+    /// (e.g. after a daemon restart), the VMM destroy step is skipped and
+    /// only state/storage cleanup is performed.
     pub async fn destroy_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "destroying VM");
         let record = self.lookup_vm(name)?;
 
-        self.vmm.destroy_vm(record.id).await?;
+        match self.vmm.destroy_vm(record.id).await {
+            Ok(()) => {}
+            Err(husk_vmm::VmmError::VmNotFound(_)) => {
+                debug!(%name, "VM not in VMM backend, cleaning up state only");
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         #[cfg(feature = "linux-net")]
         {
