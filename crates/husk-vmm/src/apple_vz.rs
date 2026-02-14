@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
+use libc;
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
@@ -43,7 +44,15 @@ struct QueueConfined<T>(T);
 unsafe impl<T> Send for QueueConfined<T> {}
 unsafe impl<T> Sync for QueueConfined<T> {}
 
-/// Type alias — the vsock stream is a cross-platform `FdStream` from `fd_stream.rs`.
+/// Vsock stream type alias for Apple VZ.
+///
+/// `FdStream::from_dup_raw_fd()` creates an independent fd via `dup(2)`.
+/// The dup'd fd survives `VZVirtioSocketConnection` deallocation because
+/// `dup()` creates a separate file description reference — the kernel keeps
+/// the underlying socket alive as long as any fd references it. This is the
+/// same pattern used by the Go VZ bindings (`Code-Hex/vz`), which extract
+/// the fd via `net.FileConn` (which calls `dup`) and let the ObjC connection
+/// object be deallocated.
 pub type VzVsockStream = FdStream;
 
 // ── Instance tracking ───────────────────────────────────────────────────
@@ -431,9 +440,7 @@ impl VmmBackend for AppleVzBackend {
 
         // Connect to the guest vsock port via the VZ socket device.
         // This must execute on the VM's dispatch queue.
-        let (tx, rx) = tokio::sync::oneshot::channel::<
-            Result<QueueConfined<Retained<VZVirtioSocketConnection>>, VmmError>,
-        >();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<i32, VmmError>>();
         let tx = Arc::new(StdMutex::new(Some(tx)));
 
         tokio::task::spawn_blocking(move || {
@@ -467,17 +474,22 @@ impl VmmBackend for AppleVzBackend {
                 let handler = RcBlock::new(
                     move |conn: *mut VZVirtioSocketConnection, error: *mut NSError| {
                         let result = if error.is_null() && !conn.is_null() {
-                            // Safety: conn is non-null (checked above) and points to a
-                            // valid ObjC object from the VZ completion handler.
-                            let Some(conn) = (unsafe { Retained::retain(conn) }) else {
-                                if let Some(tx) = tx_inner.lock().ok().and_then(|mut g| g.take()) {
-                                    let _ = tx.send(Err(VmmError::ProcessError(
-                                        "failed to retain VZVirtioSocketConnection".into(),
-                                    )));
-                                }
-                                return;
-                            };
-                            Ok(QueueConfined(conn))
+                            // Safety: conn is non-null and points to a valid ObjC object
+                            // from the VZ completion handler.
+                            let raw_fd = unsafe { (*conn).fileDescriptor() };
+                            // Dup the fd NOW while the connection is still alive.
+                            // After this handler returns, VZ may deallocate the
+                            // connection and close raw_fd. The dup'd fd is an
+                            // independent kernel reference that survives deallocation.
+                            let dup_fd = unsafe { libc::dup(raw_fd) };
+                            if dup_fd < 0 {
+                                Err(VmmError::ProcessError(format!(
+                                    "failed to dup vsock fd: {}",
+                                    std::io::Error::last_os_error()
+                                )))
+                            } else {
+                                Ok(dup_fd)
+                            }
                         } else if !error.is_null() {
                             // Safety: non-null NSError pointer from VZ completion handler;
                             // valid for the duration of the callback under ObjC ARC.
@@ -504,22 +516,17 @@ impl VmmBackend for AppleVzBackend {
         .await
         .map_err(|e| VmmError::ProcessError(format!("dispatch join: {e}")))?;
 
-        let connection = rx
+        let dup_fd = rx
             .await
             .map_err(|_| VmmError::ProcessError("vsock completion channel closed".into()))??;
 
-        // Safety: fileDescriptor() returns the raw fd from VZVirtioSocketConnection.
-        // The connection object is alive (held by `connection`) for the duration.
-        let raw_fd = unsafe { connection.0.fileDescriptor() };
-        if raw_fd < 0 {
-            return Err(VmmError::ProcessError(
-                "vsock connection returned invalid fd".into(),
-            ));
+        // Safety: dup_fd is a valid fd that we own — it was dup'd inside the
+        // completion handler while the VZ connection was still alive.
+        unsafe {
+            FdStream::from_owned_raw_fd(dup_fd).map_err(|e| {
+                VmmError::ProcessError(format!("failed to create async vsock stream: {e}"))
+            })
         }
-
-        FdStream::from_dup_raw_fd(raw_fd).map_err(|e| {
-            VmmError::ProcessError(format!("failed to create async vsock stream: {e}"))
-        })
     }
 }
 

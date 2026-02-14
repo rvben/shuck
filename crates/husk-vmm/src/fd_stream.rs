@@ -29,6 +29,14 @@ impl FdStream {
     /// # Errors
     ///
     /// Returns an error if `dup(2)`, `fcntl(2)`, or tokio registration fails.
+    /// Create from a raw file descriptor by duplicating it.
+    ///
+    /// The original fd remains owned by the caller. The duplicate is set to
+    /// non-blocking mode and wrapped for async I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `dup(2)`, `fcntl(2)`, or tokio registration fails.
     pub fn from_dup_raw_fd(raw_fd: RawFd) -> io::Result<Self> {
         // Safety: dup(2) returns a new fd or -1 on error. We check the return
         // value before using it.
@@ -37,24 +45,39 @@ impl FdStream {
             return Err(io::Error::last_os_error());
         }
 
-        // Safety: fcntl(2) with F_GETFL/F_SETFL to enable O_NONBLOCK.
-        // On error we close the dup'd fd to avoid leaking it.
-        unsafe {
-            let flags = libc::fcntl(dup_fd, libc::F_GETFL);
-            if flags < 0 {
-                libc::close(dup_fd);
-                return Err(io::Error::last_os_error());
-            }
-            if libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                libc::close(dup_fd);
-                return Err(io::Error::last_os_error());
-            }
-        }
-
         // Safety: dup_fd is a valid, open fd that we own (from dup above).
-        let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-        let async_fd = AsyncFd::new(owned)?;
-        Ok(Self { fd: async_fd })
+        unsafe { Self::from_owned_raw_fd(dup_fd) }
+    }
+
+    /// Create from a raw file descriptor, taking ownership.
+    ///
+    /// The fd is set to non-blocking mode and registered with the tokio reactor.
+    /// On error the fd is closed to avoid leaking it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `raw_fd` is a valid, open file descriptor that
+    /// they own exclusively. The fd must not be used or closed by the caller
+    /// after this call.
+    pub unsafe fn from_owned_raw_fd(raw_fd: RawFd) -> io::Result<Self> {
+        // Safety: fcntl(2) with F_GETFL/F_SETFL to enable O_NONBLOCK.
+        // On error we close the fd to avoid leaking it.
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            if flags < 0 {
+                libc::close(raw_fd);
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                libc::close(raw_fd);
+                return Err(io::Error::last_os_error());
+            }
+
+            // raw_fd is a valid, open fd that we own (caller's contract).
+            let owned = OwnedFd::from_raw_fd(raw_fd);
+            let async_fd = AsyncFd::new(owned)?;
+            Ok(Self { fd: async_fd })
+        }
     }
 }
 
@@ -187,6 +210,34 @@ mod tests {
     #[test]
     fn invalid_fd_returns_error() {
         let result = FdStream::from_dup_raw_fd(-1);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn from_owned_raw_fd_roundtrip() {
+        let (fd_a, fd_b) = make_socket_pair();
+        // Dup manually, then pass the dup'd fd as owned
+        let dup_a = unsafe { libc::dup(fd_a.as_raw_fd()) };
+        let dup_b = unsafe { libc::dup(fd_b.as_raw_fd()) };
+        assert!(dup_a >= 0);
+        assert!(dup_b >= 0);
+        drop(fd_a);
+        drop(fd_b);
+
+        let mut stream_a = unsafe { FdStream::from_owned_raw_fd(dup_a).unwrap() };
+        let mut stream_b = unsafe { FdStream::from_owned_raw_fd(dup_b).unwrap() };
+
+        stream_a.write_all(b"owned-fd-test").await.unwrap();
+        stream_a.shutdown().await.unwrap();
+
+        let mut buf = String::new();
+        stream_b.read_to_string(&mut buf).await.unwrap();
+        assert_eq!(buf, "owned-fd-test");
+    }
+
+    #[test]
+    fn from_owned_raw_fd_invalid_returns_error() {
+        let result = unsafe { FdStream::from_owned_raw_fd(-1) };
         assert!(result.is_err());
     }
 
