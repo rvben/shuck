@@ -29,14 +29,6 @@ impl FdStream {
     /// # Errors
     ///
     /// Returns an error if `dup(2)`, `fcntl(2)`, or tokio registration fails.
-    /// Create from a raw file descriptor by duplicating it.
-    ///
-    /// The original fd remains owned by the caller. The duplicate is set to
-    /// non-blocking mode and wrapped for async I/O.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `dup(2)`, `fcntl(2)`, or tokio registration fails.
     pub fn from_dup_raw_fd(raw_fd: RawFd) -> io::Result<Self> {
         // Safety: dup(2) returns a new fd or -1 on error. We check the return
         // value before using it.

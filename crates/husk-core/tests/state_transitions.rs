@@ -213,6 +213,24 @@ async fn destroy_stopped_vm() {
     assert!(matches!(err, CoreError::VmNotFound(_)));
 }
 
+#[tokio::test]
+async fn destroy_paused_vm() {
+    let (core, _) = mock_core_with_vm("test-vm", "paused");
+    core.destroy_vm("test-vm").await.unwrap();
+
+    let err = core.get_vm("test-vm").unwrap_err();
+    assert!(matches!(err, CoreError::VmNotFound(_)));
+}
+
+#[tokio::test]
+async fn destroy_failed_vm() {
+    let (core, _) = mock_core_with_vm("test-vm", "failed");
+    core.destroy_vm("test-vm").await.unwrap();
+
+    let err = core.get_vm("test-vm").unwrap_err();
+    assert!(matches!(err, CoreError::VmNotFound(_)));
+}
+
 // ── Invalid Transitions ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -345,5 +363,70 @@ async fn multiple_pause_resume_cycles() {
 
         core.resume_vm("test-vm").await.unwrap();
         assert_eq!(core.get_vm("test-vm").unwrap().state, "running");
+    }
+}
+
+// ── Agent Connect State Validation ───────────────────────────────────
+//
+// agent_connect (used by exec, shell, file operations) requires "running"
+// state. Verify it rejects paused, stopped, and failed VMs.
+
+#[tokio::test]
+async fn agent_connect_rejects_paused_vm() {
+    let (core, _) = mock_core_with_vm("test-vm", "paused");
+    let result = core.agent_connect("test-vm").await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("agent_connect should reject non-running VM"),
+    };
+
+    match err {
+        CoreError::InvalidState {
+            actual, expected, ..
+        } => {
+            assert_eq!(actual, "paused");
+            assert_eq!(expected, "running");
+        }
+        other => panic!("expected InvalidState, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn agent_connect_rejects_stopped_vm() {
+    let (core, _) = mock_core_with_vm("test-vm", "stopped");
+    let result = core.agent_connect("test-vm").await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("agent_connect should reject non-running VM"),
+    };
+
+    match err {
+        CoreError::InvalidState {
+            actual, expected, ..
+        } => {
+            assert_eq!(actual, "stopped");
+            assert_eq!(expected, "running");
+        }
+        other => panic!("expected InvalidState, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn agent_connect_rejects_failed_vm() {
+    let (core, _) = mock_core_with_vm("test-vm", "failed");
+    let result = core.agent_connect("test-vm").await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("agent_connect should reject non-running VM"),
+    };
+
+    match err {
+        CoreError::InvalidState {
+            actual, expected, ..
+        } => {
+            assert_eq!(actual, "failed");
+            assert_eq!(expected, "running");
+        }
+        other => panic!("expected InvalidState, got: {other}"),
     }
 }
