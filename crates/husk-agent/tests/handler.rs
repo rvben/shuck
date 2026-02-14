@@ -211,15 +211,26 @@ async fn shell_echo_with_cat() {
     });
     write_message(&mut stream, &request).await.unwrap();
 
-    // Read echoed output
-    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
-    match response {
-        AgentResponse::ShellData(d) => {
-            let bytes = base64_decode(&d.data).unwrap();
-            assert_eq!(bytes, b"hello\n");
+    // Collect output — with a PTY, the terminal echoes input and cat re-echoes it,
+    // both with \r\n line endings (onlcr converts \n to \r\n).
+    let mut output = Vec::new();
+    while let Ok(Ok(Some(AgentResponse::ShellData(d)))) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_message::<AgentResponse, _>(&mut stream),
+    )
+    .await
+    {
+        output.extend(base64_decode(&d.data).unwrap());
+        if output.windows(5).any(|w| w == b"hello") {
+            break;
         }
-        other => panic!("expected ShellData, got {other:?}"),
     }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("hello"),
+        "expected output to contain 'hello', got: {text:?}"
+    );
 
     // Drop the stream to close stdin, which causes cat to exit
     drop(stream);
@@ -259,8 +270,8 @@ async fn shell_immediate_exit() {
         }
     };
 
-    // `echo` with no args outputs a newline
-    assert_eq!(output_data, b"\n");
+    // `echo` with no args outputs a newline; PTY onlcr converts \n to \r\n
+    assert_eq!(output_data, b"\r\n");
     assert_eq!(exit_code, 0);
 }
 
@@ -328,14 +339,25 @@ async fn shell_resize_accepted() {
     });
     write_message(&mut stream, &request).await.unwrap();
 
-    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
-    match response {
-        AgentResponse::ShellData(d) => {
-            let bytes = base64_decode(&d.data).unwrap();
-            assert_eq!(bytes, b"test\n");
+    // Collect output — PTY echoes input with \r\n line endings
+    let mut output = Vec::new();
+    while let Ok(Ok(Some(AgentResponse::ShellData(d)))) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_message::<AgentResponse, _>(&mut stream),
+    )
+    .await
+    {
+        output.extend(base64_decode(&d.data).unwrap());
+        if output.windows(4).any(|w| w == b"test") {
+            break;
         }
-        other => panic!("expected ShellData, got {other:?}"),
     }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("test"),
+        "expected output to contain 'test', got: {text:?}"
+    );
 
     drop(stream);
 }

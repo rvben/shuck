@@ -378,10 +378,22 @@ async fn shell_start_and_echo_via_cat() {
 
     conn.shell_send(b"hello\n").await.unwrap();
 
-    match conn.shell_recv().await.unwrap() {
-        ShellEvent::Data(data) => assert_eq!(data, b"hello\n"),
-        ShellEvent::Exit(code) => panic!("unexpected exit with code {code}"),
+    // Collect output — PTY echoes input with \r\n endings
+    let mut output = Vec::new();
+    while let Ok(Ok(ShellEvent::Data(data))) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), conn.shell_recv()).await
+    {
+        output.extend(data);
+        if output.windows(5).any(|w| w == b"hello") {
+            break;
+        }
     }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("hello"),
+        "expected output to contain 'hello', got: {text:?}"
+    );
 }
 
 #[tokio::test]
@@ -403,7 +415,8 @@ async fn shell_with_echo_command() {
     };
 
     assert_eq!(exit_code, 0);
-    assert_eq!(output, b"\n");
+    // PTY onlcr converts \n to \r\n
+    assert_eq!(output, b"\r\n");
 }
 
 #[tokio::test]
@@ -441,12 +454,22 @@ async fn shell_resize_does_not_disrupt_session() {
     // Session should still be functional after resize
     conn.shell_send(b"after-resize\n").await.unwrap();
 
-    match conn.shell_recv().await.unwrap() {
-        ShellEvent::Data(data) => {
-            assert_eq!(data, b"after-resize\n");
+    // Collect output — PTY echoes input with \r\n endings
+    let mut output = Vec::new();
+    while let Ok(Ok(ShellEvent::Data(data))) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), conn.shell_recv()).await
+    {
+        output.extend(data);
+        if output.windows(12).any(|w| w == b"after-resize") {
+            break;
         }
-        ShellEvent::Exit(code) => panic!("unexpected exit with code {code}"),
     }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("after-resize"),
+        "expected output to contain 'after-resize', got: {text:?}"
+    );
 }
 
 #[tokio::test]

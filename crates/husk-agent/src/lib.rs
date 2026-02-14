@@ -1,3 +1,7 @@
+mod pty;
+
+use std::os::fd::AsRawFd;
+
 use anyhow::Result;
 use husk_agent_proto::{
     AgentRequest, AgentResponse, ErrorResponse, ExecResponse, ReadFileResponse, ShellDataResponse,
@@ -40,13 +44,45 @@ where
 {
     let command = req.command.as_deref().unwrap_or("/bin/sh");
 
-    let mut child = match tokio::process::Command::new(command)
-        .envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+    let (mut master, slave) = match pty::Pty::open(req.cols, req.rows) {
+        Ok(pair) => pair,
+        Err(e) => {
+            let resp = AgentResponse::Error(ErrorResponse {
+                message: format!("failed to open PTY: {e}"),
+            });
+            write_message(stream, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    let slave_raw = slave.as_raw_fd();
+    let master_raw = master.as_raw_fd();
+
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    cmd.stdin(std::process::Stdio::from(slave.try_clone()?));
+    cmd.stdout(std::process::Stdio::from(slave.try_clone()?));
+    cmd.stderr(std::process::Stdio::from(slave));
+
+    // Safety: pre_exec runs after fork() but before exec() in the child.
+    // setsid() creates a new session, TIOCSCTTY makes the PTY slave the
+    // controlling terminal. slave_raw is valid because fds are inherited
+    // across fork. We close master_raw so it doesn't leak into the child
+    // (openpty doesn't set FD_CLOEXEC).
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::close(master_raw);
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_raw, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let resp = AgentResponse::Error(ErrorResponse {
@@ -59,44 +95,24 @@ where
 
     write_message(stream, &AgentResponse::ShellStarted).await?;
 
-    let mut child_stdin = child.stdin.take().unwrap();
-    let child_stdout = child.stdout.take().unwrap();
-    let child_stderr = child.stderr.take().unwrap();
-
-    let mut stdout_buf = vec![0u8; 4096];
-    let mut stderr_buf = vec![0u8; 4096];
-    let mut stdout_reader = child_stdout;
-    let mut stderr_reader = child_stderr;
-    let mut stdout_closed = false;
-    let mut stderr_closed = false;
+    let mut pty_buf = vec![0u8; 4096];
 
     loop {
         tokio::select! {
-            result = stdout_reader.read(&mut stdout_buf), if !stdout_closed => {
+            result = master.read(&mut pty_buf) => {
                 match result {
-                    Ok(0) => {
-                        stdout_closed = true;
-                    }
+                    Ok(0) => break,
                     Ok(n) => {
-                        let data = base64_encode(&stdout_buf[..n]);
+                        let data = base64_encode(&pty_buf[..n]);
                         write_message(stream, &AgentResponse::ShellData(ShellDataResponse { data })).await?;
                     }
-                    Err(_) => {
-                        stdout_closed = true;
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        // EIO on PTY master means the slave side closed (child exited)
+                        break;
                     }
-                }
-            }
-            result = stderr_reader.read(&mut stderr_buf), if !stderr_closed => {
-                match result {
-                    Ok(0) => {
-                        stderr_closed = true;
-                    }
-                    Ok(n) => {
-                        let data = base64_encode(&stderr_buf[..n]);
-                        write_message(stream, &AgentResponse::ShellData(ShellDataResponse { data })).await?;
-                    }
-                    Err(_) => {
-                        stderr_closed = true;
+                    Err(e) => {
+                        warn!("PTY read error: {e}");
+                        break;
                     }
                 }
             }
@@ -104,35 +120,30 @@ where
                 match msg {
                     Ok(Some(AgentRequest::ShellData(req))) => {
                         if let Ok(data) = base64_decode(&req.data) {
-                            let _ = child_stdin.write_all(&data).await;
-                            let _ = child_stdin.flush().await;
+                            let _ = master.write_all(&data).await;
                         }
                     }
-                    Ok(Some(AgentRequest::ShellResize(_))) => {
-                        // No-op for piped mode; requires PTY for real resize
+                    Ok(Some(AgentRequest::ShellResize(req))) => {
+                        if let Err(e) = master.resize(req.cols, req.rows) {
+                            warn!("PTY resize failed: {e}");
+                        }
                     }
                     Ok(None) | Err(_) => {
-                        // Host disconnected — kill the shell
                         let _ = child.kill().await;
                         return Ok(());
                     }
-                    Ok(Some(_)) => {
-                        // Unexpected message type during shell — ignore
-                    }
+                    Ok(Some(_)) => {}
                 }
             }
             status = child.wait() => {
                 let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                // Drain any remaining stdout
+                // Drain remaining PTY output with a timeout to avoid blocking
+                // if the master side has no pending data.
                 let mut remaining = Vec::new();
-                let _ = AsyncReadExt::read_to_end(&mut stdout_reader, &mut remaining).await;
-                if !remaining.is_empty() {
-                    let data = base64_encode(&remaining);
-                    write_message(stream, &AgentResponse::ShellData(ShellDataResponse { data })).await?;
-                }
-                // Drain any remaining stderr
-                let mut remaining = Vec::new();
-                let _ = AsyncReadExt::read_to_end(&mut stderr_reader, &mut remaining).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    master.read_to_end(&mut remaining),
+                ).await;
                 if !remaining.is_empty() {
                     let data = base64_encode(&remaining);
                     write_message(stream, &AgentResponse::ShellData(ShellDataResponse { data })).await?;
@@ -142,6 +153,19 @@ where
             }
         }
     }
+
+    // PTY EOF — wait for the child to exit
+    let exit_code = child
+        .wait()
+        .await
+        .map(|s| s.code().unwrap_or(-1))
+        .unwrap_or(-1);
+    write_message(
+        stream,
+        &AgentResponse::ShellExit(ShellExitResponse { exit_code }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn handle_request(request: AgentRequest) -> AgentResponse {
