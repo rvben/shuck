@@ -1,0 +1,28 @@
+# /etc/inittab
+
+::sysinit:/bin/mkdir -p /proc /sys /dev /tmp /var/log /run /lib/modules
+::sysinit:/bin/mount -t proc proc /proc
+::sysinit:/bin/mount -t sysfs sys /sys
+::sysinit:/bin/mount -t devtmpfs devtmpfs /dev
+::sysinit:/bin/mkdir -p /dev/pts
+::sysinit:/bin/mount -t devpts devpts /dev/pts
+
+# Load vsock and network modules
+::sysinit:/sbin/insmod /lib/modules/vsock.ko
+::sysinit:/sbin/insmod /lib/modules/vmw_vsock_virtio_transport_common.ko
+::sysinit:/sbin/insmod /lib/modules/vmw_vsock_virtio_transport.ko
+::sysinit:/sbin/insmod /lib/modules/virtio_net.ko
+
+# Network: bring up loopback and DHCP on eth0
+::sysinit:/sbin/ip link set lo up
+::sysinit:/sbin/ip link set eth0 up 2>/dev/null
+::sysinit:/sbin/udhcpc -b -i eth0 -s /etc/udhcpc/default.script 2>/dev/null &
+
+# Start husk guest agent
+::respawn:/usr/local/bin/husk-agent
+
+# Virtio console for Apple VZ
+hvc0::respawn:/sbin/getty -L 115200 hvc0 vt100
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r

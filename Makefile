@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos lint fmt fmt-check clippy check check-macos clean install run-daemon
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs
 
 all: lint test
 
@@ -68,9 +68,51 @@ check:
 clean:
 	cargo clean
 
-# Install husk binary
+# Install husk binary (auto-detects macOS to disable linux-net and sign)
 install:
+ifeq ($(shell uname -s),Darwin)
+	cargo install --path crates/husk --no-default-features
+	codesign --entitlements husk.entitlements --force --sign - "$$(which husk)"
+else
 	cargo install --path crates/husk
+endif
+
+# Install and restart daemon (development workflow)
+install-restart: install
+	@pkill -f "husk daemon" 2>/dev/null || true
+	@sleep 1
+	@nohup husk daemon > /tmp/husk-daemon.log 2>&1 &
+	@echo "Daemon restarted (log: /tmp/husk-daemon.log)"
+
+# Run E2E tests (requires running daemon and a booted VM)
+test-e2e:
+	cargo nextest run --package husk --test e2e -- --ignored 2>/dev/null || cargo test --package husk --test e2e -- --ignored
+
+# Update guest rootfs image with latest agent binary and inittab.
+# Requires: aarch64-linux-musl-gcc cross-compiler, e2fsprogs (brew install e2fsprogs)
+ROOTFS_IMAGE ?= $(HOME)/.local/share/husk/images/alpine-aarch64.ext4
+DEBUGFS ?= $(shell find /opt/homebrew/Cellar/e2fsprogs -name debugfs -type f 2>/dev/null | head -1)
+AGENT_BIN = target/aarch64-unknown-linux-musl/agent/husk-agent
+GUEST_INITTAB = guest/inittab
+
+update-rootfs: build-agent-aarch64
+	@test -f "$(ROOTFS_IMAGE)" || { echo "Error: rootfs not found at $(ROOTFS_IMAGE)"; exit 1; }
+	@test -n "$(DEBUGFS)" || { echo "Error: debugfs not found. Install e2fsprogs: brew install e2fsprogs"; exit 1; }
+	@echo "Injecting agent binary into $(ROOTFS_IMAGE)..."
+	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
+		-R "rm /usr/local/bin/husk-agent" 2>/dev/null; true
+	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
+		-R "write $(AGENT_BIN) /usr/local/bin/husk-agent"
+	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
+		-R "set_inode_field /usr/local/bin/husk-agent mode 0100755"
+	@echo "Injecting inittab into $(ROOTFS_IMAGE)..."
+	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
+		-R "rm /etc/inittab" 2>/dev/null; true
+	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
+		-R "write $(GUEST_INITTAB) /etc/inittab"
+	@echo "Rootfs updated. Verify with:"
+	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/husk-agent' $(ROOTFS_IMAGE)"
+	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
 
 # Run the daemon (development)
 run-daemon:
