@@ -364,16 +364,16 @@ impl StateStore {
         Ok(records)
     }
 
-    /// Mark all VMs in transient states (`running`, `creating`) as `stopped`.
+    /// Mark all VMs in transient states (`running`, `creating`, `paused`) as `stopped`.
     ///
     /// Called on daemon startup to reconcile persisted state with reality —
     /// VMs cannot survive a daemon restart, so any that claim to be running
-    /// are stale. Returns the number of VMs that were transitioned.
+    /// or paused are stale. Returns the number of VMs that were transitioned.
     pub fn mark_stale_vms_stopped(&self) -> Result<usize, StateError> {
         let conn = self.lock()?;
         let count = conn.execute(
             "UPDATE vms SET state = 'stopped', updated_at = ?1
-             WHERE state IN ('running', 'creating')",
+             WHERE state IN ('running', 'creating', 'paused')",
             params![Utc::now().to_rfc3339()],
         )?;
         Ok(count)
@@ -796,6 +796,10 @@ mod tests {
         creating.state = "creating".into();
         store.insert_vm(&creating).unwrap();
 
+        let mut paused = make_record("vm-paused");
+        paused.state = "paused".into();
+        store.insert_vm(&paused).unwrap();
+
         let mut stopped = make_record("vm-stopped");
         stopped.state = "stopped".into();
         store.insert_vm(&stopped).unwrap();
@@ -805,10 +809,14 @@ mod tests {
         store.insert_vm(&failed).unwrap();
 
         let count = store.mark_stale_vms_stopped().unwrap();
-        assert_eq!(count, 2, "should mark running + creating as stopped");
+        assert_eq!(
+            count, 3,
+            "should mark running + creating + paused as stopped"
+        );
 
         assert_eq!(store.get_vm(running.id).unwrap().state, "stopped");
         assert_eq!(store.get_vm(creating.id).unwrap().state, "stopped");
+        assert_eq!(store.get_vm(paused.id).unwrap().state, "stopped");
         assert_eq!(store.get_vm(stopped.id).unwrap().state, "stopped");
         assert_eq!(store.get_vm(failed.id).unwrap().state, "failed");
     }

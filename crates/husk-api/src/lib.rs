@@ -150,6 +150,8 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
+        .route("/v1/vms/{name}/pause", post(pause_vm::<B>))
+        .route("/v1/vms/{name}/resume", post(resume_vm::<B>))
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
@@ -236,6 +238,22 @@ async fn stop_vm<B: VmmBackend + 'static>(
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.stop_vm(&name).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pause_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.pause_vm(&name).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.resume_vm(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -362,7 +380,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
             let _ = send_ws_output(
                 &mut ws,
                 &WsShellOutput::Error {
-                    message: format!("agent connect failed: {e}"),
+                    message: e.to_string(),
                 },
             )
             .await;
@@ -461,6 +479,10 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         }
     }
 
+    // Send a proper WebSocket Close frame so the client doesn't hang
+    // waiting for more data during its runtime shutdown.
+    let _ = ws.send(Message::Close(None)).await;
+
     debug!(%name, "shell WebSocket session ended");
 }
 
@@ -526,7 +548,7 @@ async fn remove_port_forward_handler<B: VmmBackend + 'static>(
 fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
     let (status, message) = match &err {
         CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
-        CoreError::VmNotRunning { .. } => (StatusCode::CONFLICT, err.to_string()),
+        CoreError::InvalidState { .. } => (StatusCode::CONFLICT, err.to_string()),
         CoreError::VmAlreadyExists(_) => (StatusCode::CONFLICT, err.to_string()),
         CoreError::Agent(husk_core::AgentError::NotReady(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
@@ -657,6 +679,34 @@ mod tests {
         let response = app
             .oneshot(
                 Request::post("/v1/vms/nonexistent/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pause_vm_not_found() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/nonexistent/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resume_vm_not_found() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/nonexistent/resume")
                     .body(Body::empty())
                     .unwrap(),
             )

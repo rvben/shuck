@@ -18,8 +18,12 @@ pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, She
 pub enum CoreError {
     #[error("VM not found: {0}")]
     VmNotFound(String),
-    #[error("VM '{name}' is {state}, not running")]
-    VmNotRunning { name: String, state: String },
+    #[error("VM '{name}' is {actual}, expected {expected}")]
+    InvalidState {
+        name: String,
+        actual: String,
+        expected: String,
+    },
     #[error("VM already exists: {0}")]
     VmAlreadyExists(String),
     #[error("VMM error: {0}")]
@@ -114,6 +118,17 @@ impl<B: VmmBackend> HuskCore<B> {
     pub async fn create_vm(&self, req: CreateVmRequest) -> Result<VmRecord, CoreError> {
         info!(name = %req.name, "creating VM");
 
+        // If a stopped VM with this name exists, replace it automatically.
+        // Running or paused VMs must be explicitly destroyed first.
+        if let Ok(existing) = self.state.get_vm_by_name(&req.name) {
+            if existing.state == "stopped" || existing.state == "failed" {
+                info!(name = %req.name, "replacing stopped VM");
+                self.destroy_vm(&req.name).await?;
+            } else {
+                return Err(CoreError::VmAlreadyExists(req.name));
+            }
+        }
+
         husk_storage::validate_kernel(&req.kernel_path)?;
         husk_storage::validate_rootfs(&req.rootfs_path)?;
 
@@ -154,6 +169,10 @@ impl<B: VmmBackend> HuskCore<B> {
         husk_net::add_vm_nat(&tap_name, host_ip, &self.host_interface).await?;
 
         let vm_dir = self.storage.vm_dir(&req.name);
+        if vm_dir.exists() {
+            warn!(name = %req.name, "removing stale VM directory from incomplete cleanup");
+            let _ = tokio::fs::remove_dir_all(&vm_dir).await;
+        }
         let vm_rootfs = vm_dir.join("rootfs.ext4");
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
         resources.vm_dir = Some(vm_dir);
@@ -218,6 +237,10 @@ impl<B: VmmBackend> HuskCore<B> {
         debug!(cid, "resources allocated");
 
         let vm_dir = self.storage.vm_dir(&req.name);
+        if vm_dir.exists() {
+            warn!(name = %req.name, "removing stale VM directory from incomplete cleanup");
+            let _ = tokio::fs::remove_dir_all(&vm_dir).await;
+        }
         let vm_rootfs = vm_dir.join("rootfs.ext4");
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
         resources.vm_dir = Some(vm_dir);
@@ -297,12 +320,51 @@ impl<B: VmmBackend> HuskCore<B> {
         }
     }
 
-    /// Stop a running VM.
+    /// Stop a running or paused VM.
     pub async fn stop_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "stopping VM");
         let record = self.lookup_vm(name)?;
+        if record.state != "running" && record.state != "paused" {
+            return Err(CoreError::InvalidState {
+                name: name.into(),
+                actual: record.state,
+                expected: "running or paused".into(),
+            });
+        }
         self.vmm.stop_vm(record.id).await?;
         self.state.update_vm_state(record.id, "stopped")?;
+        Ok(())
+    }
+
+    /// Pause a running VM.
+    pub async fn pause_vm(&self, name: &str) -> Result<(), CoreError> {
+        info!(%name, "pausing VM");
+        let record = self.lookup_vm(name)?;
+        if record.state != "running" {
+            return Err(CoreError::InvalidState {
+                name: name.into(),
+                actual: record.state,
+                expected: "running".into(),
+            });
+        }
+        self.vmm.pause_vm(record.id).await?;
+        self.state.update_vm_state(record.id, "paused")?;
+        Ok(())
+    }
+
+    /// Resume a paused VM.
+    pub async fn resume_vm(&self, name: &str) -> Result<(), CoreError> {
+        info!(%name, "resuming VM");
+        let record = self.lookup_vm(name)?;
+        if record.state != "paused" {
+            return Err(CoreError::InvalidState {
+                name: name.into(),
+                actual: record.state,
+                expected: "paused".into(),
+            });
+        }
+        self.vmm.resume_vm(record.id).await?;
+        self.state.update_vm_state(record.id, "running")?;
         Ok(())
     }
 
@@ -368,9 +430,10 @@ impl<B: VmmBackend> HuskCore<B> {
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
         let record = self.lookup_vm(name)?;
         if record.state != "running" {
-            return Err(CoreError::VmNotRunning {
+            return Err(CoreError::InvalidState {
                 name: name.into(),
-                state: record.state,
+                actual: record.state,
+                expected: "running".into(),
             });
         }
         debug!(%name, id = %record.id, "connecting to agent via vsock");

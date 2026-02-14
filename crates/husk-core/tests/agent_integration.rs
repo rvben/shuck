@@ -522,3 +522,113 @@ async fn shell_bidirectional_data_exchange() {
         "expected MARKER_END in output, got: {text}"
     );
 }
+
+/// Verify that `shell_start` sends TERM=xterm to the guest agent.
+///
+/// The client hardcodes TERM=xterm in the ShellStartRequest env. This test
+/// verifies the value reaches the shell process inside the agent.
+#[tokio::test]
+async fn shell_start_sends_term_env() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    conn.shell_start(Some("sh"), 80, 24).await.unwrap();
+
+    conn.shell_send(b"echo TERM=$TERM\nexit 0\n").await.unwrap();
+
+    let mut output = Vec::new();
+    loop {
+        match conn.shell_recv().await.unwrap() {
+            ShellEvent::Data(data) => output.extend(data),
+            ShellEvent::Exit(code) => {
+                assert_eq!(code, 0);
+                break;
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("TERM=xterm"),
+        "expected TERM=xterm in output, got: {text:?}"
+    );
+}
+
+/// Verify that a shell session continues to deliver data after a delay.
+///
+/// Regression test: if the underlying transport connection is dropped prematurely
+/// (e.g. VZ deallocating the vsock connection object), data stops flowing after
+/// the initial handshake. This test sends data after a pause to verify the
+/// connection remains alive.
+#[tokio::test]
+async fn shell_session_survives_idle_period() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    conn.shell_start(Some("cat"), 80, 24).await.unwrap();
+
+    // Wait long enough for any premature connection teardown to take effect
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Send data after the delay — this would hang if the connection was torn down
+    conn.shell_send(b"still-alive\n").await.unwrap();
+
+    let mut output = Vec::new();
+    while let Ok(Ok(ShellEvent::Data(data))) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), conn.shell_recv()).await
+    {
+        output.extend(data);
+        if output.windows(11).any(|w| w == b"still-alive") {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("still-alive"),
+        "expected 'still-alive' after idle period, got: {text:?}"
+    );
+}
+
+/// Verify that concurrent shell and exec sessions work independently.
+///
+/// The agent handles each connection in a separate task. A long-running shell
+/// session should not block exec commands on separate connections.
+#[tokio::test]
+async fn concurrent_shell_and_exec() {
+    let (_dir, path) = spawn_agent().await;
+
+    // Start a long-running shell on one connection
+    let mut shell_conn = AgentClient::connect_unix(&path).await.unwrap();
+    shell_conn.shell_start(Some("cat"), 80, 24).await.unwrap();
+
+    // Run exec on a separate connection while shell is active
+    let mut exec_conn = AgentClient::connect_unix(&path).await.unwrap();
+    let result = exec_conn
+        .exec("echo", &["concurrent_ok"], None, &[])
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("concurrent_ok"));
+
+    // Shell should still be functional
+    shell_conn.shell_send(b"after-exec\n").await.unwrap();
+
+    let mut output = Vec::new();
+    while let Ok(Ok(ShellEvent::Data(data))) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), shell_conn.shell_recv()).await
+    {
+        output.extend(data);
+        if output.windows(10).any(|w| w == b"after-exec") {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("after-exec"),
+        "shell should still work after concurrent exec, got: {text:?}"
+    );
+}

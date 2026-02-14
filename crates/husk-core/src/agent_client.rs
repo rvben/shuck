@@ -222,7 +222,7 @@ where
     ) -> Result<(), AgentError> {
         let request = AgentRequest::ShellStart(ShellStartRequest {
             command: command.map(Into::into),
-            env: Vec::new(),
+            env: vec![("TERM".into(), "xterm".into())],
             cols,
             rows,
         });

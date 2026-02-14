@@ -490,3 +490,114 @@ async fn shell_with_env_vars() {
         "expected output to contain 'shell_value', got: {output}"
     );
 }
+
+/// Verify that multiple env vars are passed through to the shell, including TERM.
+///
+/// The host sends TERM=xterm by default. This test verifies that TERM (and
+/// additional env vars) are visible inside the spawned shell process.
+#[tokio::test]
+async fn shell_term_and_multiple_env_vars() {
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::ShellStart(ShellStartRequest {
+        command: Some("sh".into()),
+        env: vec![
+            ("TERM".into(), "xterm".into()),
+            ("HUSK_TEST".into(), "42".into()),
+        ],
+        cols: 80,
+        rows: 24,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    assert!(matches!(response, AgentResponse::ShellStarted));
+
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: base64_encode(b"echo TERM=$TERM HUSK_TEST=$HUSK_TEST\nexit 0\n"),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let mut output_data = Vec::new();
+    loop {
+        let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+        match response {
+            AgentResponse::ShellData(d) => {
+                output_data.extend(base64_decode(&d.data).unwrap());
+            }
+            AgentResponse::ShellExit(e) => {
+                assert_eq!(e.exit_code, 0);
+                break;
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    let output = String::from_utf8_lossy(&output_data);
+    assert!(
+        output.contains("TERM=xterm"),
+        "expected TERM=xterm in output, got: {output}"
+    );
+    assert!(
+        output.contains("HUSK_TEST=42"),
+        "expected HUSK_TEST=42 in output, got: {output}"
+    );
+}
+
+/// Verify that shell data flows correctly after an idle period.
+///
+/// Regression test for connection lifetime: if the transport is torn down
+/// after the initial handshake, data sent after a delay would never arrive.
+#[tokio::test]
+async fn shell_data_after_idle_period() {
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::ShellStart(ShellStartRequest {
+        command: Some("cat".into()),
+        env: vec![],
+        cols: 80,
+        rows: 24,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    assert!(matches!(response, AgentResponse::ShellStarted));
+
+    // Wait to simulate the delay between handshake and actual use
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Send data after the idle period
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: base64_encode(b"delayed-input\n"),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    // Verify the data echoes back through the PTY
+    let mut output_data = Vec::new();
+    loop {
+        let response: AgentResponse = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_message::<AgentResponse, _>(&mut stream),
+        )
+        .await
+        .expect("timed out waiting for shell data after idle")
+        .unwrap()
+        .unwrap();
+        match response {
+            AgentResponse::ShellData(d) => {
+                output_data.extend(base64_decode(&d.data).unwrap());
+                let text = String::from_utf8_lossy(&output_data);
+                if text.contains("delayed-input") {
+                    break;
+                }
+            }
+            other => panic!("unexpected response after idle: {other:?}"),
+        }
+    }
+
+    let output = String::from_utf8_lossy(&output_data);
+    assert!(
+        output.contains("delayed-input"),
+        "expected 'delayed-input' after idle period, got: {output}"
+    );
+}

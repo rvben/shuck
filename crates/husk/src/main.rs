@@ -79,6 +79,18 @@ enum Commands {
         name: String,
     },
 
+    /// Pause a running VM
+    Pause {
+        /// VM name
+        name: String,
+    },
+
+    /// Resume a paused VM
+    Resume {
+        /// VM name
+        name: String,
+    },
+
     /// Destroy a VM and clean up resources
     #[command(alias = "rm")]
     Destroy {
@@ -196,6 +208,42 @@ fn default_host_interface() -> String {
     "eth0".into()
 }
 
+/// Extract a clean error message from an API error response.
+///
+/// Handles JSON error bodies, plain text, and empty responses gracefully
+/// so the CLI never dumps raw stack traces at the user.
+async fn api_error(resp: reqwest::Response, subject: &str) -> String {
+    let status = resp.status();
+    match resp.text().await {
+        Ok(body) if !body.is_empty() => {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(msg) = json["error"].as_str()
+            {
+                return msg.to_string();
+            }
+            body
+        }
+        _ => match status.as_u16() {
+            404 => format!("{subject} not found"),
+            409 => format!("{subject} already exists"),
+            _ => format!("{subject}: {status}"),
+        },
+    }
+}
+
+/// Send a request to the daemon API and return the response.
+///
+/// Wraps connection errors with a hint about whether the daemon is running.
+async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    request.send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::anyhow!("cannot connect to daemon (is `husk daemon` running?)")
+        } else {
+            anyhow::anyhow!("{e}")
+        }
+    })
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -251,127 +299,127 @@ async fn main() -> Result<()> {
             }
 
             let client = reqwest::Client::new();
-            let resp = client
-                .post(format!("{}/v1/vms", cli.api_url))
-                .json(&body)
-                .send()
-                .await
-                .context("connecting to daemon")?;
+            let resp =
+                api_request(client.post(format!("{}/v1/vms", cli.api_url)).json(&body)).await?;
 
-            if resp.status().is_success() {
-                let vm: serde_json::Value = resp.json().await?;
-                println!("Created VM: {}", vm["name"]);
-                println!("  ID:    {}", vm["id"]);
-                println!("  State: {}", vm["state"]);
-                println!("  CPUs:  {}", vm["vcpu_count"]);
-                println!("  RAM:   {} MiB", vm["mem_size_mib"]);
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                eprintln!("Error: {msg}");
+                if msg.contains("already exists") {
+                    eprintln!("Hint: stop or destroy it first with `husk destroy {name}`");
+                }
+                std::process::exit(1);
+            }
 
-                if let Some(ref userdata_path) = userdata {
-                    println!("Running userdata script: {}", userdata_path.display());
-                    let script = std::fs::read(userdata_path).with_context(|| {
-                        format!("reading userdata script {}", userdata_path.display())
-                    })?;
-                    let encoded = husk_agent_proto::base64_encode(&script);
+            let vm: serde_json::Value = resp.json().await?;
+            println!("Created VM: {}", vm["name"].as_str().unwrap_or("-"));
+            println!("  ID:    {}", vm["id"].as_str().unwrap_or("-"));
+            println!("  State: {}", vm["state"].as_str().unwrap_or("-"));
+            println!("  CPUs:  {}", vm["vcpu_count"]);
+            println!("  RAM:   {} MiB", vm["mem_size_mib"]);
 
-                    let write_body = serde_json::json!({
-                        "path": "/tmp/husk-userdata.sh",
-                        "data": encoded,
-                        "mode": 0o755_u32,
-                    });
+            if let Some(ref userdata_path) = userdata {
+                println!("Running userdata script: {}", userdata_path.display());
+                let script = std::fs::read(userdata_path).with_context(|| {
+                    format!("reading userdata script {}", userdata_path.display())
+                })?;
+                let encoded = husk_agent_proto::base64_encode(&script);
 
-                    // Wait for agent to be ready
-                    let mut agent_ready = false;
-                    for attempt in 0..30 {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let check = client
-                            .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
-                            .json(&serde_json::json!({"command": "true", "args": []}))
-                            .send()
-                            .await;
-                        if let Ok(r) = check
-                            && r.status().is_success()
-                        {
-                            agent_ready = true;
-                            break;
-                        }
-                        if attempt % 5 == 4 {
-                            eprintln!("Waiting for agent to be ready...");
-                        }
+                let write_body = serde_json::json!({
+                    "path": "/tmp/husk-userdata.sh",
+                    "data": encoded,
+                    "mode": 0o755_u32,
+                });
+
+                // Wait for agent to be ready
+                let mut agent_ready = false;
+                for attempt in 0..30 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let check = client
+                        .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
+                        .json(&serde_json::json!({"command": "true", "args": []}))
+                        .send()
+                        .await;
+                    if let Ok(r) = check
+                        && r.status().is_success()
+                    {
+                        agent_ready = true;
+                        break;
                     }
+                    if attempt % 5 == 4 {
+                        eprintln!("Waiting for agent to be ready...");
+                    }
+                }
 
-                    if !agent_ready {
-                        eprintln!("Warning: agent not ready, skipping userdata script");
+                if !agent_ready {
+                    eprintln!("Warning: agent not ready, skipping userdata script");
+                } else {
+                    // Write the script into the VM
+                    let resp = client
+                        .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
+                        .json(&write_body)
+                        .send()
+                        .await
+                        .context("writing userdata script")?;
+
+                    if !resp.status().is_success() {
+                        eprintln!("Warning: failed to write userdata script");
                     } else {
-                        // Write the script into the VM
+                        // Execute it
+                        let exec_body = serde_json::json!({
+                            "command": "sh",
+                            "args": ["/tmp/husk-userdata.sh"],
+                        });
                         let resp = client
-                            .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
-                            .json(&write_body)
+                            .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
+                            .json(&exec_body)
                             .send()
                             .await
-                            .context("writing userdata script")?;
+                            .context("executing userdata script")?;
 
-                        if !resp.status().is_success() {
-                            eprintln!("Warning: failed to write userdata script");
-                        } else {
-                            // Execute it
-                            let exec_body = serde_json::json!({
-                                "command": "sh",
-                                "args": ["/tmp/husk-userdata.sh"],
-                            });
-                            let resp = client
-                                .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
-                                .json(&exec_body)
-                                .send()
-                                .await
-                                .context("executing userdata script")?;
-
-                            if resp.status().is_success() {
-                                let result: serde_json::Value = resp.json().await?;
-                                let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
-                                if exit_code != 0 {
-                                    eprintln!(
-                                        "Warning: userdata script exited with code {}",
-                                        exit_code
-                                    );
-                                } else {
-                                    println!("Userdata script completed successfully");
-                                }
+                        if resp.status().is_success() {
+                            let result: serde_json::Value = resp.json().await?;
+                            let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
+                            if exit_code != 0 {
+                                eprintln!(
+                                    "Warning: userdata script exited with code {}",
+                                    exit_code
+                                );
                             } else {
-                                eprintln!("Warning: failed to execute userdata script");
+                                println!("Userdata script completed successfully");
                             }
+                        } else {
+                            eprintln!("Warning: failed to execute userdata script");
                         }
                     }
                 }
-            } else {
-                let err: serde_json::Value = resp.json().await?;
-                eprintln!("Error: {}", err["error"]);
-                std::process::exit(1);
             }
             Ok(())
         }
         Commands::List => {
             let client = reqwest::Client::new();
-            let resp = client
-                .get(format!("{}/v1/vms", cli.api_url))
-                .send()
-                .await
-                .context("connecting to daemon")?;
+            let resp = api_request(client.get(format!("{}/v1/vms", cli.api_url))).await?;
+
+            if !resp.status().is_success() {
+                eprintln!("Error: {}", api_error(resp, "listing VMs").await);
+                std::process::exit(1);
+            }
 
             let vms: Vec<serde_json::Value> = resp.json().await?;
             if vms.is_empty() {
-                println!("No VMs running");
+                println!("No VMs found");
             } else {
                 println!(
-                    "{:<20} {:<12} {:<6} {:<10} {:<16}",
+                    "{:<20} {:<12} {:>4}   {:<10} {:<16}",
                     "NAME", "STATE", "CPUS", "MEMORY", "GUEST IP"
                 );
                 for vm in vms {
                     println!(
-                        "{:<20} {:<12} {:<6} {:<10} {:<16}",
+                        "{:<20} {:<12} {:>4}   {:>4} MiB   {:<16}",
                         vm["name"].as_str().unwrap_or("-"),
                         vm["state"].as_str().unwrap_or("-"),
                         vm["vcpu_count"],
-                        format!("{} MiB", vm["mem_size_mib"]),
+                        vm["mem_size_mib"],
                         vm["guest_ip"].as_str().unwrap_or("-"),
                     );
                 }
@@ -380,59 +428,89 @@ async fn main() -> Result<()> {
         }
         Commands::Info { name } => {
             let client = reqwest::Client::new();
-            let resp = client
-                .get(format!("{}/v1/vms/{name}", cli.api_url))
-                .send()
-                .await
-                .context("connecting to daemon")?;
+            let resp = api_request(client.get(format!("{}/v1/vms/{name}", cli.api_url))).await?;
 
-            if resp.status().is_success() {
-                let vm: serde_json::Value = resp.json().await?;
-                println!("Name:     {}", vm["name"]);
-                println!("ID:       {}", vm["id"]);
-                println!("State:    {}", vm["state"]);
-                println!("vCPUs:    {}", vm["vcpu_count"]);
-                println!("Memory:   {} MiB", vm["mem_size_mib"]);
-                println!("CID:      {}", vm["vsock_cid"]);
-                println!("Host IP:  {}", vm["host_ip"].as_str().unwrap_or("-"));
-                println!("Guest IP: {}", vm["guest_ip"].as_str().unwrap_or("-"));
-            } else {
-                let err: serde_json::Value = resp.json().await?;
-                eprintln!("Error: {}", err["error"]);
+            if !resp.status().is_success() {
+                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                 std::process::exit(1);
             }
+
+            let vm: serde_json::Value = resp.json().await?;
+            let s = |key: &str| vm[key].as_str().unwrap_or("-").to_string();
+            println!("Name:      {}", s("name"));
+            println!("State:     {}", s("state"));
+            println!("vCPUs:     {}", vm["vcpu_count"]);
+            println!("Memory:    {} MiB", vm["mem_size_mib"]);
+            if let Some(ip) = vm["guest_ip"].as_str() {
+                println!("Guest IP:  {ip}");
+            }
+            if let Some(ip) = vm["host_ip"].as_str() {
+                println!("Host IP:   {ip}");
+            }
+            println!("ID:        {}", s("id"));
             Ok(())
         }
         Commands::Stop { name } => {
             let client = reqwest::Client::new();
-            let resp = client
-                .post(format!("{}/v1/vms/{name}/stop", cli.api_url))
-                .send()
-                .await
-                .context("connecting to daemon")?;
+            let resp =
+                api_request(client.post(format!("{}/v1/vms/{name}/stop", cli.api_url))).await?;
 
             if resp.status().is_success() {
                 println!("Stopped VM: {name}");
             } else {
-                let err: serde_json::Value = resp.json().await?;
-                eprintln!("Error: {}", err["error"]);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                eprintln!("Error: {msg}");
+                if msg.contains("stopped") {
+                    eprintln!("Hint: VM is already stopped");
+                }
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Commands::Pause { name } => {
+            let client = reqwest::Client::new();
+            let resp =
+                api_request(client.post(format!("{}/v1/vms/{name}/pause", cli.api_url))).await?;
+
+            if resp.status().is_success() {
+                println!("Paused VM: {name}");
+            } else {
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                eprintln!("Error: {msg}");
+                if msg.contains("stopped") {
+                    eprintln!("Hint: start the VM first with `husk run`");
+                }
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Commands::Resume { name } => {
+            let client = reqwest::Client::new();
+            let resp =
+                api_request(client.post(format!("{}/v1/vms/{name}/resume", cli.api_url))).await?;
+
+            if resp.status().is_success() {
+                println!("Resumed VM: {name}");
+            } else {
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                eprintln!("Error: {msg}");
+                if msg.contains("stopped") {
+                    eprintln!("Hint: start the VM first with `husk run`");
+                } else if msg.contains("running") {
+                    eprintln!("Hint: VM is already running, nothing to resume");
+                }
                 std::process::exit(1);
             }
             Ok(())
         }
         Commands::Destroy { name } => {
             let client = reqwest::Client::new();
-            let resp = client
-                .delete(format!("{}/v1/vms/{name}", cli.api_url))
-                .send()
-                .await
-                .context("connecting to daemon")?;
+            let resp = api_request(client.delete(format!("{}/v1/vms/{name}", cli.api_url))).await?;
 
             if resp.status().is_success() {
                 println!("Destroyed VM: {name}");
             } else {
-                let err: serde_json::Value = resp.json().await?;
-                eprintln!("Error: {}", err["error"]);
+                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                 std::process::exit(1);
             }
             Ok(())
@@ -453,31 +531,30 @@ async fn main() -> Result<()> {
             }
 
             let client = reqwest::Client::new();
-            let resp = client
-                .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
-                .json(&body)
-                .send()
-                .await
-                .context("connecting to daemon")?;
+            let resp = api_request(
+                client
+                    .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
+                    .json(&body),
+            )
+            .await?;
 
-            if resp.status().is_success() {
-                let result: serde_json::Value = resp.json().await?;
-                let stdout = result["stdout"].as_str().unwrap_or("");
-                let stderr = result["stderr"].as_str().unwrap_or("");
-                if !stdout.is_empty() {
-                    print!("{stdout}");
-                }
-                if !stderr.is_empty() {
-                    eprint!("{stderr}");
-                }
-                let exit_code = result["exit_code"].as_i64().unwrap_or(1) as i32;
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-            } else {
-                let err: serde_json::Value = resp.json().await?;
-                eprintln!("Error: {}", err["error"]);
+            if !resp.status().is_success() {
+                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                 std::process::exit(1);
+            }
+
+            let result: serde_json::Value = resp.json().await?;
+            let stdout = result["stdout"].as_str().unwrap_or("");
+            let stderr = result["stderr"].as_str().unwrap_or("");
+            if !stdout.is_empty() {
+                print!("{stdout}");
+            }
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+            }
+            let exit_code = result["exit_code"].as_i64().unwrap_or(1) as i32;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
             Ok(())
         }
@@ -500,31 +577,30 @@ async fn main() -> Result<()> {
                     }
 
                     let client = reqwest::Client::new();
-                    let resp = client
-                        .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
-                        .json(&body)
-                        .send()
-                        .await
-                        .context("connecting to daemon")?;
+                    let resp = api_request(
+                        client
+                            .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
+                            .json(&body),
+                    )
+                    .await?;
 
                     if resp.status().is_success() {
                         let result: serde_json::Value = resp.json().await?;
                         let bytes = result["bytes_written"].as_u64().unwrap_or(0);
                         println!("{bytes} bytes copied to {name}:{path}");
                     } else {
-                        let err: serde_json::Value = resp.json().await?;
-                        eprintln!("Error: {}", err["error"]);
+                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                         std::process::exit(1);
                     }
                 }
                 (CpPath::Vm { name, path }, CpPath::Local(local)) => {
                     let client = reqwest::Client::new();
-                    let resp = client
-                        .post(format!("{}/v1/vms/{name}/files/read", cli.api_url))
-                        .json(&serde_json::json!({ "path": path }))
-                        .send()
-                        .await
-                        .context("connecting to daemon")?;
+                    let resp = api_request(
+                        client
+                            .post(format!("{}/v1/vms/{name}/files/read", cli.api_url))
+                            .json(&serde_json::json!({ "path": path })),
+                    )
+                    .await?;
 
                     if resp.status().is_success() {
                         let result: serde_json::Value = resp.json().await?;
@@ -535,8 +611,7 @@ async fn main() -> Result<()> {
                             .with_context(|| format!("writing {}", local.display()))?;
                         println!("{} bytes copied from {name}:{path}", data.len());
                     } else {
-                        let err: serde_json::Value = resp.json().await?;
-                        eprintln!("Error: {}", err["error"]);
+                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                         std::process::exit(1);
                     }
                 }
@@ -558,65 +633,62 @@ async fn main() -> Result<()> {
                     host_port,
                     guest_port,
                 } => {
-                    let resp = client
-                        .post(format!("{}/v1/vms/{name}/ports", cli.api_url))
-                        .json(&serde_json::json!({
-                            "host_port": host_port,
-                            "guest_port": guest_port,
-                        }))
-                        .send()
-                        .await
-                        .context("connecting to daemon")?;
+                    let resp = api_request(
+                        client
+                            .post(format!("{}/v1/vms/{name}/ports", cli.api_url))
+                            .json(&serde_json::json!({
+                                "host_port": host_port,
+                                "guest_port": guest_port,
+                            })),
+                    )
+                    .await?;
                     if resp.status().is_success() {
                         println!("Port forward added: {host_port} -> {name}:{guest_port}");
                     } else {
-                        let err: serde_json::Value = resp.json().await?;
-                        eprintln!("Error: {}", err["error"]);
+                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                         std::process::exit(1);
                     }
                 }
                 PortForwardAction::Remove { host_port } => {
-                    let resp = client
-                        .delete(format!("{}/v1/vms/{name}/ports/{host_port}", cli.api_url))
-                        .send()
-                        .await
-                        .context("connecting to daemon")?;
+                    let resp = api_request(
+                        client.delete(format!("{}/v1/vms/{name}/ports/{host_port}", cli.api_url)),
+                    )
+                    .await?;
                     if resp.status().is_success() {
                         println!("Port forward removed: {host_port}");
                     } else {
-                        let err: serde_json::Value = resp.json().await?;
-                        eprintln!("Error: {}", err["error"]);
+                        eprintln!(
+                            "Error: {}",
+                            api_error(resp, &format!("port forward {host_port}")).await
+                        );
                         std::process::exit(1);
                     }
                 }
                 PortForwardAction::List => {
-                    let resp = client
-                        .get(format!("{}/v1/vms/{name}/ports", cli.api_url))
-                        .send()
-                        .await
-                        .context("connecting to daemon")?;
-                    if resp.status().is_success() {
-                        let forwards: Vec<serde_json::Value> = resp.json().await?;
-                        if forwards.is_empty() {
-                            println!("No port forwards for {name}");
-                        } else {
+                    let resp =
+                        api_request(client.get(format!("{}/v1/vms/{name}/ports", cli.api_url)))
+                            .await?;
+                    if !resp.status().is_success() {
+                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
+                        std::process::exit(1);
+                    }
+
+                    let forwards: Vec<serde_json::Value> = resp.json().await?;
+                    if forwards.is_empty() {
+                        println!("No port forwards for {name}");
+                    } else {
+                        println!(
+                            "{:<12} {:<12} {:<10}",
+                            "HOST PORT", "GUEST PORT", "PROTOCOL"
+                        );
+                        for pf in forwards {
                             println!(
                                 "{:<12} {:<12} {:<10}",
-                                "HOST PORT", "GUEST PORT", "PROTOCOL"
+                                pf["host_port"],
+                                pf["guest_port"],
+                                pf["protocol"].as_str().unwrap_or("tcp"),
                             );
-                            for pf in forwards {
-                                println!(
-                                    "{:<12} {:<12} {:<10}",
-                                    pf["host_port"],
-                                    pf["guest_port"],
-                                    pf["protocol"].as_str().unwrap_or("tcp"),
-                                );
-                            }
                         }
-                    } else {
-                        let err: serde_json::Value = resp.json().await?;
-                        eprintln!("Error: {}", err["error"]);
-                        std::process::exit(1);
                     }
                 }
             }
@@ -646,15 +718,10 @@ async fn run_shell(
     command: Option<String>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{}/v1/vms/{name}", api_url))
-        .send()
-        .await
-        .context("connecting to daemon")?;
+    let resp = api_request(client.get(format!("{}/v1/vms/{name}", api_url))).await?;
 
     if !resp.status().is_success() {
-        let err: serde_json::Value = resp.json().await?;
-        eprintln!("Error: {}", err["error"]);
+        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
         std::process::exit(1);
     }
 
@@ -664,6 +731,11 @@ async fn run_shell(
     let config = load_config(config_path.as_deref());
     let runtime_dir = config.data_dir.join("run");
     let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("Error: `husk shell` requires an interactive terminal");
+        std::process::exit(1);
+    }
 
     // Try direct vsock first (lower latency), fall back to WebSocket.
     if vsock_path.exists() {
@@ -686,17 +758,12 @@ async fn run_shell(
         println!();
 
         match result {
-            Ok(exit_code) => {
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-            }
+            Ok(exit_code) => std::process::exit(exit_code),
             Err(e) => {
                 eprintln!("Shell error: {e}");
                 std::process::exit(1);
             }
         }
-        return Ok(());
     }
 
     // Direct vsock unavailable — use WebSocket through daemon.
@@ -715,6 +782,25 @@ async fn run_shell(
 
 /// WebSocket-based interactive shell, works on both Linux and macOS.
 async fn run_shell_ws(api_url: &str, name: &str, command: Option<&str>) -> Result<()> {
+    // Pre-check: verify VM is running before opening the WebSocket.
+    let client = reqwest::Client::new();
+    let resp = api_request(client.get(format!("{api_url}/v1/vms/{name}"))).await?;
+    if !resp.status().is_success() {
+        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
+        std::process::exit(1);
+    }
+    let vm: serde_json::Value = resp.json().await?;
+    let state = vm["state"].as_str().unwrap_or("unknown");
+    if state != "running" {
+        eprintln!("Error: VM '{name}' is {state}, expected running");
+        if state == "stopped" {
+            eprintln!("Hint: start the VM first with `husk run`");
+        } else if state == "paused" {
+            eprintln!("Hint: resume the VM first with `husk resume {name}`");
+        }
+        std::process::exit(1);
+    }
+
     let ws_url = api_url
         .replacen("http://", "ws://", 1)
         .replacen("https://", "wss://", 1);
@@ -747,9 +833,13 @@ async fn run_shell_ws(api_url: &str, name: &str, command: Option<&str>) -> Resul
             match msg {
                 WsShellOutput::Started => {}
                 WsShellOutput::Error { message } => {
-                    anyhow::bail!("server error: {message}");
+                    eprintln!("Error: {message}");
+                    std::process::exit(1);
                 }
-                _ => anyhow::bail!("unexpected response from server"),
+                _ => {
+                    eprintln!("Error: unexpected response from server");
+                    std::process::exit(1);
+                }
             }
         }
         Ok(_) => anyhow::bail!("unexpected message type from server"),
@@ -763,18 +853,16 @@ async fn run_shell_ws(api_url: &str, name: &str, command: Option<&str>) -> Resul
     crossterm::terminal::disable_raw_mode().ok();
     println!();
 
+    // Exit immediately — tokio's stdin reader holds a blocking thread that
+    // prevents clean runtime shutdown. process::exit() is the standard pattern
+    // for interactive CLI tools that use raw stdin.
     match result {
-        Ok(exit_code) => {
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
+        Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => {
             eprintln!("Shell error: {e}");
             std::process::exit(1);
         }
     }
-    Ok(())
 }
 
 /// Bridge raw stdin/stdout to a WebSocket shell session.
@@ -872,8 +960,12 @@ fn parse_cp_path(s: &str) -> CpPath {
 async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     conn: &mut husk_core::AgentConnection<S>,
 ) -> Result<i32> {
+    use tokio::signal::unix::{SignalKind, signal};
+
     let mut stdin = tokio::io::stdin();
     let mut stdin_buf = vec![0u8; 1024];
+    let mut sigwinch = signal(SignalKind::window_change()).context("registering SIGWINCH")?;
+    let mut sighup = signal(SignalKind::hangup()).context("registering SIGHUP")?;
 
     loop {
         tokio::select! {
@@ -885,6 +977,14 @@ async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
                     }
                     Err(e) => return Err(e.into()),
                 }
+            }
+            _ = sigwinch.recv() => {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    conn.shell_resize(cols, rows).await?;
+                }
+            }
+            _ = sighup.recv() => {
+                return Ok(0);
             }
             event = conn.shell_recv() => {
                 match event? {
