@@ -18,6 +18,8 @@ pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, She
 pub enum CoreError {
     #[error("VM not found: {0}")]
     VmNotFound(String),
+    #[error("VM '{name}' is {state}, not running")]
+    VmNotRunning { name: String, state: String },
     #[error("VM already exists: {0}")]
     VmAlreadyExists(String),
     #[error("VMM error: {0}")]
@@ -355,6 +357,12 @@ impl<B: VmmBackend> HuskCore<B> {
         name: &str,
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
         let record = self.lookup_vm(name)?;
+        if record.state != "running" {
+            return Err(CoreError::VmNotRunning {
+                name: name.into(),
+                state: record.state,
+            });
+        }
         debug!(%name, id = %record.id, "connecting to agent via vsock");
         let stream = self
             .vmm

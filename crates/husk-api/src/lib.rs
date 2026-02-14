@@ -526,6 +526,7 @@ async fn remove_port_forward_handler<B: VmmBackend + 'static>(
 fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
     let (status, message) = match &err {
         CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
+        CoreError::VmNotRunning { .. } => (StatusCode::CONFLICT, err.to_string()),
         CoreError::VmAlreadyExists(_) => (StatusCode::CONFLICT, err.to_string()),
         CoreError::Agent(husk_core::AgentError::NotReady(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
