@@ -947,6 +947,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
 
     let state = husk_state::StateStore::open(&db_path).context("opening state database")?;
+
+    let stale_count = state
+        .mark_stale_vms_stopped()
+        .context("reconciling stale VM state")?;
+    if stale_count > 0 {
+        tracing::info!(stale_count, "marked stale VMs as stopped");
+    }
+
     let storage = husk_storage::StorageConfig {
         data_dir: config.data_dir,
     };

@@ -364,6 +364,21 @@ impl StateStore {
         Ok(records)
     }
 
+    /// Mark all VMs in transient states (`running`, `creating`) as `stopped`.
+    ///
+    /// Called on daemon startup to reconcile persisted state with reality —
+    /// VMs cannot survive a daemon restart, so any that claim to be running
+    /// are stale. Returns the number of VMs that were transitioned.
+    pub fn mark_stale_vms_stopped(&self) -> Result<usize, StateError> {
+        let conn = self.lock()?;
+        let count = conn.execute(
+            "UPDATE vms SET state = 'stopped', updated_at = ?1
+             WHERE state IN ('running', 'creating')",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(count)
+    }
+
     /// Delete all port forwards for a VM.
     pub fn delete_port_forwards_for_vm(&self, vm_id: Uuid) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -765,5 +780,48 @@ mod tests {
 
         let forwards = store.list_port_forwards_for_vm(vm.id).unwrap();
         assert!(forwards.is_empty());
+    }
+
+    // ── Stale VM Reconciliation ───────────────────────────────────────
+
+    #[test]
+    fn mark_stale_vms_stopped() {
+        let store = StateStore::open_memory().unwrap();
+
+        let running = make_record("vm-running");
+        store.insert_vm(&running).unwrap();
+        // make_record defaults to "running" state
+
+        let mut creating = make_record("vm-creating");
+        creating.state = "creating".into();
+        store.insert_vm(&creating).unwrap();
+
+        let mut stopped = make_record("vm-stopped");
+        stopped.state = "stopped".into();
+        store.insert_vm(&stopped).unwrap();
+
+        let mut failed = make_record("vm-failed");
+        failed.state = "failed".into();
+        store.insert_vm(&failed).unwrap();
+
+        let count = store.mark_stale_vms_stopped().unwrap();
+        assert_eq!(count, 2, "should mark running + creating as stopped");
+
+        assert_eq!(store.get_vm(running.id).unwrap().state, "stopped");
+        assert_eq!(store.get_vm(creating.id).unwrap().state, "stopped");
+        assert_eq!(store.get_vm(stopped.id).unwrap().state, "stopped");
+        assert_eq!(store.get_vm(failed.id).unwrap().state, "failed");
+    }
+
+    #[test]
+    fn mark_stale_vms_noop_when_none_running() {
+        let store = StateStore::open_memory().unwrap();
+
+        let mut stopped = make_record("vm-stopped");
+        stopped.state = "stopped".into();
+        store.insert_vm(&stopped).unwrap();
+
+        let count = store.mark_stale_vms_stopped().unwrap();
+        assert_eq!(count, 0);
     }
 }
