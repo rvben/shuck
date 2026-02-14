@@ -178,6 +178,12 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_host_interface")]
     host_interface: String,
+    #[cfg(feature = "linux-net")]
+    #[serde(default = "default_bridge_name")]
+    bridge_name: String,
+    #[cfg(feature = "linux-net")]
+    #[serde(default = "default_bridge_subnet")]
+    bridge_subnet: String,
 }
 
 #[cfg(feature = "linux-net")]
@@ -206,6 +212,16 @@ fn default_kernel_path() -> PathBuf {
 #[cfg(feature = "linux-net")]
 fn default_host_interface() -> String {
     "eth0".into()
+}
+
+#[cfg(feature = "linux-net")]
+fn default_bridge_name() -> String {
+    "husk0".into()
+}
+
+#[cfg(feature = "linux-net")]
+fn default_bridge_subnet() -> String {
+    "172.20.0.0/24".into()
 }
 
 /// Extract a clean error message from an API error response.
@@ -253,6 +269,10 @@ impl Default for Config {
             default_kernel: default_kernel_path(),
             #[cfg(feature = "linux-net")]
             host_interface: default_host_interface(),
+            #[cfg(feature = "linux-net")]
+            bridge_name: default_bridge_name(),
+            #[cfg(feature = "linux-net")]
+            bridge_subnet: default_bridge_subnet(),
         }
     }
 }
@@ -973,6 +993,37 @@ fn load_config(explicit_path: Option<&Path>) -> Config {
     }
 }
 
+/// Parse a CIDR string (e.g. "172.20.0.0/24") into base address and prefix length.
+///
+/// Validates that:
+/// - The string contains a `/` separator
+/// - The base address is a valid IPv4 address
+/// - The prefix length is between 1 and 30 (inclusive)
+/// - The base address is network-aligned (host bits are zero)
+#[cfg(feature = "linux-net")]
+fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (base_str, prefix_str) = cidr.split_once('/').context("invalid CIDR: missing '/'")?;
+    let base: std::net::Ipv4Addr = base_str.parse().context("invalid CIDR base address")?;
+    let prefix_len: u8 = prefix_str.parse().context("invalid CIDR prefix length")?;
+    anyhow::ensure!(
+        (1..=30).contains(&prefix_len),
+        "prefix length must be 1..=30 (got {prefix_len})"
+    );
+
+    // Verify the base address has no host bits set (is a proper network address).
+    let base_u32 = u32::from(base);
+    let host_mask = (1u32 << (32 - prefix_len)) - 1;
+    anyhow::ensure!(
+        base_u32 & host_mask == 0,
+        "base address {base} is not network-aligned for /{prefix_len} \
+         (did you mean {}/{}?)",
+        std::net::Ipv4Addr::from(base_u32 & !host_mask),
+        prefix_len,
+    );
+
+    Ok((base, prefix_len))
+}
+
 async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     tracing::info!("starting husk daemon");
 
@@ -999,20 +1050,40 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     {
         let vmm =
             husk_vmm::firecracker::FirecrackerBackend::new(&config.firecracker_bin, &runtime_dir);
-        let ip_allocator = husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 16);
 
-        if let Err(e) = husk_net::init_nat().await {
-            tracing::warn!("failed to initialize nftables: {e} (VM networking may not work)");
-        }
+        let (base, prefix_len) = parse_cidr(&config.bridge_subnet)?;
+        let ip_allocator = husk_net::IpAllocator::new(base, prefix_len);
+
+        // Clean up any stale bridge from a previous run
+        let _ = husk_net::delete_bridge(&config.bridge_name).await;
+
+        husk_net::create_bridge(&config.bridge_name, ip_allocator.gateway(), prefix_len)
+            .await
+            .context("creating bridge")?;
+
+        husk_net::init_nat(
+            &config.bridge_name,
+            &config.bridge_subnet,
+            &config.host_interface,
+        )
+        .await
+        .context("initializing nftables")?;
 
         let core = Arc::new(husk_core::HuskCore::new(
             vmm,
             state,
             ip_allocator,
             storage,
-            config.host_interface,
+            config.bridge_name.clone(),
         ));
         husk_api::serve(core, listen).await?;
+
+        // Cleanup on graceful shutdown. axum::serve handles SIGINT/SIGTERM,
+        // so this code runs on normal daemon stop. If the process is killed
+        // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
+        // handles the next launch.
+        let _ = husk_net::cleanup_nat().await;
+        let _ = husk_net::delete_bridge(&config.bridge_name).await;
         Ok(())
     }
 
@@ -1099,5 +1170,77 @@ mod tests {
         assert!(parse_octal_mode("999").is_err());
         assert!(parse_octal_mode("abc").is_err());
         assert!(parse_octal_mode("").is_err());
+    }
+
+    #[cfg(feature = "linux-net")]
+    mod cidr_tests {
+        use super::super::parse_cidr;
+        use std::net::Ipv4Addr;
+
+        #[test]
+        fn valid_cidr() {
+            let (base, prefix) = parse_cidr("172.20.0.0/24").unwrap();
+            assert_eq!(base, Ipv4Addr::new(172, 20, 0, 0));
+            assert_eq!(prefix, 24);
+        }
+
+        #[test]
+        fn valid_cidr_slash_16() {
+            let (base, prefix) = parse_cidr("10.0.0.0/16").unwrap();
+            assert_eq!(base, Ipv4Addr::new(10, 0, 0, 0));
+            assert_eq!(prefix, 16);
+        }
+
+        #[test]
+        fn valid_cidr_slash_30() {
+            let (base, prefix) = parse_cidr("10.0.0.0/30").unwrap();
+            assert_eq!(base, Ipv4Addr::new(10, 0, 0, 0));
+            assert_eq!(prefix, 30);
+        }
+
+        #[test]
+        fn missing_slash() {
+            let err = parse_cidr("172.20.0.0").unwrap_err();
+            assert!(err.to_string().contains("missing '/'"));
+        }
+
+        #[test]
+        fn invalid_base_address() {
+            assert!(parse_cidr("not.an.ip/24").is_err());
+        }
+
+        #[test]
+        fn invalid_prefix_not_number() {
+            assert!(parse_cidr("172.20.0.0/abc").is_err());
+        }
+
+        #[test]
+        fn prefix_too_large() {
+            let err = parse_cidr("172.20.0.0/31").unwrap_err();
+            assert!(err.to_string().contains("1..=30"));
+        }
+
+        #[test]
+        fn prefix_zero() {
+            let err = parse_cidr("0.0.0.0/0").unwrap_err();
+            assert!(err.to_string().contains("1..=30"));
+        }
+
+        #[test]
+        fn base_not_network_aligned() {
+            let err = parse_cidr("172.20.0.5/24").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("not network-aligned"), "got: {msg}");
+            // Should suggest the correct network address
+            assert!(msg.contains("172.20.0.0/24"), "got: {msg}");
+        }
+
+        #[test]
+        fn base_not_aligned_slash_16() {
+            let err = parse_cidr("10.0.1.0/16").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("not network-aligned"), "got: {msg}");
+            assert!(msg.contains("10.0.0.0/16"), "got: {msg}");
+        }
     }
 }

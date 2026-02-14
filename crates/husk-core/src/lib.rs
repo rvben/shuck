@@ -59,7 +59,7 @@ pub struct CreateVmRequest {
 #[derive(Default)]
 struct AllocatedResources {
     #[cfg(feature = "linux-net")]
-    host_ip: Option<Ipv4Addr>,
+    guest_ip: Option<Ipv4Addr>,
     cid: Option<u32>,
     #[cfg(feature = "linux-net")]
     tap_name: Option<String>,
@@ -75,25 +75,25 @@ pub struct HuskCore<B: VmmBackend> {
     ip_allocator: husk_net::IpAllocator,
     storage: husk_storage::StorageConfig,
     #[cfg(feature = "linux-net")]
-    host_interface: String,
+    bridge_name: String,
 }
 
 impl<B: VmmBackend> HuskCore<B> {
-    /// Create a new HuskCore with Linux networking (TAP + nftables).
+    /// Create a new HuskCore with Linux networking (bridge + TAP + nftables).
     #[cfg(feature = "linux-net")]
     pub fn new(
         vmm: B,
         state: husk_state::StateStore,
         ip_allocator: husk_net::IpAllocator,
         storage: husk_storage::StorageConfig,
-        host_interface: String,
+        bridge_name: String,
     ) -> Self {
         Self {
             vmm,
             state,
             ip_allocator,
             storage,
-            host_interface,
+            bridge_name,
         }
     }
 
@@ -156,20 +156,22 @@ impl<B: VmmBackend> HuskCore<B> {
         req: CreateVmRequest,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
-        let (host_ip, guest_ip) = self.ip_allocator.allocate()?;
-        resources.host_ip = Some(host_ip);
+        let guest_ip = self.ip_allocator.allocate()?;
+        resources.guest_ip = Some(guest_ip);
 
         let cid = self.state.allocate_cid()?;
         resources.cid = Some(cid);
 
         let tap_name = format!("husk{cid}");
         let mac = husk_net::generate_mac(cid);
-        debug!(tap = %tap_name, %host_ip, %guest_ip, cid, "resources allocated");
+        let gateway = self.ip_allocator.gateway();
+        let netmask = husk_net::prefix_len_to_netmask(self.ip_allocator.prefix_len());
+        debug!(tap = %tap_name, %guest_ip, %gateway, cid, "resources allocated");
 
-        husk_net::create_tap(&tap_name, host_ip).await?;
+        husk_net::create_tap(&tap_name).await?;
         resources.tap_name = Some(tap_name.clone());
 
-        husk_net::add_vm_nat(&tap_name, host_ip, &self.host_interface).await?;
+        husk_net::attach_to_bridge(&tap_name, &self.bridge_name).await?;
 
         let vm_dir = self.storage.vm_dir(&req.name);
         if vm_dir.exists() {
@@ -188,7 +190,7 @@ impl<B: VmmBackend> HuskCore<B> {
             rootfs_path: vm_rootfs,
             kernel_args: Some(format!(
                 "console=ttyS0 reboot=k panic=1 pci=off \
-                 ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
+                 ip={guest_ip}::{gateway}:{netmask}::eth0:off"
             )),
             initrd_path: req.initrd_path.clone(),
             vsock_cid: cid,
@@ -210,7 +212,9 @@ impl<B: VmmBackend> HuskCore<B> {
             mem_size_mib: info.mem_size_mib,
             vsock_cid: cid,
             tap_device: Some(tap_name),
-            host_ip: Some(host_ip.to_string()),
+            // host_ip stores the bridge gateway — the same for all VMs in the subnet.
+            // Kept for CLI display and API responses (shows the default gateway).
+            host_ip: Some(gateway.to_string()),
             guest_ip: Some(guest_ip.to_string()),
             kernel_path: req.kernel_path.to_string_lossy().into_owned(),
             rootfs_path: req.rootfs_path.to_string_lossy().into_owned(),
@@ -314,8 +318,8 @@ impl<B: VmmBackend> HuskCore<B> {
         }
         #[cfg(feature = "linux-net")]
         if let Some(ref tap) = resources.tap_name {
-            debug!(tap, "rolling back: removing NAT and TAP");
-            let _ = husk_net::remove_vm_nat(tap).await;
+            debug!(tap, "rolling back: removing TAP");
+            let _ = husk_net::remove_all_port_forwards(tap).await;
             let _ = husk_net::delete_tap(tap).await;
         }
         if let Some(cid) = resources.cid {
@@ -323,9 +327,9 @@ impl<B: VmmBackend> HuskCore<B> {
             let _ = self.state.release_cid(cid);
         }
         #[cfg(feature = "linux-net")]
-        if let Some(host_ip) = resources.host_ip {
-            debug!(%host_ip, "rolling back: releasing IP");
-            let _ = self.ip_allocator.release(host_ip);
+        if let Some(guest_ip) = resources.guest_ip {
+            debug!(%guest_ip, "rolling back: releasing IP");
+            let _ = self.ip_allocator.release(guest_ip);
         }
     }
 
@@ -394,17 +398,22 @@ impl<B: VmmBackend> HuskCore<B> {
             Err(e) => return Err(e.into()),
         }
 
+        // Clean up network resources. Port forwards live in two places:
+        // 1. nftables rules in the kernel (removed by remove_all_port_forwards)
+        // 2. SQLite records in the state store (removed by delete_port_forwards_for_vm)
+        // Both must be cleaned up. Deleting the TAP automatically detaches it
+        // from the bridge.
         #[cfg(feature = "linux-net")]
         {
             if let Some(ref tap) = record.tap_device {
-                let _ = husk_net::remove_vm_nat(tap).await;
+                let _ = husk_net::remove_all_port_forwards(tap).await;
                 let _ = husk_net::delete_tap(tap).await;
             }
 
-            if let Some(ref host_ip_str) = record.host_ip
-                && let Ok(host_ip) = host_ip_str.parse::<Ipv4Addr>()
+            if let Some(ref guest_ip_str) = record.guest_ip
+                && let Ok(guest_ip) = guest_ip_str.parse::<Ipv4Addr>()
             {
-                let _ = self.ip_allocator.release(host_ip);
+                let _ = self.ip_allocator.release(guest_ip);
             }
         }
 

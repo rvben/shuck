@@ -606,7 +606,7 @@ mod tests {
             std::path::Path::new("/tmp"),
         );
         let state = husk_state::StateStore::open_memory().unwrap();
-        let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+        let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
         let storage = husk_storage::StorageConfig {
             data_dir: PathBuf::from("/tmp/husk-test"),
         };
@@ -615,7 +615,7 @@ mod tests {
             state,
             ip_allocator,
             storage,
-            "eth0".into(),
+            "husk0".into(),
         ))
     }
 

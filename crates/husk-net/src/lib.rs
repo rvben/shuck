@@ -14,12 +14,12 @@ pub enum NetError {
     CommandFailed { cmd: String, message: String },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid TAP name '{name}': {reason}")]
-    InvalidTapName { name: String, reason: String },
+    #[error("invalid interface name '{name}': {reason}")]
+    InvalidInterfaceName { name: String, reason: String },
 }
 
 /// Linux interface name length limit (IFNAMSIZ - 1 for null terminator).
-const TAP_NAME_MAX_LEN: usize = 15;
+const IFNAMSIZ_MAX: usize = 15;
 
 /// Name of the nftables table managed by husk.
 const NFT_TABLE: &str = "husk";
@@ -31,29 +31,39 @@ struct AllocatorState {
     freed: BTreeSet<u32>,
 }
 
-/// Allocates /30 subnets from a configurable IP range.
+/// Allocates individual guest IPs from a shared subnet.
 ///
-/// Default range: `172.20.0.0/16`, yielding 16 384 subnets.
-/// Each subnet provides a host IP (`.1`) and guest IP (`.2`).
+/// The subnet gateway gets `.1`; guests get `.2` through the last usable
+/// address (excluding the broadcast address).
 ///
-/// Released subnets are reused before allocating fresh ones,
+/// Released IPs are reused before allocating fresh ones,
 /// with the lowest freed index chosen first.
 pub struct IpAllocator {
     base: u32,
+    prefix_len: u8,
     max_index: u32,
     state: Mutex<AllocatorState>,
 }
 
 impl IpAllocator {
+    /// Create a new allocator for a subnet.
+    ///
+    /// `prefix_len` must be 1..=30. Panics on out-of-range values.
     pub fn new(base: Ipv4Addr, prefix_len: u8) -> Self {
+        assert!(
+            (1..=30).contains(&prefix_len),
+            "IpAllocator prefix_len must be 1..=30 (got {prefix_len})"
+        );
+
         let base_u32 = u32::from(base);
         let host_bits = 32 - prefix_len;
-        let total_ips = 1u32 << host_bits;
-        let max_subnets = total_ips / 4;
+        // Exclude network (.0), gateway (.1), and broadcast (last)
+        let max_guests = (1u32 << host_bits) - 3;
 
         Self {
             base: base_u32,
-            max_index: max_subnets,
+            prefix_len,
+            max_index: max_guests,
             state: Mutex::new(AllocatorState {
                 next_index: 0,
                 freed: BTreeSet::new(),
@@ -61,10 +71,21 @@ impl IpAllocator {
         }
     }
 
-    /// Allocate the next /30 subnet. Returns `(host_ip, guest_ip)`.
+    /// Return the gateway IP (`.1` in the subnet).
+    pub fn gateway(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.base + 1)
+    }
+
+    /// Return the configured prefix length.
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix_len
+    }
+
+    /// Allocate the next guest IP address.
     ///
-    /// Reuses previously released subnets before allocating new ones.
-    pub fn allocate(&self) -> Result<(Ipv4Addr, Ipv4Addr), NetError> {
+    /// Returns individual addresses starting at `.2`.
+    /// Reuses previously released IPs before allocating new ones.
+    pub fn allocate(&self) -> Result<Ipv4Addr, NetError> {
         let mut state = self.state.lock().unwrap();
 
         let index = if let Some(&idx) = state.freed.iter().next() {
@@ -79,51 +100,45 @@ impl IpAllocator {
             idx
         };
 
-        // .0 = network, .1 = host (gateway), .2 = guest, .3 = broadcast
-        let subnet_base = self.base + (index * 4);
-        let host_ip = Ipv4Addr::from(subnet_base + 1);
-        let guest_ip = Ipv4Addr::from(subnet_base + 2);
-
-        debug!(index, %host_ip, %guest_ip, "allocated /30 subnet");
-        Ok((host_ip, guest_ip))
+        let guest_ip = Ipv4Addr::from(self.base + 2 + index);
+        debug!(index, %guest_ip, "allocated guest IP");
+        Ok(guest_ip)
     }
 
-    /// Release a previously allocated /30 subnet back to the pool.
-    ///
-    /// Takes the host IP (the `.1` address) to identify the subnet.
-    pub fn release(&self, host_ip: Ipv4Addr) -> Result<(), NetError> {
-        let host_u32 = u32::from(host_ip);
+    /// Release a previously allocated guest IP back to the pool.
+    pub fn release(&self, guest_ip: Ipv4Addr) -> Result<(), NetError> {
+        let guest_u32 = u32::from(guest_ip);
 
-        // Host IP = subnet_base + 1
-        if host_u32 == 0 {
-            return Err(NetError::NotAllocated(host_ip));
-        }
-        let subnet_base = host_u32 - 1;
-
-        if subnet_base < self.base {
-            return Err(NetError::NotAllocated(host_ip));
+        if guest_u32 < self.base + 2 {
+            return Err(NetError::NotAllocated(guest_ip));
         }
 
-        let offset = subnet_base - self.base;
-        if !offset.is_multiple_of(4) {
-            return Err(NetError::NotAllocated(host_ip));
-        }
-
-        let index = offset / 4;
+        let index = guest_u32 - self.base - 2;
         let mut state = self.state.lock().unwrap();
 
         if index >= state.next_index || index >= self.max_index {
-            return Err(NetError::NotAllocated(host_ip));
+            return Err(NetError::NotAllocated(guest_ip));
         }
 
         if !state.freed.insert(index) {
-            // Already freed — double release
-            return Err(NetError::NotAllocated(host_ip));
+            return Err(NetError::NotAllocated(guest_ip));
         }
 
-        debug!(index, %host_ip, "released /30 subnet");
+        debug!(index, %guest_ip, "released guest IP");
         Ok(())
     }
+}
+
+// ── Network Helpers ────────────────────────────────────────────────────
+
+/// Convert a prefix length to a dotted-quad netmask.
+pub fn prefix_len_to_netmask(prefix_len: u8) -> Ipv4Addr {
+    let mask = if prefix_len == 0 {
+        0u32
+    } else {
+        !0u32 << (32 - prefix_len)
+    };
+    Ipv4Addr::from(mask)
 }
 
 // ── MAC Address ────────────────────────────────────────────────────────
@@ -140,30 +155,30 @@ pub fn generate_mac(index: u32) -> String {
     )
 }
 
-// ── TAP Devices ────────────────────────────────────────────────────────
+// ── Interface Name Validation ──────────────────────────────────────────
 
-/// Validate a TAP device name.
+/// Validate a Linux network interface name (TAP device or bridge).
 ///
 /// Linux requires interface names to be at most 15 bytes (IFNAMSIZ - 1)
 /// and only contain alphanumeric characters, underscores, or hyphens.
-fn validate_tap_name(name: &str) -> Result<(), NetError> {
+fn validate_interface_name(name: &str) -> Result<(), NetError> {
     if name.is_empty() {
-        return Err(NetError::InvalidTapName {
+        return Err(NetError::InvalidInterfaceName {
             name: name.into(),
             reason: "name cannot be empty".into(),
         });
     }
-    if name.len() > TAP_NAME_MAX_LEN {
-        return Err(NetError::InvalidTapName {
+    if name.len() > IFNAMSIZ_MAX {
+        return Err(NetError::InvalidInterfaceName {
             name: name.into(),
-            reason: format!("exceeds {} character limit", TAP_NAME_MAX_LEN),
+            reason: format!("exceeds {} character limit", IFNAMSIZ_MAX),
         });
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        return Err(NetError::InvalidTapName {
+        return Err(NetError::InvalidInterfaceName {
             name: name.into(),
             reason: "contains invalid characters (only alphanumeric, underscore, hyphen allowed)"
                 .into(),
@@ -172,24 +187,87 @@ fn validate_tap_name(name: &str) -> Result<(), NetError> {
     Ok(())
 }
 
-/// Create a TAP device and configure its IP address.
-///
-/// Requires root or `CAP_NET_ADMIN`.
-pub async fn create_tap(name: &str, host_ip: Ipv4Addr) -> Result<(), NetError> {
-    validate_tap_name(name)?;
-    info!(tap = name, %host_ip, "creating TAP device");
+// ── Bridge Management ──────────────────────────────────────────────────
 
-    run_cmd("ip", &["tuntap", "add", "dev", name, "mode", "tap"]).await?;
+/// Create a Linux bridge device with a gateway IP.
+///
+/// Also attempts to disable `bridge-nf-call-iptables` so that
+/// bridge-local traffic bypasses nftables entirely.
+pub async fn create_bridge(
+    name: &str,
+    gateway_ip: Ipv4Addr,
+    prefix_len: u8,
+) -> Result<(), NetError> {
+    validate_interface_name(name)?;
+    info!(bridge = name, %gateway_ip, prefix_len, "creating bridge");
+
+    run_cmd("ip", &["link", "add", name, "type", "bridge"]).await?;
     run_cmd(
         "ip",
-        &["addr", "add", &format!("{host_ip}/30"), "dev", name],
+        &[
+            "addr",
+            "add",
+            &format!("{gateway_ip}/{prefix_len}"),
+            "dev",
+            name,
+        ],
     )
     .await?;
+    run_cmd("ip", &["link", "set", "dev", name, "up"]).await?;
+
+    // Bridge-local traffic should bypass nftables for performance.
+    // Non-fatal: the br_netfilter module may not be loaded.
+    if let Err(e) = run_cmd("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=0"]).await {
+        warn!(
+            "could not disable bridge-nf-call-iptables: {e} \
+             (inter-VM traffic will still work via nftables forward rules)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Delete a Linux bridge device.
+pub async fn delete_bridge(name: &str) -> Result<(), NetError> {
+    info!(bridge = name, "deleting bridge");
+    run_cmd("ip", &["link", "set", "dev", name, "down"]).await?;
+    run_cmd("ip", &["link", "del", name]).await?;
+    Ok(())
+}
+
+/// Attach a TAP device to a bridge as a slave port.
+pub async fn attach_to_bridge(tap_name: &str, bridge_name: &str) -> Result<(), NetError> {
+    debug!(
+        tap = tap_name,
+        bridge = bridge_name,
+        "attaching TAP to bridge"
+    );
+    run_cmd(
+        "ip",
+        &["link", "set", "dev", tap_name, "master", bridge_name],
+    )
+    .await?;
+    Ok(())
+}
+
+// ── TAP Devices ────────────────────────────────────────────────────────
+
+/// Create a TAP device.
+///
+/// The TAP is a plain L2 port (no IP address) — it gets its connectivity
+/// by being attached to the bridge. Requires root or `CAP_NET_ADMIN`.
+pub async fn create_tap(name: &str) -> Result<(), NetError> {
+    validate_interface_name(name)?;
+    info!(tap = name, "creating TAP device");
+
+    run_cmd("ip", &["tuntap", "add", "dev", name, "mode", "tap"]).await?;
     run_cmd("ip", &["link", "set", "dev", name, "up"]).await?;
     Ok(())
 }
 
 /// Delete a TAP device.
+///
+/// Removing the TAP automatically detaches it from any bridge.
 pub async fn delete_tap(name: &str) -> Result<(), NetError> {
     info!(tap = name, "deleting TAP device");
     run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await?;
@@ -198,17 +276,33 @@ pub async fn delete_tap(name: &str) -> Result<(), NetError> {
 
 // ── nftables NAT ───────────────────────────────────────────────────────
 
-/// Initialize the husk nftables table with required chains.
+/// Initialize the husk nftables table with bridge-level rules.
 ///
-/// Replaces any existing husk table to ensure clean state.
+/// Installs three permanent rules covering the entire bridge subnet:
+/// - Masquerade outbound traffic from the bridge subnet
+/// - Accept forwarding from the bridge
+/// - Accept forwarding to the bridge
+///
+/// Port-forward DNAT rules are added per-VM in the prerouting chain.
 /// Call once at daemon startup. Requires root or `CAP_NET_ADMIN`.
-pub async fn init_nat() -> Result<(), NetError> {
-    info!("initializing nftables table");
+pub async fn init_nat(
+    bridge_name: &str,
+    bridge_subnet: &str,
+    host_interface: &str,
+) -> Result<(), NetError> {
+    info!(
+        bridge = bridge_name,
+        subnet = bridge_subnet,
+        host_iface = host_interface,
+        "initializing nftables table"
+    );
 
     // Delete existing table (ignore error if it doesn't exist)
     let _ = run_cmd("nft", &["delete", "table", "ip", NFT_TABLE]).await;
 
     run_cmd("nft", &["add", "table", "ip", NFT_TABLE]).await?;
+
+    // Postrouting chain with masquerade rule
     run_cmd(
         "nft",
         &[
@@ -225,6 +319,27 @@ pub async fn init_nat() -> Result<(), NetError> {
         "nft",
         &[
             "add",
+            "rule",
+            "ip",
+            NFT_TABLE,
+            "postrouting",
+            "ip",
+            "saddr",
+            bridge_subnet,
+            "oifname",
+            host_interface,
+            "masquerade",
+            "comment",
+            "\"husk:bridge-masq\"",
+        ],
+    )
+    .await?;
+
+    // Forward chain with bridge accept rules
+    run_cmd(
+        "nft",
+        &[
+            "add",
             "chain",
             "ip",
             NFT_TABLE,
@@ -233,6 +348,40 @@ pub async fn init_nat() -> Result<(), NetError> {
         ],
     )
     .await?;
+    run_cmd(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "ip",
+            NFT_TABLE,
+            "forward",
+            "iifname",
+            bridge_name,
+            "accept",
+            "comment",
+            "\"husk:bridge-fwd-out\"",
+        ],
+    )
+    .await?;
+    run_cmd(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "ip",
+            NFT_TABLE,
+            "forward",
+            "oifname",
+            bridge_name,
+            "accept",
+            "comment",
+            "\"husk:bridge-fwd-in\"",
+        ],
+    )
+    .await?;
+
+    // Prerouting chain for per-VM port forwards
     run_cmd(
         "nft",
         &[
@@ -249,114 +398,13 @@ pub async fn init_nat() -> Result<(), NetError> {
     Ok(())
 }
 
-/// Add NAT masquerade and forwarding rules for a VM.
-///
-/// Creates three rules tagged with a comment for later cleanup:
-/// - Masquerade outbound traffic from the VM's /30 subnet
-/// - Allow forwarding from the TAP device
-/// - Allow forwarding to the TAP device
-pub async fn add_vm_nat(
-    tap_name: &str,
-    host_ip: Ipv4Addr,
-    host_interface: &str,
-) -> Result<(), NetError> {
-    let subnet_base = Ipv4Addr::from(u32::from(host_ip) - 1);
-    let subnet = format!("{subnet_base}/30");
-    let comment = format!("\"husk:{}\"", tap_name);
-
-    info!(tap = tap_name, %subnet, host_iface = host_interface, "adding NAT rules");
-
-    // Masquerade outbound traffic from this VM's subnet
-    run_cmd(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "ip",
-            NFT_TABLE,
-            "postrouting",
-            "ip",
-            "saddr",
-            &subnet,
-            "oifname",
-            host_interface,
-            "masquerade",
-            "comment",
-            &comment,
-        ],
-    )
-    .await?;
-
-    // Allow forwarding from TAP
-    run_cmd(
-        "nft",
-        &[
-            "add", "rule", "ip", NFT_TABLE, "forward", "iifname", tap_name, "accept", "comment",
-            &comment,
-        ],
-    )
-    .await?;
-
-    // Allow forwarding to TAP
-    run_cmd(
-        "nft",
-        &[
-            "add", "rule", "ip", NFT_TABLE, "forward", "oifname", tap_name, "accept", "comment",
-            &comment,
-        ],
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// Remove all NAT and forwarding rules for a VM.
-///
-/// Queries the husk nftables table for rules tagged with the VM's TAP name
-/// and deletes them by handle. Also removes any port forwards for this VM.
-pub async fn remove_vm_nat(tap_name: &str) -> Result<(), NetError> {
-    let _ = remove_all_port_forwards(tap_name).await;
-
-    info!(tap = tap_name, "removing NAT rules");
-
-    let output = match run_cmd("nft", &["-j", "list", "table", "ip", NFT_TABLE]).await {
-        Ok(output) => output,
-        Err(_) => {
-            debug!("nftables table not found, skipping rule removal");
-            return Ok(());
-        }
-    };
-
-    let comment_tag = format!("husk:{tap_name}");
-    let rules = find_rules_by_comment(&output, &comment_tag);
-
-    for (chain, handle) in rules {
-        debug!(chain = %chain, handle, "deleting rule");
-        let _ = run_cmd(
-            "nft",
-            &[
-                "delete",
-                "rule",
-                "ip",
-                NFT_TABLE,
-                &chain,
-                "handle",
-                &handle.to_string(),
-            ],
-        )
-        .await;
-    }
-
-    Ok(())
-}
-
 // ── Port Forwarding ───────────────────────────────────────────────────
 
 /// Add a port forward from `host_port` to `guest_ip:guest_port`.
 ///
-/// Creates two nftables rules tagged with a comment for later cleanup:
-/// - DNAT rule in the prerouting chain
-/// - Forward rule to allow traffic to the guest
+/// Creates a DNAT rule in the prerouting chain. The bridge-level
+/// forward rules already allow all traffic to/from the bridge, so
+/// no per-port-forward accept rule is needed.
 pub async fn add_port_forward(
     host_port: u16,
     guest_ip: Ipv4Addr,
@@ -383,28 +431,6 @@ pub async fn add_port_forward(
             "dnat",
             "to",
             &dnat_target,
-            "comment",
-            &comment,
-        ],
-    )
-    .await?;
-
-    // Forward rule to allow traffic to the guest
-    run_cmd(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "ip",
-            NFT_TABLE,
-            "forward",
-            "ip",
-            "daddr",
-            &guest_ip.to_string(),
-            "tcp",
-            "dport",
-            &guest_port.to_string(),
-            "accept",
             "comment",
             &comment,
         ],
@@ -596,20 +622,21 @@ mod tests {
 
     #[test]
     fn ip_allocator_sequential() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
 
-        let (host1, guest1) = alloc.allocate().unwrap();
-        assert_eq!(host1, Ipv4Addr::new(172, 20, 0, 1));
+        let guest1 = alloc.allocate().unwrap();
         assert_eq!(guest1, Ipv4Addr::new(172, 20, 0, 2));
 
-        let (host2, guest2) = alloc.allocate().unwrap();
-        assert_eq!(host2, Ipv4Addr::new(172, 20, 0, 5));
-        assert_eq!(guest2, Ipv4Addr::new(172, 20, 0, 6));
+        let guest2 = alloc.allocate().unwrap();
+        assert_eq!(guest2, Ipv4Addr::new(172, 20, 0, 3));
+
+        let guest3 = alloc.allocate().unwrap();
+        assert_eq!(guest3, Ipv4Addr::new(172, 20, 0, 4));
     }
 
     #[test]
     fn ip_allocator_exhaustion() {
-        // /30 range = exactly 1 subnet
+        // /30: network(.0), gateway(.1), one guest(.2), broadcast(.3)
         let alloc = IpAllocator::new(Ipv4Addr::new(10, 0, 0, 0), 30);
         assert!(alloc.allocate().is_ok());
         assert!(matches!(alloc.allocate(), Err(NetError::PoolExhausted)));
@@ -619,49 +646,84 @@ mod tests {
     fn ip_allocator_release_and_reuse() {
         let alloc = IpAllocator::new(Ipv4Addr::new(10, 0, 0, 0), 30);
 
-        let (host, _guest) = alloc.allocate().unwrap();
-        assert_eq!(host, Ipv4Addr::new(10, 0, 0, 1));
+        let guest = alloc.allocate().unwrap();
+        assert_eq!(guest, Ipv4Addr::new(10, 0, 0, 2));
 
         // Pool exhausted
         assert!(alloc.allocate().is_err());
 
         // Release and reallocate
-        alloc.release(host).unwrap();
-        let (host2, guest2) = alloc.allocate().unwrap();
-        assert_eq!(host2, Ipv4Addr::new(10, 0, 0, 1));
+        alloc.release(guest).unwrap();
+        let guest2 = alloc.allocate().unwrap();
         assert_eq!(guest2, Ipv4Addr::new(10, 0, 0, 2));
     }
 
     #[test]
     fn ip_allocator_release_reuses_lowest_index() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
 
-        let (host1, _) = alloc.allocate().unwrap(); // index 0
-        let (_host2, _) = alloc.allocate().unwrap(); // index 1
-        let (host3, _) = alloc.allocate().unwrap(); // index 2
+        let guest1 = alloc.allocate().unwrap(); // .2
+        let _guest2 = alloc.allocate().unwrap(); // .3
+        let guest3 = alloc.allocate().unwrap(); // .4
 
-        // Release index 2, then index 0
-        alloc.release(host3).unwrap();
-        alloc.release(host1).unwrap();
+        // Release .4 then .2
+        alloc.release(guest3).unwrap();
+        alloc.release(guest1).unwrap();
 
-        // Next allocation reuses index 0 (lowest freed)
-        let (reused, _) = alloc.allocate().unwrap();
-        assert_eq!(reused, host1);
+        // Next allocation reuses .2 (lowest freed)
+        let reused = alloc.allocate().unwrap();
+        assert_eq!(reused, guest1);
 
-        // Then index 2
-        let (reused2, _) = alloc.allocate().unwrap();
-        assert_eq!(reused2, host3);
+        // Then .4
+        let reused2 = alloc.allocate().unwrap();
+        assert_eq!(reused2, guest3);
 
-        // Then fresh index 3
-        let (fresh, _) = alloc.allocate().unwrap();
-        assert_eq!(fresh, Ipv4Addr::new(172, 20, 0, 13));
+        // Then fresh .5
+        let fresh = alloc.allocate().unwrap();
+        assert_eq!(fresh, Ipv4Addr::new(172, 20, 0, 5));
     }
 
     #[test]
     fn ip_allocator_release_not_allocated() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
 
         // Release without any allocation
+        assert!(matches!(
+            alloc.release(Ipv4Addr::new(172, 20, 0, 2)),
+            Err(NetError::NotAllocated(_))
+        ));
+    }
+
+    #[test]
+    fn ip_allocator_release_wrong_range() {
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+        alloc.allocate().unwrap();
+
+        // IP outside the allocator's range
+        assert!(matches!(
+            alloc.release(Ipv4Addr::new(10, 0, 0, 2)),
+            Err(NetError::NotAllocated(_))
+        ));
+    }
+
+    #[test]
+    fn ip_allocator_double_release() {
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+        let guest = alloc.allocate().unwrap();
+
+        alloc.release(guest).unwrap();
+        assert!(matches!(
+            alloc.release(guest),
+            Err(NetError::NotAllocated(_))
+        ));
+    }
+
+    #[test]
+    fn ip_allocator_release_gateway_rejected() {
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+        alloc.allocate().unwrap();
+
+        // The gateway IP (.1) is not a valid guest address
         assert!(matches!(
             alloc.release(Ipv4Addr::new(172, 20, 0, 1)),
             Err(NetError::NotAllocated(_))
@@ -669,39 +731,49 @@ mod tests {
     }
 
     #[test]
-    fn ip_allocator_release_wrong_range() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    fn ip_allocator_release_network_rejected() {
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
         alloc.allocate().unwrap();
 
-        // IP outside the allocator's range
+        // The network address (.0) is not a valid guest address
         assert!(matches!(
-            alloc.release(Ipv4Addr::new(10, 0, 0, 1)),
+            alloc.release(Ipv4Addr::new(172, 20, 0, 0)),
             Err(NetError::NotAllocated(_))
         ));
     }
 
     #[test]
-    fn ip_allocator_double_release() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
-        let (host, _) = alloc.allocate().unwrap();
+    fn ip_allocator_gateway_and_prefix() {
+        let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+        assert_eq!(alloc.gateway(), Ipv4Addr::new(172, 20, 0, 1));
+        assert_eq!(alloc.prefix_len(), 24);
 
-        alloc.release(host).unwrap();
-        assert!(matches!(
-            alloc.release(host),
-            Err(NetError::NotAllocated(_))
-        ));
+        let alloc16 = IpAllocator::new(Ipv4Addr::new(10, 0, 0, 0), 16);
+        assert_eq!(alloc16.gateway(), Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(alloc16.prefix_len(), 16);
     }
 
     #[test]
-    fn ip_allocator_release_misaligned_ip() {
+    fn ip_allocator_large_subnet() {
+        // /16 gives 65533 guests
         let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
-        alloc.allocate().unwrap();
 
-        // .2 is the guest IP, not the host IP
-        assert!(matches!(
-            alloc.release(Ipv4Addr::new(172, 20, 0, 2)),
-            Err(NetError::NotAllocated(_))
-        ));
+        let first = alloc.allocate().unwrap();
+        assert_eq!(first, Ipv4Addr::new(172, 20, 0, 2));
+
+        let second = alloc.allocate().unwrap();
+        assert_eq!(second, Ipv4Addr::new(172, 20, 0, 3));
+    }
+
+    // ── Netmask Conversion ────────────────────────────────────────────
+
+    #[test]
+    fn netmask_conversion() {
+        assert_eq!(prefix_len_to_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(prefix_len_to_netmask(16), Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(prefix_len_to_netmask(30), Ipv4Addr::new(255, 255, 255, 252));
+        assert_eq!(prefix_len_to_netmask(0), Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(prefix_len_to_netmask(32), Ipv4Addr::new(255, 255, 255, 255));
     }
 
     // ── MAC Address ────────────────────────────────────────────────────
@@ -720,47 +792,47 @@ mod tests {
         assert_eq!(generate_mac(0x0100_0000), "AA:FC:00:00:00:00");
     }
 
-    // ── TAP Name Validation ────────────────────────────────────────────
+    // ── Interface Name Validation ──────────────────────────────────────
 
     #[test]
-    fn tap_name_valid() {
-        assert!(validate_tap_name("husk0").is_ok());
-        assert!(validate_tap_name("tap-test_1").is_ok());
-        assert!(validate_tap_name("a").is_ok());
+    fn interface_name_valid() {
+        assert!(validate_interface_name("husk0").is_ok());
+        assert!(validate_interface_name("tap-test_1").is_ok());
+        assert!(validate_interface_name("a").is_ok());
         // Exactly 15 characters
-        assert!(validate_tap_name("abcdefghijklmno").is_ok());
+        assert!(validate_interface_name("abcdefghijklmno").is_ok());
     }
 
     #[test]
-    fn tap_name_empty() {
+    fn interface_name_empty() {
         assert!(matches!(
-            validate_tap_name(""),
-            Err(NetError::InvalidTapName { .. })
+            validate_interface_name(""),
+            Err(NetError::InvalidInterfaceName { .. })
         ));
     }
 
     #[test]
-    fn tap_name_too_long() {
+    fn interface_name_too_long() {
         // 16 characters exceeds the limit
         assert!(matches!(
-            validate_tap_name("abcdefghijklmnop"),
-            Err(NetError::InvalidTapName { .. })
+            validate_interface_name("abcdefghijklmnop"),
+            Err(NetError::InvalidInterfaceName { .. })
         ));
     }
 
     #[test]
-    fn tap_name_invalid_chars() {
+    fn interface_name_invalid_chars() {
         assert!(matches!(
-            validate_tap_name("tap.0"),
-            Err(NetError::InvalidTapName { .. })
+            validate_interface_name("tap.0"),
+            Err(NetError::InvalidInterfaceName { .. })
         ));
         assert!(matches!(
-            validate_tap_name("tap/bad"),
-            Err(NetError::InvalidTapName { .. })
+            validate_interface_name("tap/bad"),
+            Err(NetError::InvalidInterfaceName { .. })
         ));
         assert!(matches!(
-            validate_tap_name("tap name"),
-            Err(NetError::InvalidTapName { .. })
+            validate_interface_name("tap name"),
+            Err(NetError::InvalidInterfaceName { .. })
         ));
     }
 

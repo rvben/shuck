@@ -150,9 +150,9 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskCore<MockVmm>>, Uuid) 
     let core = Arc::new(HuskCore::new(
         vmm,
         state_store,
-        husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 16),
+        husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
         storage,
-        "eth0".into(),
+        "husk0".into(),
     ));
     #[cfg(not(feature = "linux-net"))]
     let core = Arc::new(HuskCore::new(vmm, state_store, storage));
@@ -366,6 +366,58 @@ async fn multiple_pause_resume_cycles() {
         core.resume_vm("test-vm").await.unwrap();
         assert_eq!(core.get_vm("test-vm").unwrap().state, "running");
     }
+}
+
+// ── Network Configuration ─────────────────────────────────────────────
+//
+// Verify that the IP allocator, netmask conversion, and gateway computation
+// produce values consistent with the bridge networking model.
+
+#[cfg(feature = "linux-net")]
+#[test]
+fn allocator_produces_correct_kernel_args_components() {
+    use std::net::Ipv4Addr;
+
+    let alloc = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let gateway = alloc.gateway();
+    let netmask = husk_net::prefix_len_to_netmask(alloc.prefix_len());
+
+    assert_eq!(gateway, Ipv4Addr::new(172, 20, 0, 1));
+    assert_eq!(netmask, Ipv4Addr::new(255, 255, 255, 0));
+
+    // Allocate two guests and verify they get sequential IPs in the subnet
+    let guest1 = alloc.allocate().unwrap();
+    let guest2 = alloc.allocate().unwrap();
+    assert_eq!(guest1, Ipv4Addr::new(172, 20, 0, 2));
+    assert_eq!(guest2, Ipv4Addr::new(172, 20, 0, 3));
+
+    // Verify the kernel args format matches what try_create_vm constructs
+    let args = format!(
+        "console=ttyS0 reboot=k panic=1 pci=off ip={guest1}::{gateway}:{netmask}::eth0:off"
+    );
+    assert!(args.contains("ip=172.20.0.2::172.20.0.1:255.255.255.0::eth0:off"));
+
+    // After releasing guest1, the next allocation reuses it
+    alloc.release(guest1).unwrap();
+    let reused = alloc.allocate().unwrap();
+    assert_eq!(reused, guest1);
+}
+
+#[cfg(feature = "linux-net")]
+#[test]
+fn allocator_with_slash_16_subnet() {
+    use std::net::Ipv4Addr;
+
+    let alloc = husk_net::IpAllocator::new(Ipv4Addr::new(10, 0, 0, 0), 16);
+    let gateway = alloc.gateway();
+    let netmask = husk_net::prefix_len_to_netmask(alloc.prefix_len());
+
+    assert_eq!(gateway, Ipv4Addr::new(10, 0, 0, 1));
+    assert_eq!(netmask, Ipv4Addr::new(255, 255, 0, 0));
+    assert_eq!(alloc.prefix_len(), 16);
+
+    let guest = alloc.allocate().unwrap();
+    assert_eq!(guest, Ipv4Addr::new(10, 0, 0, 2));
 }
 
 // ── Agent Connect State Validation ───────────────────────────────────

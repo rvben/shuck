@@ -26,7 +26,7 @@ fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         std::path::Path::new("/tmp"),
     );
     let state = husk_state::StateStore::open_memory().unwrap();
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
@@ -35,7 +35,7 @@ fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         state,
         ip_allocator,
         storage,
-        "eth0".into(),
+        "husk0".into(),
     ))
 }
 
@@ -372,7 +372,7 @@ async fn vm_response_json_structure() {
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
     );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
@@ -381,7 +381,7 @@ async fn vm_response_json_structure() {
         state,
         ip_allocator,
         storage,
-        "eth0".into(),
+        "husk0".into(),
     ));
 
     let app = router(populated_core.clone());
@@ -452,7 +452,7 @@ async fn list_vms_returns_all_records() {
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
     );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
@@ -461,7 +461,7 @@ async fn list_vms_returns_all_records() {
         state,
         ip_allocator,
         storage,
-        "eth0".into(),
+        "husk0".into(),
     ));
 
     let app = router(core);
@@ -684,7 +684,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
     );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
@@ -693,7 +693,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         state,
         ip_allocator,
         storage,
-        "eth0".into(),
+        "husk0".into(),
     ));
 
     let app = router(core);
@@ -742,7 +742,7 @@ async fn vm_response_with_null_optional_fields() {
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
     );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 16);
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
@@ -751,7 +751,7 @@ async fn vm_response_with_null_optional_fields() {
         state,
         ip_allocator,
         storage,
-        "eth0".into(),
+        "husk0".into(),
     ));
 
     let app = router(core);
