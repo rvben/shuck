@@ -202,6 +202,24 @@ pub async fn create_bridge(
     info!(bridge = name, %gateway_ip, prefix_len, "creating bridge");
 
     run_cmd("ip", &["link", "add", name, "type", "bridge"]).await?;
+
+    // If any subsequent step fails, delete the interface we just created
+    // to avoid leaving a zombie bridge.
+    if let Err(e) = configure_bridge(name, gateway_ip, prefix_len).await {
+        warn!(bridge = name, "bridge setup failed, cleaning up interface");
+        let _ = run_cmd("ip", &["link", "del", name]).await;
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Configure a newly-created bridge interface (address, link-up, sysctl).
+async fn configure_bridge(
+    name: &str,
+    gateway_ip: Ipv4Addr,
+    prefix_len: u8,
+) -> Result<(), NetError> {
     run_cmd(
         "ip",
         &[
@@ -261,7 +279,13 @@ pub async fn create_tap(name: &str) -> Result<(), NetError> {
     info!(tap = name, "creating TAP device");
 
     run_cmd("ip", &["tuntap", "add", "dev", name, "mode", "tap"]).await?;
-    run_cmd("ip", &["link", "set", "dev", name, "up"]).await?;
+
+    if let Err(e) = run_cmd("ip", &["link", "set", "dev", name, "up"]).await {
+        warn!(tap = name, "TAP link-up failed, cleaning up device");
+        let _ = run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await;
+        return Err(e);
+    }
+
     Ok(())
 }
 
@@ -296,6 +320,10 @@ pub async fn init_nat(
         host_iface = host_interface,
         "initializing nftables table"
     );
+
+    // IP forwarding is required for NAT to route packets between bridge
+    // and external interfaces.
+    run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await?;
 
     // Delete existing table (ignore error if it doesn't exist)
     let _ = run_cmd("nft", &["delete", "table", "ip", NFT_TABLE]).await;
