@@ -668,12 +668,27 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
     }
 
     let resolv_path = mount_dir.path().join("etc/resolv.conf");
+
+    // Remove symlink if present (e.g. systemd-resolved's stub-resolv.conf)
+    // so we can write a static file that persists across boot.
+    if resolv_path.is_symlink() {
+        let _ = tokio::fs::remove_file(&resolv_path).await;
+    }
+
     let contents: String = servers
         .iter()
         .map(|s| format!("nameserver {s}\n"))
         .collect();
 
     let write_result = tokio::fs::write(&resolv_path, contents.as_bytes()).await;
+
+    // Mask systemd-resolved so it doesn't recreate the symlink on boot
+    let resolved_link = mount_dir
+        .path()
+        .join("etc/systemd/system/systemd-resolved.service");
+    if !resolved_link.exists() {
+        let _ = tokio::fs::symlink("/dev/null", &resolved_link).await;
+    }
 
     // Always unmount, even if write failed
     let umount_status = Command::new("umount").arg(mount_dir.path()).status().await;
