@@ -56,6 +56,8 @@ check CONFIG_IP_VS_RR "IPVS round-robin"
 check CONFIG_IP_VS_WRR "IPVS weighted round-robin"
 check CONFIG_IP_VS_SH "IPVS source hashing"
 check CONFIG_IP_VS_NFCT "IPVS conntrack"
+check CONFIG_NETFILTER_XT_MATCH_COMMENT "iptables comment match"
+check CONFIG_VXLAN "VXLAN (flannel default backend)"
 
 echo ""
 echo "=== Cgroups ==="

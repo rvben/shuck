@@ -71,12 +71,20 @@ chroot "$MOUNT_DIR" /bin/bash -c '
         2>&1 | tail -5
     apt-get clean
     rm -rf /var/lib/apt/lists/*
+
+    # Use iptables-legacy instead of iptables-nft.
+    # The Firecracker kernel has legacy iptables support but lacks nftables.
+    update-alternatives --set iptables /usr/sbin/iptables-legacy
+    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
 '
 
 echo "==> Downloading k3s binary"
-K3S_VERSION="$(curl -sfL https://update.k3s.io/v1-release/channels/stable | grep -oP '"latest":"v\K[^"]+')"
-K3S_URL="https://github.com/k3s-io/k3s/releases/download/v${K3S_VERSION}/k3s${K3S_SUFFIX}"
-echo "    Version: v${K3S_VERSION}"
+K3S_TAG="$(curl -sfL https://api.github.com/repos/k3s-io/k3s/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+if [[ -z "$K3S_TAG" ]]; then
+    echo "Error: failed to determine latest k3s version"; exit 1
+fi
+K3S_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_TAG}/k3s${K3S_SUFFIX}"
+echo "    Version: ${K3S_TAG}"
 curl -sfL "$K3S_URL" -o "$MOUNT_DIR/usr/local/bin/k3s"
 chmod 755 "$MOUNT_DIR/usr/local/bin/k3s"
 
@@ -121,7 +129,10 @@ EOF
 echo "==> Setting empty root password"
 chroot "$MOUNT_DIR" passwd -d root
 
-echo "==> Configuring DNS (fallback, overridden by husk at boot)"
+echo "==> Disabling systemd-resolved (husk injects /etc/resolv.conf directly)"
+chroot "$MOUNT_DIR" systemctl disable systemd-resolved.service 2>/dev/null || true
+chroot "$MOUNT_DIR" systemctl mask systemd-resolved.service
+rm -f "$MOUNT_DIR/etc/resolv.conf"
 cat > "$MOUNT_DIR/etc/resolv.conf" << 'EOF'
 nameserver 8.8.8.8
 nameserver 1.1.1.1
