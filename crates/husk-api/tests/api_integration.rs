@@ -36,6 +36,7 @@ fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         ip_allocator,
         storage,
         "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
     ))
 }
 
@@ -364,6 +365,7 @@ async fn vm_response_json_structure() {
         updated_at: now,
         userdata: None,
         userdata_status: None,
+        userdata_env: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -382,6 +384,7 @@ async fn vm_response_json_structure() {
         ip_allocator,
         storage,
         "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
     ));
 
     let app = router(populated_core.clone());
@@ -444,6 +447,7 @@ async fn list_vms_returns_all_records() {
             updated_at: now,
             userdata: None,
             userdata_status: None,
+            userdata_env: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -462,6 +466,7 @@ async fn list_vms_returns_all_records() {
         ip_allocator,
         storage,
         "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
     ));
 
     let app = router(core);
@@ -677,6 +682,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         updated_at: now,
         userdata: None,
         userdata_status: None,
+        userdata_env: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -694,6 +700,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         ip_allocator,
         storage,
         "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
     ));
 
     let app = router(core);
@@ -735,6 +742,7 @@ async fn vm_response_with_null_optional_fields() {
         updated_at: now,
         userdata: None,
         userdata_status: None,
+        userdata_env: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -752,6 +760,7 @@ async fn vm_response_with_null_optional_fields() {
         ip_allocator,
         storage,
         "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
     ));
 
     let app = router(core);

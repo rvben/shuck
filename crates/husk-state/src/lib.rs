@@ -49,6 +49,8 @@ pub struct VmRecord {
     pub updated_at: DateTime<Utc>,
     pub userdata: Option<String>,
     pub userdata_status: Option<String>,
+    /// JSON-serialized environment variables for userdata script.
+    pub userdata_env: Option<String>,
 }
 
 /// Persistent port forward record.
@@ -137,6 +139,7 @@ impl StateStore {
         // Migration: add userdata columns (idempotent via suppressed errors)
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_status TEXT", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_env TEXT", []);
 
         Ok(())
     }
@@ -149,8 +152,8 @@ impl StateStore {
         conn.execute(
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                              created_at, updated_at, userdata, userdata_status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                              created_at, updated_at, userdata, userdata_status, userdata_env)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -168,6 +171,7 @@ impl StateStore {
                 record.updated_at.to_rfc3339(),
                 record.userdata,
                 record.userdata_status,
+                record.userdata_env,
             ],
         )
         .map_err(|e| match &e {
@@ -187,7 +191,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at, userdata, userdata_status
+                    created_at, updated_at, userdata, userdata_status, userdata_env
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -204,7 +208,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at, userdata, userdata_status
+                    created_at, updated_at, userdata, userdata_status, userdata_env
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -221,7 +225,7 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at, userdata, userdata_status
+                    created_at, updated_at, userdata, userdata_status, userdata_env
              FROM vms ORDER BY created_at",
         )?;
 
@@ -455,6 +459,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         updated_at: parse_datetime(&updated_str)?,
         userdata: row.get(14)?,
         userdata_status: row.get(15)?,
+        userdata_env: row.get(16)?,
     })
 }
 
@@ -480,6 +485,7 @@ mod tests {
             updated_at: Utc::now(),
             userdata: None,
             userdata_status: None,
+            userdata_env: None,
         }
     }
 

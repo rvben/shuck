@@ -53,6 +53,9 @@ pub struct CreateVmRequest {
     /// Userdata script to execute after VM boots.
     #[serde(default)]
     pub userdata: Option<String>,
+    /// Environment variables to pass to the userdata script.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -76,6 +79,8 @@ pub struct HuskCore<B: VmmBackend> {
     storage: husk_storage::StorageConfig,
     #[cfg(feature = "linux-net")]
     bridge_name: String,
+    #[cfg(feature = "linux-net")]
+    dns_servers: Vec<String>,
 }
 
 impl<B: VmmBackend> HuskCore<B> {
@@ -87,6 +92,7 @@ impl<B: VmmBackend> HuskCore<B> {
         ip_allocator: husk_net::IpAllocator,
         storage: husk_storage::StorageConfig,
         bridge_name: String,
+        dns_servers: Vec<String>,
     ) -> Self {
         Self {
             vmm,
@@ -94,6 +100,7 @@ impl<B: VmmBackend> HuskCore<B> {
             ip_allocator,
             storage,
             bridge_name,
+            dns_servers,
         }
     }
 
@@ -182,6 +189,10 @@ impl<B: VmmBackend> HuskCore<B> {
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
         resources.vm_dir = Some(vm_dir);
 
+        if !self.dns_servers.is_empty() {
+            inject_resolv_conf(&vm_rootfs, &self.dns_servers).await?;
+        }
+
         let vm_config = husk_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
@@ -222,6 +233,11 @@ impl<B: VmmBackend> HuskCore<B> {
             updated_at: now,
             userdata: req.userdata,
             userdata_status,
+            userdata_env: if req.env.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
+            },
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -296,6 +312,11 @@ impl<B: VmmBackend> HuskCore<B> {
             updated_at: now,
             userdata: req.userdata,
             userdata_status,
+            userdata_env: if req.env.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
+            },
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -507,8 +528,18 @@ impl<B: VmmBackend> HuskCore<B> {
             conn.write_file("/tmp/husk-userdata.sh", script.as_bytes(), Some(0o755))
                 .await?;
 
+            let env_pairs: Vec<(String, String)> = record
+                .userdata_env
+                .as_deref()
+                .map(|s| serde_json::from_str(s).unwrap_or_default())
+                .unwrap_or_default();
+            let env_refs: Vec<(&str, &str)> = env_pairs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+
             let exec_result = conn
-                .exec("sh", &["/tmp/husk-userdata.sh"], None, &[])
+                .exec("sh", &["/tmp/husk-userdata.sh"], None, &env_refs)
                 .await?;
 
             if exec_result.exit_code == 0 {
@@ -611,5 +642,49 @@ impl<B: VmmBackend> HuskCore<B> {
             husk_state::StateError::VmNotFoundByName(_) => CoreError::VmNotFound(name.into()),
             other => CoreError::State(other),
         })
+    }
+}
+
+/// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.
+#[cfg(feature = "linux-net")]
+async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
+    use tokio::process::Command;
+
+    let mount_dir =
+        tempfile::tempdir().map_err(|e| CoreError::Storage(husk_storage::StorageError::Io(e)))?;
+
+    let status = Command::new("mount")
+        .args(["-o", "loop"])
+        .arg(rootfs)
+        .arg(mount_dir.path())
+        .status()
+        .await
+        .map_err(|e| CoreError::Storage(husk_storage::StorageError::Io(e)))?;
+
+    if !status.success() {
+        return Err(CoreError::Storage(husk_storage::StorageError::Io(
+            std::io::Error::other("mount failed"),
+        )));
+    }
+
+    let resolv_path = mount_dir.path().join("etc/resolv.conf");
+    let contents: String = servers
+        .iter()
+        .map(|s| format!("nameserver {s}\n"))
+        .collect();
+
+    let write_result = tokio::fs::write(&resolv_path, contents.as_bytes()).await;
+
+    // Always unmount, even if write failed
+    let umount_status = Command::new("umount").arg(mount_dir.path()).status().await;
+
+    write_result.map_err(|e| CoreError::Storage(husk_storage::StorageError::Io(e)))?;
+
+    match umount_status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => Err(CoreError::Storage(husk_storage::StorageError::Io(
+            std::io::Error::other("umount failed"),
+        ))),
+        Err(e) => Err(CoreError::Storage(husk_storage::StorageError::Io(e))),
     }
 }

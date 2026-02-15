@@ -702,6 +702,7 @@ dependencies = [
  "husk-storage",
  "husk-vmm",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

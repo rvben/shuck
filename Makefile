@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-k3s-rootfs
 
 all: lint test
 
@@ -113,6 +113,11 @@ update-rootfs: build-agent-aarch64
 	@echo "Rootfs updated. Verify with:"
 	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/husk-agent' $(ROOTFS_IMAGE)"
 	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
+
+# Build k3s-ready rootfs image (requires root, debootstrap)
+K3S_ROOTFS ?= k3s-rootfs.ext4
+build-k3s-rootfs: build-agent
+	sudo guest/build-k3s-rootfs.sh $(K3S_ROOTFS)
 
 # Run the daemon (development)
 run-daemon:

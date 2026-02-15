@@ -61,6 +61,10 @@ enum Commands {
         /// Path to userdata script to execute after VM boots
         #[arg(long)]
         userdata: Option<PathBuf>,
+
+        /// Environment variables for userdata script (KEY=VALUE)
+        #[arg(long, short = 'e')]
+        env: Vec<String>,
     },
 
     /// List running VMs
@@ -184,6 +188,9 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_bridge_subnet")]
     bridge_subnet: String,
+    #[cfg(feature = "linux-net")]
+    #[serde(default = "default_dns_servers")]
+    dns_servers: Vec<String>,
 }
 
 #[cfg(feature = "linux-net")]
@@ -222,6 +229,11 @@ fn default_bridge_name() -> String {
 #[cfg(feature = "linux-net")]
 fn default_bridge_subnet() -> String {
     "172.20.0.0/24".into()
+}
+
+#[cfg(feature = "linux-net")]
+fn default_dns_servers() -> Vec<String> {
+    vec!["8.8.8.8".into(), "1.1.1.1".into()]
 }
 
 /// Extract a clean error message from an API error response.
@@ -273,6 +285,8 @@ impl Default for Config {
             bridge_name: default_bridge_name(),
             #[cfg(feature = "linux-net")]
             bridge_subnet: default_bridge_subnet(),
+            #[cfg(feature = "linux-net")]
+            dns_servers: default_dns_servers(),
         }
     }
 }
@@ -301,11 +315,20 @@ async fn main() -> Result<()> {
             cpus,
             memory,
             userdata,
+            env,
         } => {
             let config = load_config(cli.config.as_deref());
             let kernel = kernel.unwrap_or(config.default_kernel);
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+
+            let env_pairs: Vec<(String, String)> = env
+                .iter()
+                .filter_map(|s| {
+                    let (k, v) = s.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect();
 
             let mut body = serde_json::json!({
                 "name": name,
@@ -313,6 +336,7 @@ async fn main() -> Result<()> {
                 "rootfs_path": rootfs,
                 "vcpu_count": cpus,
                 "mem_size_mib": memory,
+                "env": env_pairs,
             });
             if let Some(ref initrd_path) = initrd {
                 body["initrd_path"] = serde_json::json!(initrd_path);
@@ -1075,6 +1099,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             ip_allocator,
             storage,
             config.bridge_name.clone(),
+            config.dns_servers,
         ));
         husk_api::serve(core, listen).await?;
 

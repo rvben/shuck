@@ -126,6 +126,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskCore<MockVmm>>, Uuid) 
         updated_at: now,
         userdata: None,
         userdata_status: None,
+        userdata_env: None,
     };
     state_store.insert_vm(&record).unwrap();
 
@@ -153,6 +154,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskCore<MockVmm>>, Uuid) 
         husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
         storage,
         "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
     ));
     #[cfg(not(feature = "linux-net"))]
     let core = Arc::new(HuskCore::new(vmm, state_store, storage));

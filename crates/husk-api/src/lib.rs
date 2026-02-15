@@ -616,6 +616,7 @@ mod tests {
             ip_allocator,
             storage,
             "husk0".into(),
+            vec!["8.8.8.8".into(), "1.1.1.1".into()],
         ))
     }
 
