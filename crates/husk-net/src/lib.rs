@@ -247,6 +247,7 @@ async fn configure_bridge(
 
 /// Delete a Linux bridge device.
 pub async fn delete_bridge(name: &str) -> Result<(), NetError> {
+    validate_interface_name(name)?;
     info!(bridge = name, "deleting bridge");
     run_cmd("ip", &["link", "set", "dev", name, "down"]).await?;
     run_cmd("ip", &["link", "del", name]).await?;
@@ -255,6 +256,8 @@ pub async fn delete_bridge(name: &str) -> Result<(), NetError> {
 
 /// Attach a TAP device to a bridge as a slave port.
 pub async fn attach_to_bridge(tap_name: &str, bridge_name: &str) -> Result<(), NetError> {
+    validate_interface_name(tap_name)?;
+    validate_interface_name(bridge_name)?;
     debug!(
         tap = tap_name,
         bridge = bridge_name,
@@ -293,6 +296,7 @@ pub async fn create_tap(name: &str) -> Result<(), NetError> {
 ///
 /// Removing the TAP automatically detaches it from any bridge.
 pub async fn delete_tap(name: &str) -> Result<(), NetError> {
+    validate_interface_name(name)?;
     info!(tap = name, "deleting TAP device");
     run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await?;
     Ok(())
