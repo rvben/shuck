@@ -13,6 +13,8 @@ use axum::routing::delete;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use utoipa::OpenApi;
+use utoipa::ToSchema;
 
 use husk_core::{CoreError, CreateVmRequest, HuskCore, ShellEvent, VmRecord};
 use husk_vmm::VmmBackend;
@@ -21,7 +23,7 @@ type AppState<B> = Arc<HuskCore<B>>;
 
 // ── Response Types ────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct VmResponse {
     pub id: String,
     pub name: String,
@@ -38,77 +40,78 @@ pub struct VmResponse {
     pub userdata_status: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
 }
 
 // ── Exec Types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct ExecRequest {
-    command: String,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExecRequest {
+    pub command: String,
     #[serde(default)]
-    args: Vec<String>,
-    working_dir: Option<String>,
+    pub args: Vec<String>,
+    pub working_dir: Option<String>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub env: HashMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ExecResponse {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExecResponse {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 // ── File Types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct ReadFileRequest {
-    path: String,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReadFileRequest {
+    pub path: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ReadFileResponse {
-    data: String,
-    size: u64,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReadFileResponse {
+    pub data: String,
+    pub size: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct WriteFileRequest {
-    path: String,
-    data: String,
-    mode: Option<u32>,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WriteFileRequest {
+    pub path: String,
+    /// Base64-encoded file data.
+    pub data: String,
+    pub mode: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
-struct WriteFileResponse {
-    bytes_written: u64,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WriteFileResponse {
+    pub bytes_written: u64,
 }
 
 // ── Port Forward Types ────────────────────────────────────────────────
 
 #[cfg(feature = "linux-net")]
-#[derive(Debug, Deserialize)]
-struct AddPortForwardRequest {
-    host_port: u16,
-    guest_port: u16,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AddPortForwardRequest {
+    pub host_port: u16,
+    pub guest_port: u16,
 }
 
 #[cfg(feature = "linux-net")]
-#[derive(Debug, Serialize)]
-struct PortForwardResponse {
-    host_port: u16,
-    guest_port: u16,
-    protocol: String,
-    created_at: String,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PortForwardResponse {
+    pub host_port: u16,
+    pub guest_port: u16,
+    pub protocol: String,
+    pub created_at: String,
 }
 
 // ── WebSocket Shell Types ─────────────────────────────────────────────
 
 /// Messages sent by the client to the server over the shell WebSocket.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsShellInput {
     Start {
@@ -136,15 +139,15 @@ fn default_rows() -> u16 {
 
 // ── Logs Types ───────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct LogsQuery {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LogsQuery {
     #[serde(default)]
-    follow: bool,
-    tail: Option<u64>,
+    pub follow: bool,
+    pub tail: Option<u64>,
 }
 
 /// Messages sent by the server to the client over the shell WebSocket.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsShellOutput {
     Started,
@@ -152,6 +155,71 @@ pub enum WsShellOutput {
     Exit { exit_code: i32 },
     Error { message: String },
 }
+
+// ── OpenAPI ───────────────────────────────────────────────────────────
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Husk API",
+        description = "REST API for managing Firecracker microVMs",
+        version = "0.1.0",
+        license(name = "MIT")
+    ),
+    paths(
+        health,
+        list_vms,
+        create_vm,
+        get_vm,
+        stop_vm,
+        pause_vm,
+        resume_vm,
+        destroy_vm,
+        exec_vm,
+        read_file_handler,
+        write_file_handler,
+        shell_ws,
+        get_logs,
+    ),
+    components(schemas(
+        VmResponse,
+        ErrorResponse,
+        ExecRequest,
+        ExecResponse,
+        ReadFileRequest,
+        ReadFileResponse,
+        WriteFileRequest,
+        WriteFileResponse,
+        HealthResponse,
+        VmCounts,
+        LogsQuery,
+        WsShellInput,
+        WsShellOutput,
+        CreateVmRequest,
+    )),
+    tags(
+        (name = "vms", description = "VM lifecycle management"),
+        (name = "exec", description = "Command execution in VMs"),
+        (name = "files", description = "File transfer to/from VMs"),
+        (name = "shell", description = "Interactive shell sessions"),
+        (name = "logs", description = "Serial console output"),
+        (name = "ports", description = "Port forwarding (Linux only)"),
+        (name = "health", description = "Service health")
+    )
+)]
+struct ApiDoc;
+
+#[cfg(feature = "linux-net")]
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        add_port_forward_handler,
+        list_port_forwards_handler,
+        remove_port_forward_handler,
+    ),
+    components(schemas(AddPortForwardRequest, PortForwardResponse,))
+)]
+struct PortForwardApiDoc;
 
 // ── Router ────────────────────────────────────────────────────────────
 
@@ -180,8 +248,18 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
             delete(remove_port_forward_handler::<B>),
         );
 
+    #[allow(unused_mut)]
+    let mut openapi = ApiDoc::openapi();
+
+    #[cfg(feature = "linux-net")]
+    {
+        let pf_doc = PortForwardApiDoc::openapi();
+        openapi.merge(pf_doc);
+    }
+
     router
         .route("/v1/health", get(health::<B>))
+        .merge(utoipa_swagger_ui::SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi))
         .layer(axum::middleware::from_fn(trace_request))
         .with_state(core)
 }
@@ -247,6 +325,14 @@ async fn trace_request(
 
 // ── Handlers ──────────────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/v1/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Service health status", body = HealthResponse)
+    )
+)]
 async fn health<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> Json<HealthResponse> {
     let (total, running) = match core.list_vms() {
         Ok(vms) => {
@@ -263,19 +349,28 @@ async fn health<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> Jso
     })
 }
 
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    status: String,
-    version: String,
-    vms: VmCounts,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+    pub vms: VmCounts,
 }
 
-#[derive(Debug, Serialize)]
-struct VmCounts {
-    total: u64,
-    running: u64,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VmCounts {
+    pub total: u64,
+    pub running: u64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/vms",
+    tag = "vms",
+    responses(
+        (status = 200, description = "List of all VMs", body = Vec<VmResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn list_vms<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
 ) -> Result<Json<Vec<VmResponse>>, (StatusCode, Json<ErrorResponse>)> {
@@ -283,6 +378,17 @@ async fn list_vms<B: VmmBackend + 'static>(
     Ok(Json(vms.into_iter().map(record_to_response).collect()))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms",
+    tag = "vms",
+    request_body = CreateVmRequest,
+    responses(
+        (status = 201, description = "VM created", body = VmResponse),
+        (status = 409, description = "VM already exists", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn create_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Json(req): Json<CreateVmRequest>,
@@ -302,6 +408,16 @@ async fn create_vm<B: VmmBackend + 'static>(
     Ok((StatusCode::CREATED, Json(record_to_response(record))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 200, description = "VM details", body = VmResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
 async fn get_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -310,6 +426,17 @@ async fn get_vm<B: VmmBackend + 'static>(
     Ok(Json(record_to_response(record)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/stop",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 204, description = "VM stopped"),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Invalid VM state", body = ErrorResponse)
+    )
+)]
 async fn stop_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -318,6 +445,17 @@ async fn stop_vm<B: VmmBackend + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/pause",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 204, description = "VM paused"),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Invalid VM state", body = ErrorResponse)
+    )
+)]
 async fn pause_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -326,6 +464,17 @@ async fn pause_vm<B: VmmBackend + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/resume",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 204, description = "VM resumed"),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Invalid VM state", body = ErrorResponse)
+    )
+)]
 async fn resume_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -334,6 +483,16 @@ async fn resume_vm<B: VmmBackend + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/vms/{name}",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 204, description = "VM destroyed"),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
 async fn destroy_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -342,6 +501,18 @@ async fn destroy_vm<B: VmmBackend + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/exec",
+    tag = "exec",
+    params(("name" = String, Path, description = "VM name")),
+    request_body = ExecRequest,
+    responses(
+        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 503, description = "Agent not ready", body = ErrorResponse)
+    )
+)]
 async fn exec_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -365,6 +536,18 @@ async fn exec_vm<B: VmmBackend + 'static>(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/files/read",
+    tag = "files",
+    params(("name" = String, Path, description = "VM name")),
+    request_body = ReadFileRequest,
+    responses(
+        (status = 200, description = "File content (base64-encoded)", body = ReadFileResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 503, description = "Agent not ready", body = ErrorResponse)
+    )
+)]
 async fn read_file_handler<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -382,6 +565,19 @@ async fn read_file_handler<B: VmmBackend + 'static>(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/files/write",
+    tag = "files",
+    params(("name" = String, Path, description = "VM name")),
+    request_body = WriteFileRequest,
+    responses(
+        (status = 200, description = "File written", body = WriteFileResponse),
+        (status = 400, description = "Invalid base64 data", body = ErrorResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 503, description = "Agent not ready", body = ErrorResponse)
+    )
+)]
 async fn write_file_handler<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -405,6 +601,16 @@ async fn write_file_handler<B: VmmBackend + 'static>(
 
 // ── WebSocket Shell Handler ───────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}/shell",
+    tag = "shell",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 101, description = "WebSocket upgrade for interactive shell"),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
 async fn shell_ws<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -574,6 +780,20 @@ async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), a
 /// Logs exceeding this size are truncated to the last 1 MiB.
 const LOG_MAX_READ_BYTES: u64 = 1024 * 1024;
 
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}/logs",
+    tag = "logs",
+    params(
+        ("name" = String, Path, description = "VM name"),
+        ("follow" = Option<bool>, Query, description = "Follow log output"),
+        ("tail" = Option<u64>, Query, description = "Show last N lines")
+    ),
+    responses(
+        (status = 200, description = "Serial console output", content_type = "text/plain"),
+        (status = 404, description = "VM or log not found", body = ErrorResponse)
+    )
+)]
 async fn get_logs<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -737,6 +957,18 @@ fn tail_lines(content: &str, n: u64) -> String {
 // ── Port Forward Handlers ─────────────────────────────────────────────
 
 #[cfg(feature = "linux-net")]
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/ports",
+    tag = "ports",
+    params(("name" = String, Path, description = "VM name")),
+    request_body = AddPortForwardRequest,
+    responses(
+        (status = 201, description = "Port forward added", body = PortForwardResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Port already forwarded", body = ErrorResponse)
+    )
+)]
 async fn add_port_forward_handler<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -757,6 +989,16 @@ async fn add_port_forward_handler<B: VmmBackend + 'static>(
 }
 
 #[cfg(feature = "linux-net")]
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}/ports",
+    tag = "ports",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 200, description = "List of port forwards", body = Vec<PortForwardResponse>),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
 async fn list_port_forwards_handler<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -776,6 +1018,19 @@ async fn list_port_forwards_handler<B: VmmBackend + 'static>(
 }
 
 #[cfg(feature = "linux-net")]
+#[utoipa::path(
+    delete,
+    path = "/v1/vms/{name}/ports/{host_port}",
+    tag = "ports",
+    params(
+        ("name" = String, Path, description = "VM name"),
+        ("host_port" = u16, Path, description = "Host port to remove")
+    ),
+    responses(
+        (status = 204, description = "Port forward removed"),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
 async fn remove_port_forward_handler<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, host_port)): Path<(String, u16)>,

@@ -64,6 +64,10 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
+# OpenAPI documentation
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
 # Internal crates
 husk-core = { path = "crates/husk-core", default-features = false }
 husk-vmm = { path = "crates/husk-vmm" }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [features]
 default = ["linux-net"]
 linux-net = ["husk-net", "dep:tempfile"]
+utoipa = ["dep:utoipa"]
 
 [dependencies]
 husk-vmm = { workspace = true }
@@ -22,6 +23,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+utoipa = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]

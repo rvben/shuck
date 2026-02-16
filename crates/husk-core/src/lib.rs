@@ -41,14 +41,18 @@ pub enum CoreError {
 
 /// Parameters for creating a new VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct CreateVmRequest {
     pub name: String,
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub kernel_path: PathBuf,
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub rootfs_path: PathBuf,
     pub vcpu_count: Option<u32>,
     pub mem_size_mib: Option<u32>,
     /// Path to an initramfs/initrd image (needed for kernels with modular drivers).
     #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
     pub initrd_path: Option<PathBuf>,
     /// Userdata script to execute after VM boots.
     #[serde(default)]
