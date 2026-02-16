@@ -186,7 +186,7 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
         .with_state(core)
 }
 
-/// Start the API server.
+/// Start the API server with graceful shutdown on SIGINT/SIGTERM.
 pub async fn serve<B: VmmBackend + 'static>(
     core: Arc<HuskCore<B>>,
     addr: SocketAddr,
@@ -194,7 +194,36 @@ pub async fn serve<B: VmmBackend + 'static>(
     let app = router(core);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husk daemon listening");
-    axum::serve(listener, app).await
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+}
+
+/// Wait for a shutdown signal (SIGINT or SIGTERM).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+
+    info!("shutdown signal received, draining connections");
 }
 
 // ── Middleware ─────────────────────────────────────────────────────────
