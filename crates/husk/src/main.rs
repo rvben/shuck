@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[derive(Parser)]
 #[command(name = "husk", about = "An open source microVM manager", version)]
@@ -19,6 +20,10 @@ struct Cli {
     /// Daemon API address (for client commands)
     #[arg(long, default_value = "http://127.0.0.1:7777")]
     api_url: String,
+
+    /// Bearer token for authenticated API access.
+    #[arg(long)]
+    api_token: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -212,6 +217,8 @@ struct Config {
     data_dir: PathBuf,
     #[serde(default = "default_kernel_path")]
     default_kernel: PathBuf,
+    #[serde(default)]
+    api_token: Option<String>,
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_host_interface")]
     host_interface: String,
@@ -305,6 +312,21 @@ async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Respon
     })
 }
 
+fn with_api_auth(
+    request: reqwest::RequestBuilder,
+    api_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if let Some(token) = api_token {
+        request.bearer_auth(token)
+    } else {
+        request
+    }
+}
+
+fn resolve_api_token(cli_api_token: Option<String>, config_path: Option<&Path>) -> Option<String> {
+    cli_api_token.or_else(|| load_config(config_path).api_token)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -312,6 +334,7 @@ impl Default for Config {
             firecracker_bin: default_firecracker_bin(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
+            api_token: None,
             #[cfg(feature = "linux-net")]
             host_interface: default_host_interface(),
             #[cfg(feature = "linux-net")]
@@ -334,14 +357,23 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let Cli {
+        config: config_path,
+        api_url,
+        api_token: cli_api_token,
+        command,
+    } = cli;
 
-    match cli.command {
+    match command {
         Commands::Daemon {
             listen,
             allow_remote,
         } => {
             validate_daemon_bind(listen, allow_remote)?;
-            let config = load_config(cli.config.as_deref());
+            let mut config = load_config(config_path.as_deref());
+            if let Some(token) = cli_api_token.clone() {
+                config.api_token = Some(token);
+            }
             start_daemon(config, listen).await
         }
         Commands::Run {
@@ -354,7 +386,8 @@ async fn main() -> Result<()> {
             userdata,
             env,
         } => {
-            let config = load_config(cli.config.as_deref());
+            let config = load_config(config_path.as_deref());
+            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
             let kernel = kernel.unwrap_or(config.default_kernel);
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
@@ -386,8 +419,14 @@ async fn main() -> Result<()> {
             }
 
             let client = reqwest::Client::new();
-            let resp =
-                api_request(client.post(format!("{}/v1/vms", cli.api_url)).json(&body)).await?;
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/vms")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
 
             if !resp.status().is_success() {
                 let msg = api_error(resp, &format!("VM '{name}'")).await;
@@ -411,8 +450,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::List => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp = api_request(client.get(format!("{}/v1/vms", cli.api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/vms")),
+                api_token.as_deref(),
+            ))
+            .await?;
 
             if !resp.status().is_success() {
                 eprintln!("Error: {}", api_error(resp, "listing VMs").await);
@@ -441,8 +485,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Info { name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp = api_request(client.get(format!("{}/v1/vms/{name}", cli.api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/vms/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
 
             if !resp.status().is_success() {
                 eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
@@ -468,9 +517,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Stop { name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp =
-                api_request(client.post(format!("{}/v1/vms/{name}/stop", cli.api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.post(format!("{api_url}/v1/vms/{name}/stop")),
+                api_token.as_deref(),
+            ))
+            .await?;
 
             if resp.status().is_success() {
                 println!("Stopped VM: {name}");
@@ -485,9 +538,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Pause { name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp =
-                api_request(client.post(format!("{}/v1/vms/{name}/pause", cli.api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.post(format!("{api_url}/v1/vms/{name}/pause")),
+                api_token.as_deref(),
+            ))
+            .await?;
 
             if resp.status().is_success() {
                 println!("Paused VM: {name}");
@@ -502,9 +559,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Resume { name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp =
-                api_request(client.post(format!("{}/v1/vms/{name}/resume", cli.api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.post(format!("{api_url}/v1/vms/{name}/resume")),
+                api_token.as_deref(),
+            ))
+            .await?;
 
             if resp.status().is_success() {
                 println!("Resumed VM: {name}");
@@ -521,8 +582,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Destroy { name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp = api_request(client.delete(format!("{}/v1/vms/{name}", cli.api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/vms/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
 
             if resp.status().is_success() {
                 println!("Destroyed VM: {name}");
@@ -537,6 +603,7 @@ async fn main() -> Result<()> {
             workdir,
             command,
         } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let (cmd, args) = command.split_first().context("command required after --")?;
 
             let mut body = serde_json::json!({
@@ -549,9 +616,11 @@ async fn main() -> Result<()> {
 
             let client = reqwest::Client::new();
             let resp = api_request(
-                client
-                    .post(format!("{}/v1/vms/{name}/exec", cli.api_url))
-                    .json(&body),
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/vms/{name}/exec")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
             )
             .await?;
 
@@ -576,6 +645,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Cp { source, dest, mode } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let src = parse_cp_path(&source);
             let dst = parse_cp_path(&dest);
 
@@ -595,9 +665,11 @@ async fn main() -> Result<()> {
 
                     let client = reqwest::Client::new();
                     let resp = api_request(
-                        client
-                            .post(format!("{}/v1/vms/{name}/files/write", cli.api_url))
-                            .json(&body),
+                        with_api_auth(
+                            client.post(format!("{api_url}/v1/vms/{name}/files/write")),
+                            api_token.as_deref(),
+                        )
+                        .json(&body),
                     )
                     .await?;
 
@@ -613,9 +685,11 @@ async fn main() -> Result<()> {
                 (CpPath::Vm { name, path }, CpPath::Local(local)) => {
                     let client = reqwest::Client::new();
                     let resp = api_request(
-                        client
-                            .post(format!("{}/v1/vms/{name}/files/read", cli.api_url))
-                            .json(&serde_json::json!({ "path": path })),
+                        with_api_auth(
+                            client.post(format!("{api_url}/v1/vms/{name}/files/read")),
+                            api_token.as_deref(),
+                        )
+                        .json(&serde_json::json!({ "path": path })),
                     )
                     .await?;
 
@@ -643,9 +717,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::PortForward { name, action } => port_forward(cli.api_url, name, action).await,
+        Commands::PortForward { name, action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            port_forward(api_url, api_token, name, action).await
+        }
         Commands::Logs { name, follow, tail } => {
-            let mut url = format!("{}/v1/vms/{name}/logs", cli.api_url);
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            let mut url = format!("{api_url}/v1/vms/{name}/logs");
             let mut params = Vec::new();
             if follow {
                 params.push("follow=true".to_string());
@@ -659,7 +737,7 @@ async fn main() -> Result<()> {
             }
 
             let client = reqwest::Client::new();
-            let resp = api_request(client.get(&url)).await?;
+            let resp = api_request(with_api_auth(client.get(&url), api_token.as_deref())).await?;
 
             if !resp.status().is_success() {
                 eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
@@ -690,7 +768,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Shell { name, command } => {
-            run_shell(cli.api_url, cli.config, name, command).await
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            run_shell(api_url, config_path, name, command, api_token.as_deref()).await
         }
         Commands::Version => {
             println!("husk {}", env!("CARGO_PKG_VERSION"));
@@ -698,10 +777,7 @@ async fn main() -> Result<()> {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()?;
-            if let Ok(resp) = client
-                .get(format!("{}/v1/health", cli.api_url))
-                .send()
-                .await
+            if let Ok(resp) = client.get(format!("{api_url}/v1/health")).send().await
                 && resp.status().is_success()
                 && let Ok(health) = resp.json::<serde_json::Value>().await
             {
@@ -713,7 +789,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Config { action } => match action {
-            ConfigAction::Check => check_config(cli.config.as_deref()),
+            ConfigAction::Check => check_config(config_path.as_deref()),
         },
     }
 }
@@ -729,7 +805,12 @@ fn validate_daemon_bind(listen: SocketAddr, allow_remote: bool) -> Result<()> {
 }
 
 #[cfg(not(feature = "linux-net"))]
-async fn port_forward(_api_url: String, _name: String, _action: PortForwardAction) -> Result<()> {
+async fn port_forward(
+    _api_url: String,
+    _api_token: Option<String>,
+    _name: String,
+    _action: PortForwardAction,
+) -> Result<()> {
     eprintln!("Error: port forwarding is not supported on this platform");
     eprintln!();
     eprintln!("Port forwarding requires Linux with Firecracker and nftables.");
@@ -740,7 +821,12 @@ async fn port_forward(_api_url: String, _name: String, _action: PortForwardActio
 }
 
 #[cfg(feature = "linux-net")]
-async fn port_forward(api_url: String, name: String, action: PortForwardAction) -> Result<()> {
+async fn port_forward(
+    api_url: String,
+    api_token: Option<String>,
+    name: String,
+    action: PortForwardAction,
+) -> Result<()> {
     let client = reqwest::Client::new();
     match action {
         PortForwardAction::Add {
@@ -748,12 +834,14 @@ async fn port_forward(api_url: String, name: String, action: PortForwardAction) 
             guest_port,
         } => {
             let resp = api_request(
-                client
-                    .post(format!("{}/v1/vms/{name}/ports", api_url))
-                    .json(&serde_json::json!({
-                        "host_port": host_port,
-                        "guest_port": guest_port,
-                    })),
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/vms/{name}/ports")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({
+                    "host_port": host_port,
+                    "guest_port": guest_port,
+                })),
             )
             .await?;
             if resp.status().is_success() {
@@ -764,9 +852,11 @@ async fn port_forward(api_url: String, name: String, action: PortForwardAction) 
             }
         }
         PortForwardAction::Remove { host_port } => {
-            let resp =
-                api_request(client.delete(format!("{}/v1/vms/{name}/ports/{host_port}", api_url)))
-                    .await?;
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/vms/{name}/ports/{host_port}")),
+                api_token.as_deref(),
+            ))
+            .await?;
             if resp.status().is_success() {
                 println!("Port forward removed: {host_port}");
             } else {
@@ -778,7 +868,11 @@ async fn port_forward(api_url: String, name: String, action: PortForwardAction) 
             }
         }
         PortForwardAction::List => {
-            let resp = api_request(client.get(format!("{}/v1/vms/{name}/ports", api_url))).await?;
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/vms/{name}/ports")),
+                api_token.as_deref(),
+            ))
+            .await?;
             if !resp.status().is_success() {
                 eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
                 std::process::exit(1);
@@ -822,9 +916,14 @@ async fn run_shell(
     config_path: Option<PathBuf>,
     name: String,
     command: Option<String>,
+    api_token: Option<&str>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
-    let resp = api_request(client.get(format!("{}/v1/vms/{name}", api_url))).await?;
+    let resp = api_request(with_api_auth(
+        client.get(format!("{api_url}/v1/vms/{name}")),
+        api_token,
+    ))
+    .await?;
 
     if !resp.status().is_success() {
         eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
@@ -873,7 +972,7 @@ async fn run_shell(
     }
 
     // Direct vsock unavailable — use WebSocket through daemon.
-    run_shell_ws(&api_url, &name, command.as_deref()).await
+    run_shell_ws(&api_url, &name, command.as_deref(), api_token).await
 }
 
 #[cfg(not(feature = "linux-net"))]
@@ -882,15 +981,25 @@ async fn run_shell(
     _config_path: Option<PathBuf>,
     name: String,
     command: Option<String>,
+    api_token: Option<&str>,
 ) -> Result<()> {
-    run_shell_ws(&api_url, &name, command.as_deref()).await
+    run_shell_ws(&api_url, &name, command.as_deref(), api_token).await
 }
 
 /// WebSocket-based interactive shell, works on both Linux and macOS.
-async fn run_shell_ws(api_url: &str, name: &str, command: Option<&str>) -> Result<()> {
+async fn run_shell_ws(
+    api_url: &str,
+    name: &str,
+    command: Option<&str>,
+    api_token: Option<&str>,
+) -> Result<()> {
     // Pre-check: verify VM is running before opening the WebSocket.
     let client = reqwest::Client::new();
-    let resp = api_request(client.get(format!("{api_url}/v1/vms/{name}"))).await?;
+    let resp = api_request(with_api_auth(
+        client.get(format!("{api_url}/v1/vms/{name}")),
+        api_token,
+    ))
+    .await?;
     if !resp.status().is_success() {
         eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
         std::process::exit(1);
@@ -912,7 +1021,19 @@ async fn run_shell_ws(api_url: &str, name: &str, command: Option<&str>) -> Resul
         .replacen("https://", "wss://", 1);
     let url = format!("{ws_url}/v1/vms/{name}/shell");
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+    let mut ws_request = url
+        .into_client_request()
+        .context("building websocket request")?;
+    if let Some(token) = api_token {
+        let value = format!("Bearer {token}");
+        let header = tungstenite::http::HeaderValue::from_str(&value)
+            .context("invalid API token for websocket auth header")?;
+        ws_request
+            .headers_mut()
+            .insert(tungstenite::http::header::AUTHORIZATION, header);
+    }
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_request)
         .await
         .context("connecting to daemon WebSocket")?;
 
@@ -1134,6 +1255,9 @@ fn apply_env_overrides(config: &mut Config) {
     }
     if let Ok(val) = std::env::var("HUSK_DEFAULT_KERNEL") {
         config.default_kernel = PathBuf::from(val);
+    }
+    if let Ok(val) = std::env::var("HUSK_API_TOKEN") {
+        config.api_token = Some(val);
     }
     #[cfg(feature = "linux-net")]
     {
@@ -1390,6 +1514,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     let runtime_dir = config.data_dir.join("run");
     let db_path = config.data_dir.join("husk.db");
+    let api_token = config.api_token.clone();
 
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
     std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
@@ -1441,7 +1566,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         ));
 
         spawn_log_rotation(Arc::clone(&core));
-        husk_api::serve(Arc::clone(&core), listen).await?;
+        husk_api::serve_with_auth(Arc::clone(&core), listen, api_token.clone()).await?;
         drain_vms_on_shutdown(&core).await;
 
         // Network cleanup after VM drain. If the process is killed
@@ -1464,7 +1589,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         ));
 
         spawn_log_rotation(Arc::clone(&core));
-        husk_api::serve(Arc::clone(&core), listen).await?;
+        husk_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
         drain_vms_on_shutdown(&core).await;
         Ok(())
     }
@@ -1604,6 +1729,15 @@ mod tests {
         let config = load_config(None);
         assert_eq!(config.default_kernel, PathBuf::from("/tmp/custom-kernel"));
         unsafe { std::env::remove_var("HUSK_DEFAULT_KERNEL") };
+    }
+
+    #[test]
+    fn env_override_api_token() {
+        // SAFETY: test is single-threaded; no other threads read this env var.
+        unsafe { std::env::set_var("HUSK_API_TOKEN", "test-token") };
+        let config = load_config(None);
+        assert_eq!(config.api_token.as_deref(), Some("test-token"));
+        unsafe { std::env::remove_var("HUSK_API_TOKEN") };
     }
 
     #[cfg(feature = "linux-net")]

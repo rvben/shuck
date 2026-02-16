@@ -6,6 +6,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::Method;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 #[cfg(feature = "linux-net")]
@@ -225,6 +226,17 @@ struct PortForwardApiDoc;
 
 /// Build the API router.
 pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
+    router_with_auth(core, None)
+}
+
+/// Build the API router with optional bearer token authentication.
+///
+/// When `auth_token` is set, mutating endpoints and interactive shell access
+/// require `Authorization: Bearer <token>`.
+pub fn router_with_auth<B: VmmBackend + 'static>(
+    core: Arc<HuskCore<B>>,
+    auth_token: Option<String>,
+) -> Router {
     let router = Router::new()
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
@@ -257,9 +269,21 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
         openapi.merge(pf_doc);
     }
 
-    router
+    let router = router
         .route("/v1/health", get(health::<B>))
-        .merge(utoipa_swagger_ui::SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi))
+        .merge(utoipa_swagger_ui::SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi));
+
+    let router = if let Some(token) = auth_token {
+        let expected = Arc::new(format!("Bearer {token}"));
+        router.layer(axum::middleware::from_fn_with_state(
+            expected,
+            auth_middleware,
+        ))
+    } else {
+        router
+    };
+
+    router
         .layer(axum::middleware::from_fn(trace_request))
         .with_state(core)
 }
@@ -269,7 +293,16 @@ pub async fn serve<B: VmmBackend + 'static>(
     core: Arc<HuskCore<B>>,
     addr: SocketAddr,
 ) -> std::io::Result<()> {
-    let app = router(core);
+    serve_with_auth(core, addr, None).await
+}
+
+/// Start the API server with optional bearer token authentication.
+pub async fn serve_with_auth<B: VmmBackend + 'static>(
+    core: Arc<HuskCore<B>>,
+    addr: SocketAddr,
+    auth_token: Option<String>,
+) -> std::io::Result<()> {
+    let app = router_with_auth(core, auth_token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husk daemon listening");
     axum::serve(listener, app)
@@ -321,6 +354,42 @@ async fn trace_request(
         elapsed_ms = start.elapsed().as_millis() as u64,
     );
     response
+}
+
+fn is_protected_route(method: &Method, path: &str) -> bool {
+    if !path.starts_with("/v1/vms") {
+        return false;
+    }
+    if *method != Method::GET {
+        return true;
+    }
+    path.ends_with("/shell")
+}
+
+async fn auth_middleware(
+    State(expected): State<Arc<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_protected_route(req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    let provided = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+    if provided == Some(expected.as_str()) {
+        return next.run(req).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: "unauthorized: missing or invalid bearer token".into(),
+        }),
+    )
+        .into_response()
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────
@@ -1295,6 +1364,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn protected_route_detection_is_correct() {
+        assert!(!is_protected_route(&Method::GET, "/v1/health"));
+        assert!(!is_protected_route(&Method::GET, "/v1/vms"));
+        assert!(!is_protected_route(&Method::GET, "/v1/vms/example"));
+        assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
+        assert!(is_protected_route(&Method::DELETE, "/v1/vms/example"));
+        assert!(is_protected_route(&Method::GET, "/v1/vms/example/shell"));
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_allows_public_health_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_mutating_endpoint_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/nonexistent/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("missing or invalid bearer token"))
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_accepts_valid_token_for_mutating_endpoint() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/nonexistent/stop")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Request passed auth middleware and reached VM lookup.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_requires_token_for_shell_endpoint() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(
+                Request::get("/v1/vms/nonexistent/shell")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── tail_lines unit tests ─────────────────────────────────────────
