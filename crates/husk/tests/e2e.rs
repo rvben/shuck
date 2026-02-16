@@ -578,3 +578,82 @@ async fn shell_after_pause_resume_macos() {
 
     assert!(status.success(), "shell exited with: {status}");
 }
+
+// ── Logs E2E tests ─────────────────────────────────────────────────────
+
+/// Verify serial log output: full logs contain kernel markers, tail limits
+/// line count, and logs return 404 after VM is destroyed.
+///
+/// Requires a running daemon. Uses a dedicated VM to avoid interfering
+/// with other tests.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn logs_serial_output() {
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+    let vm_name = "e2e-logs-test";
+
+    // 1. Create a VM
+    let create_body = serde_json::json!({
+        "name": vm_name,
+        "kernel_path": "/var/lib/husk/kernels/vmlinux",
+        "rootfs_path": "/var/lib/husk/images/ubuntu-22.04.ext4",
+        "vcpu_count": 1,
+        "mem_size_mib": 128,
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("create should succeed");
+    assert_eq!(resp.status(), 201);
+
+    // 2. Wait for the VM to boot and produce serial output
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // 3. Full logs should contain kernel boot markers
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Linux version") || body.contains("Booting"),
+        "expected kernel boot marker in logs, got: {}",
+        &body[..body.len().min(200)]
+    );
+
+    // 4. Tail should limit output
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}/logs?tail=5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let line_count = body.lines().count();
+    assert!(
+        line_count <= 5,
+        "tail=5 should return at most 5 lines, got {line_count}"
+    );
+
+    // 5. Destroy the VM
+    let resp = client
+        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 6. Logs should return 404 after destroy
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
