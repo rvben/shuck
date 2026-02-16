@@ -8,6 +8,8 @@ pub enum StorageError {
     RootfsNotFound(PathBuf),
     #[error("kernel not found: {0}")]
     KernelNotFound(PathBuf),
+    #[error("{0}")]
+    InvalidKernel(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("command failed: {0}")]
@@ -67,11 +69,59 @@ pub async fn clone_rootfs(source: &Path, dest: &Path) -> Result<(), StorageError
 }
 
 /// Validate that a kernel file exists and looks reasonable.
+///
+/// On macOS (Apple Virtualization.framework), the kernel must be an
+/// uncompressed ARM64 Image — compressed vmlinuz/bzImage kernels cause
+/// an opaque "failed to start" error from VZ.
 pub fn validate_kernel(path: &Path) -> Result<(), StorageError> {
     if !path.exists() {
         return Err(StorageError::KernelNotFound(path.to_owned()));
     }
+
+    #[cfg(target_os = "macos")]
+    validate_kernel_format(path)?;
+
     Ok(())
+}
+
+/// Check that a kernel is an uncompressed ARM64 Image, not a compressed
+/// vmlinuz/bzImage which VZLinuxBootLoader cannot handle.
+#[cfg(target_os = "macos")]
+fn validate_kernel_format(path: &Path) -> Result<(), StorageError> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(StorageError::Io)?;
+    let mut header = [0u8; 64];
+    let n = file.read(&mut header).map_err(StorageError::Io)?;
+
+    if n < 64 {
+        return Err(StorageError::InvalidKernel(format!(
+            "kernel too small ({n} bytes): {}",
+            path.display()
+        )));
+    }
+
+    // ARM64 Image magic: 0x644d5241 ("ARM\x64") at offset 56
+    let magic = u32::from_le_bytes([header[56], header[57], header[58], header[59]]);
+    if magic == 0x644d_5241 {
+        return Ok(());
+    }
+
+    // PE32+ / EFI stub (compressed vmlinuz): starts with "MZ"
+    if header[0] == b'M' && header[1] == b'Z' {
+        return Err(StorageError::InvalidKernel(format!(
+            "kernel is a compressed vmlinuz (PE32+/EFI stub): {}\n\
+             Apple Virtualization.framework requires an uncompressed ARM64 Image.\n\
+             Use the uncompressed 'Image' file instead of 'vmlinuz'.",
+            path.display()
+        )));
+    }
+
+    Err(StorageError::InvalidKernel(format!(
+        "kernel does not appear to be an ARM64 Image (magic: {magic:#010x}): {}\n\
+         Apple Virtualization.framework requires an uncompressed ARM64 kernel Image.",
+        path.display()
+    )))
 }
 
 /// Validate that a rootfs image exists.
@@ -80,4 +130,80 @@ pub fn validate_rootfs(path: &Path) -> Result<(), StorageError> {
         return Err(StorageError::RootfsNotFound(path.to_owned()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_kernel_missing_file() {
+        let result = validate_kernel(Path::new("/nonexistent/vmlinux"));
+        assert!(matches!(result, Err(StorageError::KernelNotFound(_))));
+    }
+
+    #[test]
+    fn validate_rootfs_missing_file() {
+        let result = validate_rootfs(Path::new("/nonexistent/rootfs.ext4"));
+        assert!(matches!(result, Err(StorageError::RootfsNotFound(_))));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos_kernel_validation {
+        use super::*;
+
+        fn write_temp_file(content: &[u8]) -> (tempfile::NamedTempFile, PathBuf) {
+            use std::io::Write;
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(content).unwrap();
+            let path = f.path().to_path_buf();
+            (f, path)
+        }
+
+        #[test]
+        fn accepts_valid_arm64_image() {
+            // Build a 64-byte header with ARM64 magic at offset 56
+            let mut header = [0u8; 64];
+            let magic = 0x644d_5241u32.to_le_bytes();
+            header[56..60].copy_from_slice(&magic);
+            let (_f, path) = write_temp_file(&header);
+            assert!(validate_kernel(&path).is_ok());
+        }
+
+        #[test]
+        fn rejects_compressed_vmlinuz() {
+            // PE32+/EFI stub starts with "MZ"
+            let mut header = [0u8; 64];
+            header[0] = b'M';
+            header[1] = b'Z';
+            let (_f, path) = write_temp_file(&header);
+            let err = validate_kernel(&path).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("compressed vmlinuz"),
+                "expected vmlinuz error, got: {msg}"
+            );
+            assert!(msg.contains("uncompressed"));
+        }
+
+        #[test]
+        fn rejects_unknown_kernel_format() {
+            let header = [0xFFu8; 64];
+            let (_f, path) = write_temp_file(&header);
+            let err = validate_kernel(&path).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not appear to be an ARM64 Image"),
+                "expected format error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_too_small_kernel() {
+            let (_f, path) = write_temp_file(&[0u8; 32]);
+            let err = validate_kernel(&path).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("too small"), "expected size error, got: {msg}");
+        }
+    }
 }
