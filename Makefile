@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-k3s-rootfs
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-k3s-rootfs build-k3s-kernel test-k3s
 
 all: lint test
 
@@ -118,6 +118,16 @@ update-rootfs: build-agent-aarch64
 K3S_ROOTFS ?= k3s-rootfs.ext4
 build-k3s-rootfs: build-agent
 	sudo guest/build-k3s-rootfs.sh $(K3S_ROOTFS)
+
+# Build k3s-compatible kernel (requires root, build-essential, flex, bison, libelf-dev)
+K3S_KERNEL ?= /mnt/husk/vmlinux-k3s
+build-k3s-kernel:
+	sudo guest/build-k3s-kernel.sh $(K3S_KERNEL)
+
+# Run k3s E2E cluster test (requires running daemon, k3s rootfs + kernel)
+K3S_ROOTFS ?= k3s-rootfs.ext4
+test-k3s:
+	guest/test-k3s-cluster.sh $(K3S_ROOTFS)
 
 # Run the daemon (development)
 run-daemon:
