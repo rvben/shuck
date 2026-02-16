@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 #[cfg(feature = "linux-net")]
@@ -134,6 +134,15 @@ fn default_rows() -> u16 {
     24
 }
 
+// ── Logs Types ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    follow: bool,
+    tail: Option<u64>,
+}
+
 /// Messages sent by the server to the client over the shell WebSocket.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -157,7 +166,8 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
-        .route("/v1/vms/{name}/shell", get(shell_ws::<B>));
+        .route("/v1/vms/{name}/shell", get(shell_ws::<B>))
+        .route("/v1/vms/{name}/logs", get(get_logs::<B>));
 
     #[cfg(feature = "linux-net")]
     let router = router
@@ -504,6 +514,109 @@ async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), a
     ws.send(Message::Text(text.into())).await
 }
 
+// ── Logs Handler ─────────────────────────────────────────────────────
+
+async fn get_logs<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Query(params): Query<LogsQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let log_path = core.serial_log_path(&name).map_err(map_error)?;
+
+    let content = tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("no serial log for VM '{name}'"),
+                }),
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("reading serial log: {e}"),
+                }),
+            )
+        }
+    })?;
+
+    if params.follow {
+        let initial_content = if let Some(n) = params.tail {
+            tail_lines(&content, n)
+        } else {
+            content.clone()
+        };
+
+        let mut offset = content.len() as u64;
+        let initial = axum::body::Bytes::from(initial_content.into_bytes());
+
+        let stream = async_stream::stream! {
+            if !initial.is_empty() {
+                yield Ok::<axum::body::Bytes, std::io::Error>(initial);
+            }
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                match tokio::fs::metadata(&log_path).await {
+                    Ok(meta) => {
+                        let len = meta.len();
+                        if len > offset {
+                            match tokio::fs::read(&log_path).await {
+                                Ok(data) => {
+                                    if (offset as usize) < data.len() {
+                                        let new_data = axum::body::Bytes::from(data[offset as usize..].to_vec());
+                                        offset = data.len() as u64;
+                                        yield Ok(new_data);
+                                    }
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        break;
+                    }
+                    Err(_) => {}
+                }
+            }
+        };
+
+        let body = axum::body::Body::from_stream(stream);
+        Ok(axum::response::Response::builder()
+            .header("content-type", "text/plain; charset=utf-8")
+            .header("transfer-encoding", "chunked")
+            .body(body)
+            .unwrap())
+    } else {
+        let output = if let Some(n) = params.tail {
+            tail_lines(&content, n)
+        } else {
+            content
+        };
+
+        Ok(axum::response::Response::builder()
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(output))
+            .unwrap())
+    }
+}
+
+/// Return the last `n` lines of `content`.
+fn tail_lines(content: &str, n: u64) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n as usize);
+    let mut result = lines[start..].join("\n");
+    if content.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
 // ── Port Forward Handlers ─────────────────────────────────────────────
 
 #[cfg(feature = "linux-net")]
@@ -617,6 +730,7 @@ mod tests {
             storage,
             "husk0".into(),
             vec!["8.8.8.8".into(), "1.1.1.1".into()],
+            PathBuf::from("/tmp/husk-test/run"),
         ))
     }
 
@@ -761,6 +875,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── tail_lines unit tests ─────────────────────────────────────────
+
+    #[test]
+    fn tail_lines_returns_last_n() {
+        let content = "a\nb\nc\nd\ne\n";
+        assert_eq!(tail_lines(content, 2), "d\ne\n");
+        assert_eq!(tail_lines(content, 3), "c\nd\ne\n");
+    }
+
+    #[test]
+    fn tail_lines_n_exceeds_line_count_returns_all() {
+        let content = "a\nb\nc\n";
+        assert_eq!(tail_lines(content, 100), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn tail_lines_zero_returns_empty() {
+        let content = "a\nb\nc\n";
+        assert_eq!(tail_lines(content, 0), "");
+    }
+
+    #[test]
+    fn tail_lines_empty_input() {
+        assert_eq!(tail_lines("", 5), "");
+    }
+
+    #[test]
+    fn tail_lines_no_trailing_newline() {
+        let content = "a\nb\nc";
+        assert_eq!(tail_lines(content, 2), "b\nc");
+    }
+
+    #[test]
+    fn tail_lines_single_line_with_newline() {
+        assert_eq!(tail_lines("hello\n", 1), "hello\n");
+        assert_eq!(tail_lines("hello\n", 5), "hello\n");
+    }
+
+    #[test]
+    fn tail_lines_single_line_without_newline() {
+        assert_eq!(tail_lines("hello", 1), "hello");
+    }
+
+    #[test]
+    fn tail_lines_blank_lines_preserved() {
+        let content = "a\n\nb\n\nc\n";
+        // lines() yields: ["a", "", "b", "", "c"] — 5 lines
+        assert_eq!(tail_lines(content, 3), "b\n\nc\n");
     }
 
     #[test]

@@ -18,6 +18,7 @@ struct FcInstance {
     socket_path: PathBuf,
     vsock_path: PathBuf,
     log_path: PathBuf,
+    serial_log_path: PathBuf,
     process: tokio::process::Child,
 }
 
@@ -129,11 +130,17 @@ impl VmmBackend for FirecrackerBackend {
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let log_path = self.runtime_dir.join(format!("{id}.log"));
         let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
+        let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
 
         // Firecracker requires the log file to exist before startup
         tokio::fs::write(&log_path, b"").await?;
+
+        // Firecracker writes guest serial console (ttyS0) to stdout.
+        // Capture it to a file so `husk logs` can read it.
+        let serial_file = std::fs::File::create(&serial_log_path)
+            .map_err(|e| VmmError::ProcessError(format!("create serial log: {e}")))?;
 
         // Spawn the Firecracker process
         let process = tokio::process::Command::new(&self.firecracker_bin)
@@ -143,6 +150,8 @@ impl VmmBackend for FirecrackerBackend {
             .arg(&log_path)
             .arg("--level")
             .arg("Info")
+            .stdout(serial_file.try_clone().map_err(VmmError::Io)?)
+            .stderr(serial_file)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| VmmError::ProcessError(format!("spawn firecracker: {e}")))?;
@@ -262,6 +271,7 @@ impl VmmBackend for FirecrackerBackend {
             socket_path,
             vsock_path,
             log_path,
+            serial_log_path,
             process,
         };
 
@@ -301,6 +311,7 @@ impl VmmBackend for FirecrackerBackend {
         let _ = tokio::fs::remove_file(&instance.socket_path).await;
         let _ = tokio::fs::remove_file(&instance.vsock_path).await;
         let _ = tokio::fs::remove_file(&instance.log_path).await;
+        let _ = tokio::fs::remove_file(&instance.serial_log_path).await;
 
         Ok(())
     }
@@ -508,6 +519,7 @@ mod tests {
             socket_path: dir.path().join("fake.sock"),
             vsock_path: dir.path().join("fake.vsock"),
             log_path: dir.path().join("fake.log"),
+            serial_log_path: dir.path().join("fake.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
         };
         backend.instances.lock().await.insert(id, instance);
@@ -569,11 +581,13 @@ mod tests {
         let socket_path = dir.path().join("test.sock");
         let vsock_path = dir.path().join("test.vsock");
         let log_path = dir.path().join("test.log");
+        let serial_log_path = dir.path().join("test.serial.log");
 
         // Create the files
         tokio::fs::write(&socket_path, b"").await.unwrap();
         tokio::fs::write(&vsock_path, b"").await.unwrap();
         tokio::fs::write(&log_path, b"").await.unwrap();
+        tokio::fs::write(&serial_log_path, b"").await.unwrap();
 
         let instance = FcInstance {
             info: VmInfo {
@@ -588,6 +602,7 @@ mod tests {
             socket_path: socket_path.clone(),
             vsock_path: vsock_path.clone(),
             log_path: log_path.clone(),
+            serial_log_path: serial_log_path.clone(),
             process: tokio::process::Command::new("true").spawn().unwrap(),
         };
         backend.instances.lock().await.insert(id, instance);
@@ -597,6 +612,7 @@ mod tests {
         assert!(!socket_path.exists());
         assert!(!vsock_path.exists());
         assert!(!log_path.exists());
+        assert!(!serial_log_path.exists());
     }
 
     #[tokio::test]
@@ -621,6 +637,7 @@ mod tests {
             socket_path: dir.path().join("test.sock"),
             vsock_path: dir.path().join("test.vsock"),
             log_path: dir.path().join("test.log"),
+            serial_log_path: dir.path().join("test.serial.log"),
             process,
         };
         backend.instances.lock().await.insert(id, instance);

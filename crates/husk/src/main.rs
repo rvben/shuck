@@ -150,6 +150,18 @@ enum Commands {
         #[arg(long)]
         command: Option<String>,
     },
+
+    /// Show serial console output from a VM
+    Logs {
+        /// VM name
+        name: String,
+        /// Follow log output (like tail -f)
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Show last N lines
+        #[arg(long, short = 'n')]
+        tail: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -674,6 +686,51 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Logs { name, follow, tail } => {
+            let mut url = format!("{}/v1/vms/{name}/logs", cli.api_url);
+            let mut params = Vec::new();
+            if follow {
+                params.push("follow=true".to_string());
+            }
+            if let Some(n) = tail {
+                params.push(format!("tail={n}"));
+            }
+            if !params.is_empty() {
+                url.push('?');
+                url.push_str(&params.join("&"));
+            }
+
+            let client = reqwest::Client::new();
+            let resp = api_request(client.get(&url)).await?;
+
+            if !resp.status().is_success() {
+                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
+                std::process::exit(1);
+            }
+
+            if follow {
+                use tokio::io::AsyncWriteExt;
+                let mut stream = resp.bytes_stream();
+                let mut stdout = tokio::io::stdout();
+                use futures_util::StreamExt;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            stdout.write_all(&bytes).await?;
+                            stdout.flush().await?;
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading stream: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            } else {
+                let body = resp.text().await?;
+                print!("{body}");
+            }
+            Ok(())
+        }
         Commands::Shell { name, command } => {
             run_shell(cli.api_url, cli.config, name, command).await
         }
@@ -1100,6 +1157,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             storage,
             config.bridge_name.clone(),
             config.dns_servers,
+            runtime_dir.clone(),
         ));
         husk_api::serve(core, listen).await?;
 
@@ -1114,9 +1172,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     #[cfg(not(feature = "linux-net"))]
     {
-        let vmm = husk_vmm::apple_vz::AppleVzBackend::new();
+        let vmm = husk_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
 
-        let core = Arc::new(husk_core::HuskCore::new(vmm, state, storage));
+        let core = Arc::new(husk_core::HuskCore::new(
+            vmm,
+            state,
+            storage,
+            runtime_dir.clone(),
+        ));
         husk_api::serve(core, listen).await?;
         Ok(())
     }

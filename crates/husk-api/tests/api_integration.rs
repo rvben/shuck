@@ -37,6 +37,7 @@ fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         storage,
         "husk0".into(),
         vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-test/run"),
     ))
 }
 
@@ -385,6 +386,7 @@ async fn vm_response_json_structure() {
         storage,
         "husk0".into(),
         vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-test/run"),
     ));
 
     let app = router(populated_core.clone());
@@ -467,6 +469,7 @@ async fn list_vms_returns_all_records() {
         storage,
         "husk0".into(),
         vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-test/run"),
     ));
 
     let app = router(core);
@@ -701,6 +704,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         storage,
         "husk0".into(),
         vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-test/run"),
     ));
 
     let app = router(core);
@@ -761,6 +765,7 @@ async fn vm_response_with_null_optional_fields() {
         storage,
         "husk0".into(),
         vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-test/run"),
     ));
 
     let app = router(core);
@@ -780,4 +785,466 @@ async fn vm_response_with_null_optional_fields() {
     assert!(json["pid"].is_null());
     assert!(json["host_ip"].is_null());
     assert!(json["guest_ip"].is_null());
+}
+
+// ── Logs Endpoint ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn logs_nonexistent_vm_returns_404() {
+    let app = router(test_core());
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/ghost/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn logs_returns_serial_output() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let vm_id = uuid::Uuid::new_v4();
+    let record = husk_state::VmRecord {
+        id: vm_id,
+        name: "log-test".into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+    };
+    state.insert_vm(&record).unwrap();
+
+    // Pre-create serial log file with known content
+    let serial_log = runtime_dir.path().join(format!("{vm_id}.serial.log"));
+    std::fs::write(&serial_log, "Linux version 6.1.102\nBoot complete\n").unwrap();
+
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        runtime_dir.path().to_path_buf(),
+    ));
+
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/log-test/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("Linux version 6.1.102"));
+    assert!(body.contains("Boot complete"));
+}
+
+#[tokio::test]
+async fn logs_tail_returns_last_n_lines() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let vm_id = uuid::Uuid::new_v4();
+    let record = husk_state::VmRecord {
+        id: vm_id,
+        name: "tail-test".into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+    };
+    state.insert_vm(&record).unwrap();
+
+    let serial_log = runtime_dir.path().join(format!("{vm_id}.serial.log"));
+    std::fs::write(&serial_log, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        runtime_dir.path().to_path_buf(),
+    ));
+
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/tail-test/logs?tail=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(!body.contains("line3"));
+    assert!(body.contains("line4"));
+    assert!(body.contains("line5"));
+}
+
+#[tokio::test]
+async fn logs_no_serial_file_returns_404() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let vm_id = uuid::Uuid::new_v4();
+    let record = husk_state::VmRecord {
+        id: vm_id,
+        name: "no-log-test".into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+    };
+    state.insert_vm(&record).unwrap();
+
+    // Do NOT create the serial log file
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        runtime_dir.path().to_path_buf(),
+    ));
+
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/no-log-test/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = response_json(response).await;
+    assert!(json["error"].as_str().unwrap().contains("no serial log"));
+}
+
+/// Helper: create a core with a pre-populated VM and optional serial log content.
+fn logs_test_core(
+    vm_name: &str,
+    serial_content: Option<&str>,
+) -> (
+    Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>>,
+    tempfile::TempDir,
+) {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let vm_id = uuid::Uuid::new_v4();
+    let record = husk_state::VmRecord {
+        id: vm_id,
+        name: vm_name.into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+    };
+    state.insert_vm(&record).unwrap();
+
+    if let Some(content) = serial_content {
+        let serial_log = runtime_dir.path().join(format!("{vm_id}.serial.log"));
+        std::fs::write(&serial_log, content).unwrap();
+    }
+
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        runtime_dir.path().to_path_buf(),
+    ));
+    (core, runtime_dir)
+}
+
+#[tokio::test]
+async fn logs_empty_serial_file_returns_empty_body() {
+    let (core, _dir) = logs_test_core("empty-log", Some(""));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/empty-log/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, "");
+}
+
+#[tokio::test]
+async fn logs_tail_zero_returns_empty() {
+    let (core, _dir) = logs_test_core("tail-zero", Some("line1\nline2\nline3\n"));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/tail-zero/logs?tail=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, "");
+}
+
+#[tokio::test]
+async fn logs_tail_exceeding_line_count_returns_all() {
+    let content = "alpha\nbeta\n";
+    let (core, _dir) = logs_test_core("tail-big", Some(content));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/tail-big/logs?tail=999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, content);
+}
+
+#[tokio::test]
+async fn logs_tail_on_empty_file_returns_empty() {
+    let (core, _dir) = logs_test_core("tail-empty", Some(""));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/tail-empty/logs?tail=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, "");
+}
+
+#[tokio::test]
+async fn logs_preserves_blank_lines() {
+    let content = "boot start\n\n\nkernel loaded\n\nready\n";
+    let (core, _dir) = logs_test_core("blank-lines", Some(content));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/blank-lines/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, content);
+}
+
+#[tokio::test]
+async fn logs_content_type_is_text_plain() {
+    let (core, _dir) = logs_test_core("ct-test", Some("hello\n"));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/ct-test/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let ct = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.contains("text/plain"), "expected text/plain, got: {ct}");
+}
+
+#[tokio::test]
+async fn logs_with_binary_like_content_returns_ok() {
+    // Serial output can contain ANSI escape codes, partial UTF-8, etc.
+    // The file is read as UTF-8 string, so non-UTF-8 would fail.
+    // Test that ANSI-heavy output works fine.
+    let content =
+        "[\x1b[32m  OK  \x1b[0m] Started systemd\n[\x1b[32m  OK  \x1b[0m] Reached target\n";
+    let (core, _dir) = logs_test_core("ansi-test", Some(content));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/ansi-test/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("Started systemd"));
+    assert!(body.contains("Reached target"));
+}
+
+#[tokio::test]
+async fn logs_no_trailing_newline_preserved() {
+    let content = "line1\nline2\nno-newline-at-end";
+    let (core, _dir) = logs_test_core("no-nl", Some(content));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/no-nl/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, content);
+}
+
+#[tokio::test]
+async fn logs_tail_with_no_trailing_newline() {
+    let content = "a\nb\nc";
+    let (core, _dir) = logs_test_core("tail-no-nl", Some(content));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/tail-no-nl/logs?tail=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, "b\nc");
+}
+
+#[tokio::test]
+async fn logs_tail_one_from_multiline() {
+    let content = "first\nsecond\nthird\n";
+    let (core, _dir) = logs_test_core("tail-one", Some(content));
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/tail-one/logs?tail=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert_eq!(body, "third\n");
 }

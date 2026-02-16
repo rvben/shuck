@@ -155,9 +155,15 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskCore<MockVmm>>, Uuid) 
         storage,
         "husk0".into(),
         vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-mock-test/run"),
     ));
     #[cfg(not(feature = "linux-net"))]
-    let core = Arc::new(HuskCore::new(vmm, state_store, storage));
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state_store,
+        storage,
+        PathBuf::from("/tmp/husk-mock-test/run"),
+    ));
     (core, id)
 }
 

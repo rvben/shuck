@@ -4,6 +4,7 @@
 //! VZVirtualMachine's queue-affinity requirement.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use block2::RcBlock;
@@ -11,13 +12,13 @@ use dispatch2::{DispatchQueue, DispatchRetained};
 use libc;
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
+    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -64,6 +65,9 @@ struct VzInstance {
     queue: DispatchRetained<DispatchQueue>,
     /// The VZ virtual machine object. Only accessed from `queue`.
     vm: QueueConfined<Retained<VZVirtualMachine>>,
+    serial_log_path: PathBuf,
+    /// Kept alive so the file descriptor remains valid for the VZ serial attachment.
+    _serial_file: std::fs::File,
 }
 
 /// VZ operations that use completion handlers.
@@ -76,20 +80,16 @@ enum VzOp {
 
 /// Apple Virtualization.framework VMM backend.
 pub struct AppleVzBackend {
+    runtime_dir: PathBuf,
     instances: Arc<Mutex<HashMap<Uuid, VzInstance>>>,
 }
 
-impl Default for AppleVzBackend {
-    fn default() -> Self {
+impl AppleVzBackend {
+    pub fn new(runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
+            runtime_dir: runtime_dir.into(),
             instances: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-}
-
-impl AppleVzBackend {
-    pub fn new() -> Self {
-        Self::default()
     }
 }
 
@@ -219,6 +219,15 @@ impl VmmBackend for AppleVzBackend {
         let id = Uuid::new_v4();
         let queue = DispatchQueue::new(&format!("com.husk.vm.{id}"), None);
 
+        // Capture serial console output to a file for `husk logs`.
+        let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
+        let serial_file = std::fs::File::create(&serial_log_path)
+            .map_err(|e| VmmError::ProcessError(format!("create serial log: {e}")))?;
+        let serial_write_fd = {
+            use std::os::unix::io::AsRawFd;
+            serial_file.as_raw_fd()
+        };
+
         // Create the VM on its dedicated dispatch queue.
         let vm = dispatch_sync_fallible(queue.clone(), {
             let config = config.clone();
@@ -303,9 +312,20 @@ impl VmmBackend for AppleVzBackend {
                 }
 
                 // Serial console (hvc0 — virtio console)
-                // Attach to /dev/null for reading and writing to discard output.
-                // A proper console (pty, pipe) can be added later for interactive use.
+                // Attach output to a log file for `husk logs`. No input needed (None).
+                let write_handle = NSFileHandle::initWithFileDescriptor(
+                    NSFileHandle::alloc(),
+                    serial_write_fd,
+                );
+                let attachment = unsafe {
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        None,
+                        Some(&*write_handle),
+                    )
+                };
                 let serial_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+                unsafe { serial_port.setAttachment(Some(&*attachment)) };
                 let serial_config = serial_port.into_super();
                 unsafe {
                     vz_config.setSerialPorts(&NSArray::from_retained_slice(&[serial_config]));
@@ -351,6 +371,8 @@ impl VmmBackend for AppleVzBackend {
                 info: info.clone(),
                 queue,
                 vm,
+                serial_log_path,
+                _serial_file: serial_file,
             },
         );
 
@@ -390,6 +412,7 @@ impl VmmBackend for AppleVzBackend {
 
         // Force stop — best-effort, ignore errors (VM may already be stopped)
         let _ = dispatch_vz_op(instance.queue, instance.vm, VzOp::Stop).await;
+        let _ = tokio::fs::remove_file(&instance.serial_log_path).await;
         Ok(())
     }
 
@@ -535,9 +558,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_has_no_instances() {
+    fn new_has_no_instances() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let backend = AppleVzBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
         rt.block_on(async {
             let instances = backend.instances.lock().await;
             assert!(instances.is_empty());
@@ -546,7 +570,8 @@ mod tests {
 
     #[tokio::test]
     async fn vm_not_found_errors() {
-        let backend = AppleVzBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
         let id = Uuid::new_v4();
 
         assert!(matches!(
@@ -601,7 +626,8 @@ mod tests {
 
     #[test]
     fn drop_on_empty_backend_is_safe() {
-        let backend = AppleVzBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
         drop(backend);
         // No panic = pass
     }

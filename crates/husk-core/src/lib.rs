@@ -81,6 +81,7 @@ pub struct HuskCore<B: VmmBackend> {
     bridge_name: String,
     #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
+    runtime_dir: PathBuf,
 }
 
 impl<B: VmmBackend> HuskCore<B> {
@@ -93,6 +94,7 @@ impl<B: VmmBackend> HuskCore<B> {
         storage: husk_storage::StorageConfig,
         bridge_name: String,
         dns_servers: Vec<String>,
+        runtime_dir: PathBuf,
     ) -> Self {
         Self {
             vmm,
@@ -101,6 +103,7 @@ impl<B: VmmBackend> HuskCore<B> {
             storage,
             bridge_name,
             dns_servers,
+            runtime_dir,
         }
     }
 
@@ -113,11 +116,13 @@ impl<B: VmmBackend> HuskCore<B> {
         vmm: B,
         state: husk_state::StateStore,
         storage: husk_storage::StorageConfig,
+        runtime_dir: PathBuf,
     ) -> Self {
         Self {
             vmm,
             state,
             storage,
+            runtime_dir,
         }
     }
 
@@ -444,6 +449,9 @@ impl<B: VmmBackend> HuskCore<B> {
         let vm_dir = self.storage.vm_dir(&record.name);
         let _ = tokio::fs::remove_dir_all(&vm_dir).await;
 
+        let serial_log = self.runtime_dir.join(format!("{}.serial.log", record.id));
+        let _ = tokio::fs::remove_file(&serial_log).await;
+
         self.state.delete_vm(record.id)?;
         info!(%name, "VM destroyed");
         Ok(())
@@ -457,6 +465,12 @@ impl<B: VmmBackend> HuskCore<B> {
     /// Get info about a specific VM.
     pub fn get_vm(&self, name: &str) -> Result<VmRecord, CoreError> {
         self.lookup_vm(name)
+    }
+
+    /// Path to a VM's serial console log file.
+    pub fn serial_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        let record = self.lookup_vm(name)?;
+        Ok(self.runtime_dir.join(format!("{}.serial.log", record.id)))
     }
 
     /// Connect to the guest agent for a running VM.
