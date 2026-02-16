@@ -42,6 +42,65 @@ jobs:
       - run: make test
       - run: make test-initramfs
 
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-contracts
+
+  failure-injection:
+    name: Failure Injection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-failure-injection
+
+  perf-baseline:
+    name: Perf Baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-perf-baseline
+
+  coverage:
+    name: Coverage Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: make coverage-ci
+
+  graceful-shutdown:
+    name: Graceful Shutdown Drill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make graceful-shutdown-drill
+
+  ignored-e2e-gated:
+    name: Ignored E2E (Gated)
+    runs-on: ubuntu-latest
+    env:
+      HUSK_RUN_IGNORED_E2E: ${{ vars.HUSK_RUN_IGNORED_E2E }}
+      HUSK_RUN_NET_E2E: ${{ vars.HUSK_RUN_NET_E2E }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-e2e-gated
+      - run: make test-net-e2e-gated
+
   check-macos:
     name: Check (macOS)
     runs-on: macos-latest

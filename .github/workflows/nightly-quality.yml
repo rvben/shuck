@@ -1,0 +1,24 @@
+name: Nightly Quality
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  nightly:
+    name: Nightly Soak/Chaos/Perf
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HUSK_RUN_IGNORED_E2E: ${{ vars.HUSK_RUN_IGNORED_E2E_NIGHTLY }}
+      HUSK_RUN_NET_E2E: ${{ vars.HUSK_RUN_NET_E2E_NIGHTLY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make nightly-quality

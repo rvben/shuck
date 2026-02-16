@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
 all: lint test
 
@@ -87,6 +87,50 @@ install-restart: install
 # Run E2E tests (requires running daemon and a booted VM)
 test-e2e:
 	cargo nextest run --package husk --test e2e -- --ignored 2>/dev/null || cargo test --package husk --test e2e -- --ignored
+
+# Run ignored husk e2e tests only when explicitly enabled.
+test-e2e-gated:
+	@if [ "$${HUSK_RUN_IGNORED_E2E:-0}" = "1" ]; then \
+		cargo test --package husk --test e2e -- --ignored; \
+	else \
+		echo "Skipping husk ignored e2e tests (set HUSK_RUN_IGNORED_E2E=1 to enable)"; \
+	fi
+
+# Run ignored husk-net e2e tests only when explicitly enabled.
+test-net-e2e-gated:
+	@if [ "$${HUSK_RUN_NET_E2E:-0}" = "1" ]; then \
+		cargo test --package husk-net --test e2e_bridge -- --ignored; \
+	else \
+		echo "Skipping husk-net ignored e2e tests (set HUSK_RUN_NET_E2E=1 to enable)"; \
+	fi
+
+# API/CLI contract tests (OpenAPI + CLI output schema stability)
+test-contracts:
+	cargo test -p husk-api --test openapi_contract
+	cargo test -p husk --no-default-features -- --nocapture
+
+# Core failure-injection tests
+test-failure-injection:
+	cargo test -p husk-core --test failure_injection
+
+# Lightweight performance baseline and regression gate
+test-perf-baseline:
+	cargo test -p husk-api --test perf_baseline -- --nocapture
+
+# Coverage gate (line + branch) for workspace quality floor.
+coverage-ci:
+	cargo llvm-cov --workspace --all-features --fail-under-lines 50 --lcov --output-path target/llvm-cov.info
+
+# Graceful shutdown drill (SIGTERM path)
+graceful-shutdown-drill:
+	scripts/ci/graceful_shutdown_drill.sh
+
+# Chaos/restart drill (force-kill and restart path)
+chaos-tests:
+	scripts/ci/chaos_restart_drill.sh
+
+# Nightly long-run quality suite
+nightly-quality: test-perf-baseline test-failure-injection graceful-shutdown-drill chaos-tests test-e2e-gated test-net-e2e-gated
 
 # Update guest rootfs image with latest agent binary and inittab.
 # Requires: aarch64-linux-musl-gcc cross-compiler, e2fsprogs (brew install e2fsprogs)
