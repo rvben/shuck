@@ -40,6 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: make test
+      - run: make test-initramfs
 
   check-macos:
     name: Check (macOS)
@@ -59,3 +60,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: make test-macos
+      - run: make test-initramfs
