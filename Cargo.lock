@@ -809,6 +809,7 @@ dependencies = [
 name = "husk-net"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "serde_json",
  "thiserror",
  "tokio",

@@ -651,6 +651,7 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, NetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── IP Allocator ───────────────────────────────────────────────────
 
@@ -715,6 +716,39 @@ mod tests {
         // Then fresh .5
         let fresh = alloc.allocate().unwrap();
         assert_eq!(fresh, Ipv4Addr::new(172, 20, 0, 5));
+    }
+
+    proptest! {
+        #[test]
+        fn prop_allocator_reuses_released_ips_in_ascending_order(
+            indices in proptest::collection::vec(0usize..40, 0..40)
+        ) {
+            let alloc = IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+            let mut allocated = Vec::new();
+            for _ in 0..40 {
+                allocated.push(alloc.allocate().unwrap());
+            }
+
+            let mut released_indices: Vec<usize> = indices
+                .into_iter()
+                .map(|i| i % allocated.len())
+                .collect();
+            released_indices.sort_unstable();
+            released_indices.dedup();
+
+            for idx in &released_indices {
+                alloc.release(allocated[*idx]).unwrap();
+            }
+
+            let mut expected: Vec<Ipv4Addr> =
+                released_indices.iter().map(|idx| allocated[*idx]).collect();
+            expected.sort_by_key(|ip| u32::from(*ip));
+
+            for ip in expected {
+                let next = alloc.allocate().unwrap();
+                prop_assert_eq!(next, ip);
+            }
+        }
     }
 
     #[test]
