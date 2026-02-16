@@ -31,6 +31,12 @@ enum Commands {
         /// Address to listen on
         #[arg(long, default_value = "127.0.0.1:7777")]
         listen: SocketAddr,
+        /// Allow binding the daemon API to non-loopback addresses.
+        ///
+        /// By default husk refuses non-loopback binds to avoid accidental
+        /// remote exposure of privileged VM control endpoints.
+        #[arg(long)]
+        allow_remote: bool,
     },
 
     /// Create and boot a new VM
@@ -330,7 +336,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon { listen } => {
+        Commands::Daemon {
+            listen,
+            allow_remote,
+        } => {
+            validate_daemon_bind(listen, allow_remote)?;
             let config = load_config(cli.config.as_deref());
             start_daemon(config, listen).await
         }
@@ -706,6 +716,16 @@ async fn main() -> Result<()> {
             ConfigAction::Check => check_config(cli.config.as_deref()),
         },
     }
+}
+
+fn validate_daemon_bind(listen: SocketAddr, allow_remote: bool) -> Result<()> {
+    if !listen.ip().is_loopback() && !allow_remote {
+        anyhow::bail!(
+            "refusing to bind daemon to non-loopback address {listen} without \
+             --allow-remote"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "linux-net"))]
@@ -1553,6 +1573,19 @@ mod tests {
         assert!(parse_octal_mode("999").is_err());
         assert!(parse_octal_mode("abc").is_err());
         assert!(parse_octal_mode("").is_err());
+    }
+
+    #[test]
+    fn daemon_bind_loopback_allowed_without_flag() {
+        let listen: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        assert!(validate_daemon_bind(listen, false).is_ok());
+    }
+
+    #[test]
+    fn daemon_bind_non_loopback_requires_allow_remote() {
+        let listen: SocketAddr = "0.0.0.0:7777".parse().unwrap();
+        assert!(validate_daemon_bind(listen, false).is_err());
+        assert!(validate_daemon_bind(listen, true).is_ok());
     }
 
     #[test]
