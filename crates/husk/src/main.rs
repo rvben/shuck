@@ -219,6 +219,26 @@ struct Config {
     default_kernel: PathBuf,
     #[serde(default)]
     api_token: Option<String>,
+    #[serde(default = "default_api_max_request_bytes")]
+    api_max_request_bytes: usize,
+    #[serde(default = "default_api_max_file_read_bytes")]
+    api_max_file_read_bytes: usize,
+    #[serde(default = "default_api_max_file_write_bytes")]
+    api_max_file_write_bytes: usize,
+    #[serde(default = "default_api_sensitive_rate_limit_per_minute")]
+    api_sensitive_rate_limit_per_minute: u32,
+    #[serde(default)]
+    allowed_read_paths: Vec<String>,
+    #[serde(default)]
+    allowed_write_paths: Vec<String>,
+    #[serde(default = "default_exec_timeout_secs")]
+    exec_timeout_secs: u64,
+    #[serde(default)]
+    exec_allowlist: Vec<String>,
+    #[serde(default)]
+    exec_denylist: Vec<String>,
+    #[serde(default)]
+    exec_env_allowlist: Vec<String>,
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_host_interface")]
     host_interface: String,
@@ -256,6 +276,26 @@ fn default_kernel_path() -> PathBuf {
     }
 }
 
+fn default_api_max_request_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+fn default_api_max_file_read_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_api_max_file_write_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_api_sensitive_rate_limit_per_minute() -> u32 {
+    120
+}
+
+fn default_exec_timeout_secs() -> u64 {
+    30
+}
+
 #[cfg(feature = "linux-net")]
 fn default_host_interface() -> String {
     "eth0".into()
@@ -284,10 +324,16 @@ async fn api_error(resp: reqwest::Response, subject: &str) -> String {
     let status = resp.status();
     match resp.text().await {
         Ok(body) if !body.is_empty() => {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(msg) = json["error"].as_str()
-            {
-                return msg.to_string();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(msg) = json["message"].as_str() {
+                    if let Some(hint) = json["hint"].as_str() {
+                        return format!("{msg} (hint: {hint})");
+                    }
+                    return msg.to_string();
+                }
+                if let Some(msg) = json["error"].as_str() {
+                    return msg.to_string();
+                }
             }
             body
         }
@@ -335,6 +381,16 @@ impl Default for Config {
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
             api_token: None,
+            api_max_request_bytes: default_api_max_request_bytes(),
+            api_max_file_read_bytes: default_api_max_file_read_bytes(),
+            api_max_file_write_bytes: default_api_max_file_write_bytes(),
+            api_sensitive_rate_limit_per_minute: default_api_sensitive_rate_limit_per_minute(),
+            allowed_read_paths: Vec::new(),
+            allowed_write_paths: Vec::new(),
+            exec_timeout_secs: default_exec_timeout_secs(),
+            exec_allowlist: Vec::new(),
+            exec_denylist: Vec::new(),
+            exec_env_allowlist: Vec::new(),
             #[cfg(feature = "linux-net")]
             host_interface: default_host_interface(),
             #[cfg(feature = "linux-net")]
@@ -1259,6 +1315,66 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("HUSK_API_TOKEN") {
         config.api_token = Some(val);
     }
+    if let Ok(val) = std::env::var("HUSK_API_MAX_REQUEST_BYTES")
+        && let Ok(parsed) = val.parse::<usize>()
+    {
+        config.api_max_request_bytes = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSK_API_MAX_FILE_READ_BYTES")
+        && let Ok(parsed) = val.parse::<usize>()
+    {
+        config.api_max_file_read_bytes = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSK_API_MAX_FILE_WRITE_BYTES")
+        && let Ok(parsed) = val.parse::<usize>()
+    {
+        config.api_max_file_write_bytes = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSK_API_SENSITIVE_RATE_LIMIT_PER_MINUTE")
+        && let Ok(parsed) = val.parse::<u32>()
+    {
+        config.api_sensitive_rate_limit_per_minute = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSK_ALLOWED_READ_PATHS") {
+        config.allowed_read_paths = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Ok(val) = std::env::var("HUSK_ALLOWED_WRITE_PATHS") {
+        config.allowed_write_paths = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Ok(val) = std::env::var("HUSK_EXEC_TIMEOUT_SECS")
+        && let Ok(parsed) = val.parse::<u64>()
+    {
+        config.exec_timeout_secs = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSK_EXEC_ALLOWLIST") {
+        config.exec_allowlist = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Ok(val) = std::env::var("HUSK_EXEC_DENYLIST") {
+        config.exec_denylist = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Ok(val) = std::env::var("HUSK_EXEC_ENV_ALLOWLIST") {
+        config.exec_env_allowlist = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
     #[cfg(feature = "linux-net")]
     {
         if let Ok(val) = std::env::var("HUSK_FIRECRACKER_BIN") {
@@ -1515,6 +1631,19 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     let runtime_dir = config.data_dir.join("run");
     let db_path = config.data_dir.join("husk.db");
     let api_token = config.api_token.clone();
+    let api_policy = husk_api::ApiPolicy {
+        max_request_bytes: config.api_max_request_bytes,
+        max_file_read_bytes: config.api_max_file_read_bytes,
+        max_file_write_bytes: config.api_max_file_write_bytes,
+        sensitive_rate_limit_per_minute: config.api_sensitive_rate_limit_per_minute,
+        allowed_read_paths: config.allowed_read_paths.clone(),
+        allowed_write_paths: config.allowed_write_paths.clone(),
+        exec_timeout_secs: config.exec_timeout_secs,
+        exec_allowlist: config.exec_allowlist.clone(),
+        exec_denylist: config.exec_denylist.clone(),
+        exec_env_allowlist: config.exec_env_allowlist.clone(),
+    };
+    husk_api::set_policy(api_policy);
 
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
     std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
@@ -1564,6 +1693,11 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             config.dns_servers,
             runtime_dir.clone(),
         ));
+
+        let restored = core.reconcile_port_forwards_from_state().await;
+        if restored > 0 {
+            tracing::info!(restored, "restored persisted port-forward nftables rules");
+        }
 
         spawn_log_rotation(Arc::clone(&core));
         husk_api::serve_with_auth(Arc::clone(&core), listen, api_token.clone()).await?;

@@ -733,6 +733,17 @@ impl<B: VmmBackend> HuskCore<B> {
             .as_deref()
             .ok_or_else(|| CoreError::VmNotFound(format!("{name}: no TAP device")))?;
 
+        // Idempotent behavior: if this exact forward already exists on this VM,
+        // treat it as success.
+        if let Ok(existing) = self.state.list_port_forwards_for_vm(record.id)
+            && existing
+                .iter()
+                .any(|pf| pf.host_port == host_port && pf.guest_port == guest_port)
+        {
+            info!(%name, host_port, guest_port, "port forward already present (no-op)");
+            return Ok(());
+        }
+
         husk_net::add_port_forward(host_port, guest_ip, guest_port, tap_name).await?;
 
         let pf_record = husk_state::PortForwardRecord {
@@ -796,6 +807,67 @@ impl<B: VmmBackend> HuskCore<B> {
     ) -> Result<Vec<husk_state::PortForwardRecord>, CoreError> {
         let record = self.lookup_vm(name)?;
         Ok(self.state.list_port_forwards_for_vm(record.id)?)
+    }
+
+    /// Rebuild nftables port-forward rules from persisted state on startup.
+    ///
+    /// This closes drift after daemon restarts because `init_nat` recreates the
+    /// nftables table while port-forward records remain in SQLite.
+    #[cfg(feature = "linux-net")]
+    pub async fn reconcile_port_forwards_from_state(&self) -> usize {
+        let vms = match self.state.list_vms() {
+            Ok(vms) => vms,
+            Err(e) => {
+                warn!(error = %e, "failed to list VMs for port-forward reconciliation");
+                return 0;
+            }
+        };
+
+        let mut restored = 0usize;
+        for vm in vms {
+            let Some(guest_ip_str) = vm.guest_ip.as_deref() else {
+                continue;
+            };
+            let Some(tap_name) = vm.tap_device.as_deref() else {
+                continue;
+            };
+            let guest_ip: Ipv4Addr = match guest_ip_str.parse() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    warn!(name = %vm.name, guest_ip = %guest_ip_str, "skipping invalid guest IP during reconciliation");
+                    continue;
+                }
+            };
+
+            let forwards = match self.state.list_port_forwards_for_vm(vm.id) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(name = %vm.name, error = %e, "failed to list port forwards during reconciliation");
+                    continue;
+                }
+            };
+
+            for pf in forwards {
+                match husk_net::add_port_forward(pf.host_port, guest_ip, pf.guest_port, tap_name)
+                    .await
+                {
+                    Ok(()) => {
+                        restored += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            name = %vm.name,
+                            tap = tap_name,
+                            host_port = pf.host_port,
+                            guest_port = pf.guest_port,
+                            error = %e,
+                            "failed to restore port-forward rule"
+                        );
+                    }
+                }
+            }
+        }
+        restored
     }
 
     fn lookup_vm(&self, name: &str) -> Result<VmRecord, CoreError> {

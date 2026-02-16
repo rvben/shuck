@@ -349,6 +349,73 @@ async fn multiple_pause_resume_cycles() {
     }
 }
 
+#[tokio::test]
+async fn lifecycle_property_randomized_transitions() {
+    let (core, _) = mock_core_with_vm("prop-vm", "running");
+    let mut expected = "running".to_string();
+    let mut seed: u64 = 0xC0FFEE;
+
+    for _ in 0..200 {
+        // Tiny deterministic PRNG to generate a stable random-looking sequence.
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let op = (seed % 3) as u8;
+
+        match op {
+            0 => {
+                let result = core.pause_vm("prop-vm").await;
+                match expected.as_str() {
+                    "running" => {
+                        result.unwrap();
+                        expected = "paused".into();
+                    }
+                    "paused" => {
+                        // idempotent no-op
+                        result.unwrap();
+                    }
+                    "stopped" => {
+                        assert!(matches!(result, Err(CoreError::InvalidState { .. })));
+                    }
+                    other => panic!("unexpected expected state: {other}"),
+                }
+            }
+            1 => {
+                let result = core.resume_vm("prop-vm").await;
+                match expected.as_str() {
+                    "paused" => {
+                        result.unwrap();
+                        expected = "running".into();
+                    }
+                    "running" => {
+                        // idempotent no-op
+                        result.unwrap();
+                    }
+                    "stopped" => {
+                        assert!(matches!(result, Err(CoreError::InvalidState { .. })));
+                    }
+                    other => panic!("unexpected expected state: {other}"),
+                }
+            }
+            _ => {
+                let result = core.stop_vm("prop-vm").await;
+                match expected.as_str() {
+                    "running" | "paused" => {
+                        result.unwrap();
+                        expected = "stopped".into();
+                    }
+                    "stopped" => {
+                        // idempotent no-op
+                        result.unwrap();
+                    }
+                    other => panic!("unexpected expected state: {other}"),
+                }
+            }
+        }
+
+        let actual = core.get_vm("prop-vm").unwrap().state;
+        assert_eq!(actual, expected);
+    }
+}
+
 // ── Network Configuration ─────────────────────────────────────────────
 //
 // Verify that the IP allocator, netmask conversion, and gateway computation

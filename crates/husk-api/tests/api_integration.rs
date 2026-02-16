@@ -135,6 +135,44 @@ async fn health_counts_vms_correctly() {
     assert_eq!(json["vms"]["running"], 2);
 }
 
+#[tokio::test]
+async fn health_includes_subsystem_checks_and_uptime() {
+    let app = router(test_core());
+    let response = app
+        .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["checks"]["state_db"], "ok");
+    assert!(json["checks"]["vmm_backend"].is_string());
+    assert!(json["checks"]["network_backend"].is_string());
+    assert!(json["uptime_seconds"].is_u64());
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text() {
+    let app = router(test_core());
+
+    // Drive at least one request before scraping metrics.
+    let _ = app
+        .clone()
+        .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("husk_api_requests_total"));
+    assert!(body.contains("husk_vms_total"));
+    assert!(body.contains("husk_api_uptime_seconds"));
+}
+
 // ── List Endpoint ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -172,6 +210,8 @@ async fn get_nonexistent_vm_returns_404_with_error_body() {
         error.contains("not found"),
         "error should mention 'not found', got: {error}"
     );
+    assert_eq!(json["code"], "vm_not_found");
+    assert_eq!(json["message"], error);
 }
 
 // ── POST /vms with Missing Content-Type ──────────────────────────────

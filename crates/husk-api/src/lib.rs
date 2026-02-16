@@ -1,11 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::{Component, Path as StdPath};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderValue;
 use axum::http::Method;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -41,10 +46,106 @@ pub struct VmResponse {
     pub userdata_status: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
-    pub error: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    // Backward-compatible alias kept for existing clients/tests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiPolicy {
+    pub max_request_bytes: usize,
+    pub max_file_read_bytes: usize,
+    pub max_file_write_bytes: usize,
+    pub sensitive_rate_limit_per_minute: u32,
+    pub allowed_read_paths: Vec<String>,
+    pub allowed_write_paths: Vec<String>,
+    pub exec_timeout_secs: u64,
+    pub exec_allowlist: Vec<String>,
+    pub exec_denylist: Vec<String>,
+    pub exec_env_allowlist: Vec<String>,
+}
+
+impl Default for ApiPolicy {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: 2 * 1024 * 1024,
+            max_file_read_bytes: 1024 * 1024,
+            max_file_write_bytes: 1024 * 1024,
+            sensitive_rate_limit_per_minute: 120,
+            allowed_read_paths: Vec::new(),
+            allowed_write_paths: Vec::new(),
+            exec_timeout_secs: 30,
+            exec_allowlist: Vec::new(),
+            exec_denylist: Vec::new(),
+            exec_env_allowlist: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ApiMetrics {
+    start: Instant,
+    requests_total: AtomicU64,
+    errors_total: AtomicU64,
+    rate_limited_total: AtomicU64,
+    exec_total: AtomicU64,
+    file_reads_total: AtomicU64,
+    file_writes_total: AtomicU64,
+    shell_sessions_total: AtomicU64,
+}
+
+impl ApiMetrics {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            requests_total: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+            rate_limited_total: AtomicU64::new(0),
+            exec_total: AtomicU64::new(0),
+            file_reads_total: AtomicU64::new(0),
+            file_writes_total: AtomicU64::new(0),
+            shell_sessions_total: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SlidingWindowRateLimiter {
+    events: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl SlidingWindowRateLimiter {
+    fn allow(&self, key: &str, limit_per_minute: u32) -> bool {
+        if limit_per_minute == 0 {
+            return true;
+        }
+        let mut events = self.events.lock().expect("rate limiter lock poisoned");
+        let now = Instant::now();
+        let window_start = now - Duration::from_secs(60);
+        let queue = events.entry(key.to_string()).or_default();
+        while queue.front().is_some_and(|t| *t < window_start) {
+            queue.pop_front();
+        }
+        if queue.len() >= limit_per_minute as usize {
+            return false;
+        }
+        queue.push_back(now);
+        true
+    }
+}
+
+static API_POLICY: OnceLock<RwLock<ApiPolicy>> = OnceLock::new();
+static API_METRICS: OnceLock<ApiMetrics> = OnceLock::new();
+static RATE_LIMITER: OnceLock<SlidingWindowRateLimiter> = OnceLock::new();
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ── Exec Types ────────────────────────────────────────────────────────
 
@@ -181,6 +282,7 @@ pub enum WsShellOutput {
         write_file_handler,
         shell_ws,
         get_logs,
+        metrics_handler,
     ),
     components(schemas(
         VmResponse,
@@ -222,6 +324,121 @@ struct ApiDoc;
 )]
 struct PortForwardApiDoc;
 
+fn policy_lock() -> &'static RwLock<ApiPolicy> {
+    API_POLICY.get_or_init(|| RwLock::new(ApiPolicy::default()))
+}
+
+fn metrics() -> &'static ApiMetrics {
+    API_METRICS.get_or_init(ApiMetrics::new)
+}
+
+fn rate_limiter() -> &'static SlidingWindowRateLimiter {
+    RATE_LIMITER.get_or_init(SlidingWindowRateLimiter::default)
+}
+
+fn current_policy() -> ApiPolicy {
+    policy_lock()
+        .read()
+        .expect("api policy lock poisoned")
+        .clone()
+}
+
+pub fn set_policy(policy: ApiPolicy) {
+    *policy_lock().write().expect("api policy lock poisoned") = policy;
+}
+
+fn error_response(code: &str, message: impl Into<String>) -> Json<ErrorResponse> {
+    let message = message.into();
+    Json(ErrorResponse {
+        code: code.to_string(),
+        message: message.clone(),
+        hint: None,
+        details: None,
+        error: Some(message),
+    })
+}
+
+fn error_response_with_hint(
+    code: &str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> Json<ErrorResponse> {
+    let message = message.into();
+    Json(ErrorResponse {
+        code: code.to_string(),
+        message: message.clone(),
+        hint: Some(hint.into()),
+        details: None,
+        error: Some(message),
+    })
+}
+
+fn normalize_guest_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for comp in StdPath::new(path).components() {
+        match comp {
+            Component::RootDir => {}
+            Component::Normal(seg) => out.push(seg.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(format!("/{}", out.join("/")))
+}
+
+fn is_allowed_guest_path(path: &str, allowlist: &[String]) -> bool {
+    let Some(normalized) = normalize_guest_path(path) else {
+        return false;
+    };
+    if allowlist.is_empty() {
+        return true;
+    }
+    allowlist.iter().any(|prefix| {
+        let Some(p) = normalize_guest_path(prefix) else {
+            return false;
+        };
+        normalized == p || normalized.starts_with(&(p + "/"))
+    })
+}
+
+fn exec_command_allowed(command: &str, policy: &ApiPolicy) -> bool {
+    if policy.exec_denylist.iter().any(|c| c == command) {
+        return false;
+    }
+    if policy.exec_allowlist.is_empty() {
+        return true;
+    }
+    policy.exec_allowlist.iter().any(|c| c == command)
+}
+
+fn exec_env_allowed(env: &HashMap<String, String>, policy: &ApiPolicy) -> bool {
+    if policy.exec_env_allowlist.is_empty() {
+        return true;
+    }
+    env.keys()
+        .all(|k| policy.exec_env_allowlist.iter().any(|allowed| allowed == k))
+}
+
+fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'static str> {
+    if *method == Method::POST && path.ends_with("/exec") {
+        return Some("exec");
+    }
+    if *method == Method::POST && path.ends_with("/files/read") {
+        return Some("file_read");
+    }
+    if *method == Method::POST && path.ends_with("/files/write") {
+        return Some("file_write");
+    }
+    if *method == Method::GET && path.ends_with("/shell") {
+        return Some("shell");
+    }
+    None
+}
+
 // ── Router ────────────────────────────────────────────────────────────
 
 /// Build the API router.
@@ -237,6 +454,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
     core: Arc<HuskCore<B>>,
     auth_token: Option<String>,
 ) -> Router {
+    let policy = current_policy();
     let router = Router::new()
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
@@ -247,7 +465,8 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
         .route("/v1/vms/{name}/shell", get(shell_ws::<B>))
-        .route("/v1/vms/{name}/logs", get(get_logs::<B>));
+        .route("/v1/vms/{name}/logs", get(get_logs::<B>))
+        .route("/v1/metrics", get(metrics_handler::<B>));
 
     #[cfg(feature = "linux-net")]
     let router = router
@@ -284,6 +503,8 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
     };
 
     router
+        .layer(DefaultBodyLimit::max(policy.max_request_bytes))
+        .layer(axum::middleware::from_fn(rate_limit_middleware))
         .layer(axum::middleware::from_fn(trace_request))
         .with_state(core)
 }
@@ -340,20 +561,68 @@ async fn shutdown_signal() {
 // ── Middleware ─────────────────────────────────────────────────────────
 
 async fn trace_request(
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    metrics().requests_total.fetch_add(1, Ordering::Relaxed);
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            format!("req-{n}")
+        });
+    if let Ok(val) = HeaderValue::from_str(&request_id) {
+        req.headers_mut().insert("x-request-id", val);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let start = std::time::Instant::now();
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        metrics().errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Ok(val) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", val);
+    }
     info!(
+        request_id = %request_id,
         %method,
         %path,
         status = response.status().as_u16(),
         elapsed_ms = start.elapsed().as_millis() as u64,
     );
     response
+}
+
+async fn rate_limit_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let policy = current_policy();
+    if let Some(kind) = is_rate_limited_route(req.method(), req.uri().path()) {
+        let client = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("local");
+        let key = format!("{kind}:{client}");
+        if !rate_limiter().allow(&key, policy.sensitive_rate_limit_per_minute) {
+            metrics().rate_limited_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                error_response_with_hint(
+                    "rate_limited",
+                    "too many requests to sensitive endpoint",
+                    "retry after a short delay",
+                ),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 fn is_protected_route(method: &Method, path: &str) -> bool {
@@ -385,9 +654,11 @@ async fn auth_middleware(
 
     (
         StatusCode::UNAUTHORIZED,
-        Json(ErrorResponse {
-            error: "unauthorized: missing or invalid bearer token".into(),
-        }),
+        error_response_with_hint(
+            "unauthorized",
+            "unauthorized: missing or invalid bearer token",
+            "set Authorization: Bearer <token>",
+        ),
     )
         .into_response()
 }
@@ -403,18 +674,41 @@ async fn auth_middleware(
     )
 )]
 async fn health<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> Json<HealthResponse> {
-    let (total, running) = match core.list_vms() {
+    let (total, running, state_db_ok) = match core.list_vms() {
         Ok(vms) => {
             let total = vms.len() as u64;
             let running = vms.iter().filter(|v| v.state == "running").count() as u64;
-            (total, running)
+            (total, running, true)
         }
-        Err(_) => (0, 0),
+        Err(_) => (0, 0, false),
     };
+    let mut checks = HashMap::new();
+    checks.insert(
+        "state_db".into(),
+        if state_db_ok {
+            "ok".into()
+        } else {
+            "degraded".into()
+        },
+    );
+    checks.insert(
+        "vmm_backend".into(),
+        if state_db_ok {
+            "ok".into()
+        } else {
+            "degraded".into()
+        },
+    );
+    #[cfg(feature = "linux-net")]
+    checks.insert("network_backend".into(), "ok".into());
+    #[cfg(not(feature = "linux-net"))]
+    checks.insert("network_backend".into(), "n/a".into());
     Json(HealthResponse {
         status: "ok".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         vms: VmCounts { total, running },
+        checks,
+        uptime_seconds: metrics().start.elapsed().as_secs(),
     })
 }
 
@@ -423,12 +717,68 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub vms: VmCounts,
+    pub checks: HashMap<String, String>,
+    pub uptime_seconds: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VmCounts {
     pub total: u64,
     pub running: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/metrics",
+    tag = "health",
+    responses(
+        (status = 200, description = "Prometheus metrics", content_type = "text/plain")
+    )
+)]
+async fn metrics_handler<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> String {
+    let (total, running) = core
+        .list_vms()
+        .map(|vms| {
+            (
+                vms.len() as u64,
+                vms.iter().filter(|vm| vm.state == "running").count() as u64,
+            )
+        })
+        .unwrap_or((0, 0));
+
+    let m = metrics();
+    format!(
+        "# TYPE husk_api_requests_total counter\n\
+husk_api_requests_total {}\n\
+# TYPE husk_api_errors_total counter\n\
+husk_api_errors_total {}\n\
+# TYPE husk_api_rate_limited_total counter\n\
+husk_api_rate_limited_total {}\n\
+# TYPE husk_exec_total counter\n\
+husk_exec_total {}\n\
+# TYPE husk_file_reads_total counter\n\
+husk_file_reads_total {}\n\
+# TYPE husk_file_writes_total counter\n\
+husk_file_writes_total {}\n\
+# TYPE husk_shell_sessions_total counter\n\
+husk_shell_sessions_total {}\n\
+# TYPE husk_vms_total gauge\n\
+husk_vms_total {}\n\
+# TYPE husk_vms_running gauge\n\
+husk_vms_running {}\n\
+# TYPE husk_api_uptime_seconds gauge\n\
+husk_api_uptime_seconds {}\n",
+        m.requests_total.load(Ordering::Relaxed),
+        m.errors_total.load(Ordering::Relaxed),
+        m.rate_limited_total.load(Ordering::Relaxed),
+        m.exec_total.load(Ordering::Relaxed),
+        m.file_reads_total.load(Ordering::Relaxed),
+        m.file_writes_total.load(Ordering::Relaxed),
+        m.shell_sessions_total.load(Ordering::Relaxed),
+        total,
+        running,
+        m.start.elapsed().as_secs(),
+    )
 }
 
 #[utoipa::path(
@@ -587,6 +937,27 @@ async fn exec_vm<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let policy = current_policy();
+    if !exec_command_allowed(&req.command, &policy) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            error_response_with_hint(
+                "policy_exec_command_denied",
+                format!("command '{}' is blocked by execution policy", req.command),
+                "adjust exec allow/deny policy",
+            ),
+        ));
+    }
+    if !exec_env_allowed(&req.env, &policy) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            error_response_with_hint(
+                "policy_exec_env_denied",
+                "one or more environment keys are not allowed",
+                "adjust exec env allowlist policy",
+            ),
+        ));
+    }
     info!(
         audit = "exec_request",
         vm = %name,
@@ -605,10 +976,23 @@ async fn exec_vm<B: VmmBackend + 'static>(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let result = conn
-        .exec(&req.command, &args, req.working_dir.as_deref(), &env)
-        .await
-        .map_err(|e| map_error(e.into()))?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(policy.exec_timeout_secs.max(1)),
+        conn.exec(&req.command, &args, req.working_dir.as_deref(), &env),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            error_response_with_hint(
+                "exec_timeout",
+                "command execution timed out",
+                "increase exec timeout policy or optimize guest command runtime",
+            ),
+        )
+    })?
+    .map_err(|e| map_error(e.into()))?;
+    metrics().exec_total.fetch_add(1, Ordering::Relaxed);
     info!(
         audit = "exec_result",
         vm = %name,
@@ -641,6 +1025,17 @@ async fn read_file_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<Json<ReadFileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let policy = current_policy();
+    if !is_allowed_guest_path(&req.path, &policy.allowed_read_paths) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            error_response_with_hint(
+                "policy_read_path_denied",
+                format!("guest path '{}' is not allowed for read", req.path),
+                "set allowed_read_paths in daemon config",
+            ),
+        ));
+    }
     info!(audit = "read_file_request", vm = %name, path = %req.path);
     let mut conn = core
         .agent_connect(&name)
@@ -650,7 +1045,22 @@ async fn read_file_handler<B: VmmBackend + 'static>(
         .read_file(&req.path)
         .await
         .map_err(|e| map_error(e.into()))?;
+    if data.len() > policy.max_file_read_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_response_with_hint(
+                "read_file_too_large",
+                format!(
+                    "read result exceeds limit ({} bytes > {} bytes)",
+                    data.len(),
+                    policy.max_file_read_bytes
+                ),
+                "increase max_file_read_bytes policy if needed",
+            ),
+        ));
+    }
     let size = data.len() as u64;
+    metrics().file_reads_total.fetch_add(1, Ordering::Relaxed);
     info!(
         audit = "read_file_result",
         vm = %name,
@@ -681,6 +1091,17 @@ async fn write_file_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<WriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let policy = current_policy();
+    if !is_allowed_guest_path(&req.path, &policy.allowed_write_paths) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            error_response_with_hint(
+                "policy_write_path_denied",
+                format!("guest path '{}' is not allowed for write", req.path),
+                "set allowed_write_paths in daemon config",
+            ),
+        ));
+    }
     info!(
         audit = "write_file_request",
         vm = %name,
@@ -691,11 +1112,27 @@ async fn write_file_handler<B: VmmBackend + 'static>(
     let data = husk_agent_proto::base64_decode(&req.data).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "invalid base64 in data field".into(),
-            }),
+            error_response_with_hint(
+                "invalid_base64",
+                "invalid base64 in data field",
+                "provide a valid base64 payload",
+            ),
         )
     })?;
+    if data.len() > policy.max_file_write_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_response_with_hint(
+                "write_file_too_large",
+                format!(
+                    "write payload exceeds limit ({} bytes > {} bytes)",
+                    data.len(),
+                    policy.max_file_write_bytes
+                ),
+                "increase max_file_write_bytes policy if needed",
+            ),
+        ));
+    }
     let mut conn = core
         .agent_connect(&name)
         .await
@@ -704,6 +1141,7 @@ async fn write_file_handler<B: VmmBackend + 'static>(
         .write_file(&req.path, &data, req.mode)
         .await
         .map_err(|e| map_error(e.into()))?;
+    metrics().file_writes_total.fetch_add(1, Ordering::Relaxed);
     info!(
         audit = "write_file_result",
         vm = %name,
@@ -777,6 +1215,9 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         rows,
         command = command.as_deref().unwrap_or("/bin/sh")
     );
+    metrics()
+        .shell_sessions_total
+        .fetch_add(1, Ordering::Relaxed);
 
     // Connect to the guest agent.
     let mut conn = match core.agent_connect(&name).await {
@@ -928,72 +1369,62 @@ async fn get_logs<B: VmmBackend + 'static>(
         if e.kind() == std::io::ErrorKind::NotFound {
             (
                 StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("no serial log for VM '{name}'"),
-                }),
+                error_response(
+                    "serial_log_not_found",
+                    format!("no serial log for VM '{name}'"),
+                ),
             )
         } else {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("reading serial log: {e}"),
-                }),
+                error_response("serial_log_read_failed", format!("reading serial log: {e}")),
             )
         }
     })?;
 
     let file_size = metadata.len();
-    let truncated = !params.follow && file_size > LOG_MAX_READ_BYTES;
-
-    let content = if truncated {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("reading serial log: {e}"),
-                }),
-            )
-        })?;
-        file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
-            .await
-            .map_err(|e| {
+    if params.follow {
+        // Bounded preload: for follow mode never load more than 1 MiB.
+        let mut initial_content = if file_size > LOG_MAX_READ_BYTES {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("seeking serial log: {e}"),
-                    }),
+                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
                 )
             })?;
-        let mut buf = String::new();
-        file.read_to_string(&mut buf).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("reading serial log: {e}"),
-                }),
-            )
-        })?;
-        format!("[... truncated, showing last 1 MiB ...]\n{buf}")
-    } else {
-        tokio::fs::read_to_string(&log_path).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("reading serial log: {e}"),
-                }),
-            )
-        })?
-    };
-
-    if params.follow {
-        let initial_content = if let Some(n) = params.tail {
-            tail_lines(&content, n)
+            file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_response(
+                            "serial_log_seek_failed",
+                            format!("seeking serial log: {e}"),
+                        ),
+                    )
+                })?;
+            let mut buf = String::new();
+            file.read_to_string(&mut buf).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                )
+            })?;
+            format!("[... truncated, showing last 1 MiB ...]\n{buf}")
         } else {
-            content.clone()
+            tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                )
+            })?
         };
+        if let Some(n) = params.tail {
+            initial_content = tail_lines(&initial_content, n);
+        }
 
-        let mut offset = content.len() as u64;
+        let mut offset = file_size;
         let initial = axum::body::Bytes::from(initial_content.into_bytes());
 
         let stream = async_stream::stream! {
@@ -1009,6 +1440,11 @@ async fn get_logs<B: VmmBackend + 'static>(
                 match tokio::fs::metadata(&log_path).await {
                     Ok(meta) => {
                         let len = meta.len();
+                        if len < offset {
+                            offset = 0;
+                            let notice = b"\n[... serial log rotated or truncated ...]\n".to_vec();
+                            yield Ok(axum::body::Bytes::from(notice));
+                        }
                         if len > offset {
                             match tokio::fs::File::open(&log_path).await {
                                 Ok(mut file) => {
@@ -1053,6 +1489,43 @@ async fn get_logs<B: VmmBackend + 'static>(
             .body(body)
             .expect("static response builder"))
     } else {
+        let truncated = file_size > LOG_MAX_READ_BYTES;
+        let content = if truncated {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                )
+            })?;
+            file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_response(
+                            "serial_log_seek_failed",
+                            format!("seeking serial log: {e}"),
+                        ),
+                    )
+                })?;
+            let mut buf = String::new();
+            file.read_to_string(&mut buf).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                )
+            })?;
+            format!("[... truncated, showing last 1 MiB ...]\n{buf}")
+        } else {
+            tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                )
+            })?
+        };
+
         let output = if let Some(n) = params.tail {
             tail_lines(&content, n)
         } else {
@@ -1167,16 +1640,45 @@ async fn remove_port_forward_handler<B: VmmBackend + 'static>(
 // ── Error Mapping ─────────────────────────────────────────────────────
 
 fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
-    let (status, message) = match &err {
-        CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
-        CoreError::InvalidState { .. } => (StatusCode::CONFLICT, err.to_string()),
-        CoreError::VmAlreadyExists(_) => (StatusCode::CONFLICT, err.to_string()),
-        CoreError::Agent(husk_core::AgentError::NotReady(_)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+    let (status, code, message) = match &err {
+        CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, "vm_not_found", err.to_string()),
+        CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state", err.to_string()),
+        CoreError::VmAlreadyExists(_) => {
+            (StatusCode::CONFLICT, "vm_already_exists", err.to_string())
         }
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        CoreError::Agent(husk_core::AgentError::NotReady(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_not_ready",
+            err.to_string(),
+        ),
+        CoreError::Storage(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            err.to_string(),
+        ),
+        CoreError::State(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_error",
+            err.to_string(),
+        ),
+        CoreError::Vmm(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "vmm_error",
+            err.to_string(),
+        ),
+        #[cfg(feature = "linux-net")]
+        CoreError::Network(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "network_error",
+            err.to_string(),
+        ),
+        CoreError::Agent(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_error",
+            err.to_string(),
+        ),
     };
-    (status, Json(ErrorResponse { error: message }))
+    (status, error_response(code, message))
 }
 
 fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
@@ -1188,9 +1690,11 @@ fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) 
         | CoreError::Agent(husk_core::AgentError::VsockConnectRejected(_))
         | CoreError::Agent(husk_core::AgentError::NotReady(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("agent not ready: {err}"),
-            }),
+            error_response_with_hint(
+                "agent_not_ready",
+                format!("agent not ready: {err}"),
+                "retry after the VM boot sequence has completed",
+            ),
         ),
         other => map_error(other),
     }
@@ -1479,6 +1983,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn normalize_guest_path_rejects_parent_traversal() {
+        assert_eq!(normalize_guest_path("/var/log/../tmp"), None);
+        assert_eq!(
+            normalize_guest_path("/var//log/./kernel"),
+            Some("/var/log/kernel".into())
+        );
+    }
+
+    #[test]
+    fn allowlist_path_enforcement() {
+        let allow = vec!["/tmp".to_string(), "/var/log".to_string()];
+        assert!(is_allowed_guest_path("/tmp/test.txt", &allow));
+        assert!(is_allowed_guest_path("/var/log/kern.log", &allow));
+        assert!(!is_allowed_guest_path("/etc/passwd", &allow));
+    }
+
+    #[test]
+    fn exec_policy_allow_deny_and_env() {
+        let mut policy = ApiPolicy {
+            exec_allowlist: vec!["echo".into(), "ls".into()],
+            exec_denylist: vec!["rm".into()],
+            exec_env_allowlist: vec!["PATH".into(), "HOME".into()],
+            ..ApiPolicy::default()
+        };
+        assert!(exec_command_allowed("echo", &policy));
+        assert!(!exec_command_allowed("rm", &policy));
+        assert!(!exec_command_allowed("cat", &policy));
+
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        assert!(exec_env_allowed(&env, &policy));
+        env.insert("LD_PRELOAD".to_string(), "x".to_string());
+        assert!(!exec_env_allowed(&env, &policy));
+
+        policy.exec_allowlist.clear();
+        assert!(exec_command_allowed("cat", &policy));
+    }
+
+    #[test]
+    fn rate_limiter_blocks_when_limit_reached() {
+        let limiter = SlidingWindowRateLimiter::default();
+        assert!(limiter.allow("k", 2));
+        assert!(limiter.allow("k", 2));
+        assert!(!limiter.allow("k", 2));
     }
 
     // ── tail_lines unit tests ─────────────────────────────────────────
