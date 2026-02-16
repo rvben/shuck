@@ -618,74 +618,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::PortForward { name, action } => {
-            let client = reqwest::Client::new();
-            match action {
-                PortForwardAction::Add {
-                    host_port,
-                    guest_port,
-                } => {
-                    let resp = api_request(
-                        client
-                            .post(format!("{}/v1/vms/{name}/ports", cli.api_url))
-                            .json(&serde_json::json!({
-                                "host_port": host_port,
-                                "guest_port": guest_port,
-                            })),
-                    )
-                    .await?;
-                    if resp.status().is_success() {
-                        println!("Port forward added: {host_port} -> {name}:{guest_port}");
-                    } else {
-                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                        std::process::exit(1);
-                    }
-                }
-                PortForwardAction::Remove { host_port } => {
-                    let resp = api_request(
-                        client.delete(format!("{}/v1/vms/{name}/ports/{host_port}", cli.api_url)),
-                    )
-                    .await?;
-                    if resp.status().is_success() {
-                        println!("Port forward removed: {host_port}");
-                    } else {
-                        eprintln!(
-                            "Error: {}",
-                            api_error(resp, &format!("port forward {host_port}")).await
-                        );
-                        std::process::exit(1);
-                    }
-                }
-                PortForwardAction::List => {
-                    let resp =
-                        api_request(client.get(format!("{}/v1/vms/{name}/ports", cli.api_url)))
-                            .await?;
-                    if !resp.status().is_success() {
-                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                        std::process::exit(1);
-                    }
-
-                    let forwards: Vec<serde_json::Value> = resp.json().await?;
-                    if forwards.is_empty() {
-                        println!("No port forwards for {name}");
-                    } else {
-                        println!(
-                            "{:<12} {:<12} {:<10}",
-                            "HOST PORT", "GUEST PORT", "PROTOCOL"
-                        );
-                        for pf in forwards {
-                            println!(
-                                "{:<12} {:<12} {:<10}",
-                                pf["host_port"],
-                                pf["guest_port"],
-                                pf["protocol"].as_str().unwrap_or("tcp"),
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
+        Commands::PortForward { name, action } => port_forward(cli.api_url, name, action).await,
         Commands::Logs { name, follow, tail } => {
             let mut url = format!("{}/v1/vms/{name}/logs", cli.api_url);
             let mut params = Vec::new();
@@ -735,6 +668,84 @@ async fn main() -> Result<()> {
             run_shell(cli.api_url, cli.config, name, command).await
         }
     }
+}
+
+#[cfg(not(feature = "linux-net"))]
+async fn port_forward(_api_url: String, _name: String, _action: PortForwardAction) -> Result<()> {
+    eprintln!("Error: port forwarding is not supported on this platform");
+    eprintln!();
+    eprintln!("Port forwarding requires Linux with Firecracker and nftables.");
+    eprintln!("On macOS, guests use shared NAT via Virtualization.framework");
+    eprintln!("and can reach the host network, but inbound port mapping is");
+    eprintln!("not available.");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "linux-net")]
+async fn port_forward(api_url: String, name: String, action: PortForwardAction) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        PortForwardAction::Add {
+            host_port,
+            guest_port,
+        } => {
+            let resp = api_request(
+                client
+                    .post(format!("{}/v1/vms/{name}/ports", api_url))
+                    .json(&serde_json::json!({
+                        "host_port": host_port,
+                        "guest_port": guest_port,
+                    })),
+            )
+            .await?;
+            if resp.status().is_success() {
+                println!("Port forward added: {host_port} -> {name}:{guest_port}");
+            } else {
+                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
+                std::process::exit(1);
+            }
+        }
+        PortForwardAction::Remove { host_port } => {
+            let resp =
+                api_request(client.delete(format!("{}/v1/vms/{name}/ports/{host_port}", api_url)))
+                    .await?;
+            if resp.status().is_success() {
+                println!("Port forward removed: {host_port}");
+            } else {
+                eprintln!(
+                    "Error: {}",
+                    api_error(resp, &format!("port forward {host_port}")).await
+                );
+                std::process::exit(1);
+            }
+        }
+        PortForwardAction::List => {
+            let resp = api_request(client.get(format!("{}/v1/vms/{name}/ports", api_url))).await?;
+            if !resp.status().is_success() {
+                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
+                std::process::exit(1);
+            }
+
+            let forwards: Vec<serde_json::Value> = resp.json().await?;
+            if forwards.is_empty() {
+                println!("No port forwards for {name}");
+            } else {
+                println!(
+                    "{:<12} {:<12} {:<10}",
+                    "HOST PORT", "GUEST PORT", "PROTOCOL"
+                );
+                for pf in forwards {
+                    println!(
+                        "{:<12} {:<12} {:<10}",
+                        pf["host_port"],
+                        pf["guest_port"],
+                        pf["protocol"].as_str().unwrap_or("tcp"),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 use husk_api::{WsShellInput, WsShellOutput};
