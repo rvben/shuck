@@ -313,6 +313,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn roundtrip_exec_request() {
@@ -557,6 +558,41 @@ mod tests {
                 assert_eq!(s.exit_code, 0);
             }
             _ => panic!("expected ShellExit response"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_base64_roundtrip(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let encoded = base64_encode(&data);
+            let decoded = base64_decode(&encoded).unwrap();
+            prop_assert_eq!(decoded, data);
+        }
+
+        #[test]
+        fn prop_frame_roundtrip_random_exec(
+            cmd in ".*",
+            args in proptest::collection::vec(".*", 0..8),
+            wd in proptest::option::of(".*")
+        ) {
+            let req = AgentRequest::Exec(ExecRequest {
+                command: cmd.clone(),
+                args: args.clone(),
+                working_dir: wd.clone(),
+                env: Vec::new(),
+            });
+            let encoded = encode_message(&req).unwrap();
+            let decoded: Option<(AgentRequest, usize)> = decode_message(&encoded).unwrap();
+            let (decoded, consumed) = decoded.unwrap();
+            prop_assert_eq!(consumed, encoded.len());
+            match decoded {
+                AgentRequest::Exec(exec) => {
+                    prop_assert_eq!(exec.command, cmd);
+                    prop_assert_eq!(exec.args, args);
+                    prop_assert_eq!(exec.working_dir, wd);
+                }
+                other => prop_assert!(false, "unexpected decoded variant: {other:?}"),
+            }
         }
     }
 }
