@@ -1,3 +1,5 @@
+//! Core orchestration layer for VM lifecycle, agent connectivity, and recovery logic.
+
 pub mod agent_client;
 
 #[cfg(feature = "linux-net")]

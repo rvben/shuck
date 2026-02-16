@@ -21,6 +21,37 @@
 #   Linux default: <data_dir>/kernels/vmlinux       (uncompressed x86_64 ELF)
 # default_kernel = "/var/lib/husk/kernels/vmlinux"
 
+# ── API Security and Limits ─────────────────────────────────────────
+
+# Optional bearer token required by mutating and shell endpoints.
+# Set this in production or whenever daemon binds beyond localhost.
+# api_token = "replace-with-a-long-random-token"
+
+# Global max HTTP request body size accepted by the API (bytes).
+# api_max_request_bytes = 2097152
+
+# Max bytes returned by files/read endpoint before request is rejected.
+# api_max_file_read_bytes = 1048576
+
+# Max decoded bytes accepted by files/write endpoint.
+# api_max_file_write_bytes = 1048576
+
+# Sliding-window limit for sensitive API routes per client per minute.
+# A value of 0 disables rate limiting.
+# api_sensitive_rate_limit_per_minute = 120
+
+# Allowed guest path prefixes for read and write operations.
+# Empty lists allow all absolute guest paths.
+# allowed_read_paths = ["/tmp", "/var/log"]
+# allowed_write_paths = ["/tmp", "/var/tmp"]
+
+# Exec policy controls.
+# Empty allowlist permits all commands not explicitly denied.
+# exec_timeout_secs = 30
+# exec_allowlist = ["echo", "ls", "cat"]
+# exec_denylist = ["rm", "mkfs", "dd"]
+# exec_env_allowlist = ["PATH", "HOME", "TERM"]
+
 # ── Firecracker (Linux only) ─────────────────────────────────────────
 
 # Path to the Firecracker binary. Must be on a filesystem that supports

@@ -1,3 +1,5 @@
+//! Linux networking helpers for bridge/TAP lifecycle, NAT, and port forwarding.
+
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;

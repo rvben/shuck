@@ -1,3 +1,5 @@
+//! Guest-side agent handlers for exec, file transfer, and interactive shell services.
+
 mod pty;
 
 use std::os::fd::AsRawFd;

@@ -1,3 +1,5 @@
+//! HTTP API surface for husk, including OpenAPI docs, auth, policy, and shell/log endpoints.
+
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Component, Path as StdPath};

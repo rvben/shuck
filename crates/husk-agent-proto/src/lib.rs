@@ -1,3 +1,5 @@
+//! Shared host/guest protocol messages and framing helpers for husk agent communication.
+
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

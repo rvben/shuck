@@ -79,6 +79,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make coverage-ci
 
+  mutation:
+    name: Mutation Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-mutants --locked
+      - run: make mutation-gate
+
   graceful-shutdown:
     name: Graceful Shutdown Drill
     runs-on: ubuntu-latest

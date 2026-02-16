@@ -1,3 +1,5 @@
+//! SQLite-backed persistent state store for VM records, CID allocation, and port forwards.
+
 use std::path::Path;
 use std::sync::Mutex;
 

@@ -1,0 +1,41 @@
+# Testing Quality Gates
+
+## Mandatory CI gates
+
+- Unit/integration suite: `make test`
+- macOS compile/test lane: `make check-macos`, `make test-macos`
+- Contracts:
+  - OpenAPI contract tests
+  - CLI JSON output schema tests
+- Failure-injection lifecycle tests
+- Perf baseline regression test
+- Coverage threshold gate (`cargo llvm-cov`)
+- Mutation smoke gate (`cargo mutants --list --package husk-agent-proto`)
+- Dependency security/policy (`cargo audit`, `cargo deny`)
+
+## Gated suites
+
+- Ignored end-to-end suites are executed only when explicitly enabled:
+  - `HUSK_RUN_IGNORED_E2E=1`
+  - `HUSK_RUN_NET_E2E=1`
+- These lanes run in CI and nightly with environment gates.
+
+## Nightly lane
+
+- `make nightly-quality` runs:
+  - perf baseline
+  - failure injection
+  - mutation gate
+  - graceful shutdown drill
+  - chaos restart drill
+  - gated ignored e2e suites
+
+## Coverage policy
+
+- Workspace coverage floor:
+  - line >= 50%
+
+## Mutation policy
+
+- CI enforces mutation-tooling viability via `make mutation-gate`.
+- Scope is currently focused on protocol crate discovery and is tracked for expansion (`DEBT-005`).

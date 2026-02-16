@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
 all: lint test
 
@@ -121,6 +121,10 @@ test-perf-baseline:
 coverage-ci:
 	cargo llvm-cov --workspace --all-features --fail-under-lines 50 --lcov --output-path target/llvm-cov.info
 
+# Mutation-testing smoke gate (tooling + target discoverability).
+mutation-gate:
+	cargo mutants --list --package husk-agent-proto > /dev/null
+
 # Graceful shutdown drill (SIGTERM path)
 graceful-shutdown-drill:
 	scripts/ci/graceful_shutdown_drill.sh
@@ -130,7 +134,7 @@ chaos-tests:
 	scripts/ci/chaos_restart_drill.sh
 
 # Nightly long-run quality suite
-nightly-quality: test-perf-baseline test-failure-injection graceful-shutdown-drill chaos-tests test-e2e-gated test-net-e2e-gated
+nightly-quality: test-perf-baseline test-failure-injection mutation-gate graceful-shutdown-drill chaos-tests test-e2e-gated test-net-e2e-gated
 
 # Update guest rootfs image with latest agent binary and inittab.
 # Requires: aarch64-linux-musl-gcc cross-compiler, e2fsprogs (brew install e2fsprogs)

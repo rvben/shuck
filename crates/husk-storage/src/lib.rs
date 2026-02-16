@@ -1,3 +1,5 @@
+//! Storage utilities for validating kernels/rootfs images and cloning VM root disks.
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

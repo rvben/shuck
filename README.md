@@ -90,3 +90,8 @@ A systemd unit file is provided at `contrib/husk.service`.
 ## Links
 
 - [k3s on Husk](docs/k3s.md) - Running Kubernetes clusters on Firecracker VMs
+- [Quality Plan](docs/quality-plan/README.md) - Multi-aspect roadmap to 100/100 quality targets
+- [Threat Model](docs/security/threat-model.md) - STRIDE model and control mapping
+- [Hardening Guide](docs/security/hardening-guide.md) - Deployment security checklist
+- [Runbooks](docs/operations/runbooks.md) - Incident response quick reference
+- [Compatibility Policy](docs/compatibility.md) - API/CLI deprecation and compatibility rules
