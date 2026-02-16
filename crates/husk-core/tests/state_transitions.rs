@@ -260,35 +260,17 @@ async fn pause_stopped_vm_fails() {
 }
 
 #[tokio::test]
-async fn pause_paused_vm_fails() {
+async fn pause_paused_vm_is_noop() {
     let (core, _) = mock_core_with_vm("test-vm", "paused");
-    let err = core.pause_vm("test-vm").await.unwrap_err();
-
-    match err {
-        CoreError::InvalidState {
-            actual, expected, ..
-        } => {
-            assert_eq!(actual, "paused");
-            assert_eq!(expected, "running");
-        }
-        other => panic!("expected InvalidState, got: {other}"),
-    }
+    core.pause_vm("test-vm").await.unwrap();
+    assert_eq!(core.get_vm("test-vm").unwrap().state, "paused");
 }
 
 #[tokio::test]
-async fn resume_running_vm_fails() {
+async fn resume_running_vm_is_noop() {
     let (core, _) = mock_core_with_vm("test-vm", "running");
-    let err = core.resume_vm("test-vm").await.unwrap_err();
-
-    match err {
-        CoreError::InvalidState {
-            actual, expected, ..
-        } => {
-            assert_eq!(actual, "running");
-            assert_eq!(expected, "paused");
-        }
-        other => panic!("expected InvalidState, got: {other}"),
-    }
+    core.resume_vm("test-vm").await.unwrap();
+    assert_eq!(core.get_vm("test-vm").unwrap().state, "running");
 }
 
 #[tokio::test]
@@ -308,19 +290,10 @@ async fn resume_stopped_vm_fails() {
 }
 
 #[tokio::test]
-async fn stop_stopped_vm_fails() {
+async fn stop_stopped_vm_is_noop() {
     let (core, _) = mock_core_with_vm("test-vm", "stopped");
-    let err = core.stop_vm("test-vm").await.unwrap_err();
-
-    match err {
-        CoreError::InvalidState {
-            actual, expected, ..
-        } => {
-            assert_eq!(actual, "stopped");
-            assert_eq!(expected, "running or paused");
-        }
-        other => panic!("expected InvalidState, got: {other}"),
-    }
+    core.stop_vm("test-vm").await.unwrap();
+    assert_eq!(core.get_vm("test-vm").unwrap().state, "stopped");
 }
 
 // ── Nonexistent VM ───────────────────────────────────────────────────

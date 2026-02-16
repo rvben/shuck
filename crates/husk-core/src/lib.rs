@@ -380,15 +380,24 @@ impl<B: VmmBackend> HuskCore<B> {
     }
 
     /// Stop a running or paused VM.
+    ///
+    /// Idempotent: stopping an already stopped VM is a no-op.
     pub async fn stop_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "stopping VM");
         let record = self.lookup_vm(name)?;
-        if record.state != "running" && record.state != "paused" {
-            return Err(CoreError::InvalidState {
-                name: name.into(),
-                actual: record.state,
-                expected: "running or paused".into(),
-            });
+        match record.state.as_str() {
+            "running" | "paused" => {}
+            "stopped" => {
+                debug!(%name, "VM already stopped; stop is a no-op");
+                return Ok(());
+            }
+            _ => {
+                return Err(CoreError::InvalidState {
+                    name: name.into(),
+                    actual: record.state,
+                    expected: "running or paused".into(),
+                });
+            }
         }
         self.vmm.stop_vm(record.id).await?;
         self.state.update_vm_state(record.id, "stopped")?;
@@ -396,15 +405,24 @@ impl<B: VmmBackend> HuskCore<B> {
     }
 
     /// Pause a running VM.
+    ///
+    /// Idempotent: pausing an already paused VM is a no-op.
     pub async fn pause_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "pausing VM");
         let record = self.lookup_vm(name)?;
-        if record.state != "running" {
-            return Err(CoreError::InvalidState {
-                name: name.into(),
-                actual: record.state,
-                expected: "running".into(),
-            });
+        match record.state.as_str() {
+            "running" => {}
+            "paused" => {
+                debug!(%name, "VM already paused; pause is a no-op");
+                return Ok(());
+            }
+            _ => {
+                return Err(CoreError::InvalidState {
+                    name: name.into(),
+                    actual: record.state,
+                    expected: "running".into(),
+                });
+            }
         }
         self.vmm.pause_vm(record.id).await?;
         self.state.update_vm_state(record.id, "paused")?;
@@ -412,15 +430,24 @@ impl<B: VmmBackend> HuskCore<B> {
     }
 
     /// Resume a paused VM.
+    ///
+    /// Idempotent: resuming an already running VM is a no-op.
     pub async fn resume_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "resuming VM");
         let record = self.lookup_vm(name)?;
-        if record.state != "paused" {
-            return Err(CoreError::InvalidState {
-                name: name.into(),
-                actual: record.state,
-                expected: "paused".into(),
-            });
+        match record.state.as_str() {
+            "paused" => {}
+            "running" => {
+                debug!(%name, "VM already running; resume is a no-op");
+                return Ok(());
+            }
+            _ => {
+                return Err(CoreError::InvalidState {
+                    name: name.into(),
+                    actual: record.state,
+                    expected: "paused".into(),
+                });
+            }
         }
         self.vmm.resume_vm(record.id).await?;
         self.state.update_vm_state(record.id, "running")?;
