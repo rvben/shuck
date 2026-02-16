@@ -716,7 +716,8 @@ impl<B: VmmBackend> HuskCore<B> {
             protocol: "tcp".into(),
             created_at: chrono::Utc::now(),
         };
-        self.state
+        if let Err(e) = self
+            .state
             .insert_port_forward(&pf_record)
             .map_err(|e| match e {
                 husk_state::StateError::PortAlreadyForwarded(port) => {
@@ -726,7 +727,19 @@ impl<B: VmmBackend> HuskCore<B> {
                     })
                 }
                 other => CoreError::State(other),
-            })?;
+            })
+        {
+            if let Err(rollback_err) = husk_net::remove_port_forward(host_port, tap_name).await {
+                warn!(
+                    %name,
+                    host_port,
+                    tap = tap_name,
+                    error = %rollback_err,
+                    "failed to rollback nftables rule after state insert error"
+                );
+            }
+            return Err(e);
+        }
 
         info!(%name, host_port, guest_port, "port forward added");
         Ok(())
