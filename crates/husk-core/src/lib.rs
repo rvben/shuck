@@ -473,6 +473,82 @@ impl<B: VmmBackend> HuskCore<B> {
         Ok(self.runtime_dir.join(format!("{}.serial.log", record.id)))
     }
 
+    /// Stop all running and paused VMs during daemon shutdown.
+    ///
+    /// Returns the number of VMs that were drained. Errors on individual VMs
+    /// are logged but do not abort the drain.
+    pub async fn drain_vms(&self) -> usize {
+        let vms = match self.list_vms() {
+            Ok(vms) => vms,
+            Err(e) => {
+                warn!(error = %e, "failed to list VMs for drain");
+                return 0;
+            }
+        };
+
+        let mut count = 0;
+        for vm in vms {
+            if vm.state != "running" && vm.state != "paused" {
+                continue;
+            }
+            info!(name = %vm.name, state = %vm.state, "draining VM");
+            if let Err(e) = self.vmm.stop_vm(vm.id).await {
+                warn!(name = %vm.name, error = %e, "failed to stop VM during drain");
+            }
+            if let Err(e) = self.state.update_vm_state(vm.id, "stopped") {
+                warn!(name = %vm.name, error = %e, "failed to update state during drain");
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Rotate serial log files that exceed the size threshold.
+    ///
+    /// Scans `runtime_dir` for `*.serial.log` files larger than 10 MiB,
+    /// keeps the last 5 MiB using the copy-truncate pattern (safe for
+    /// Firecracker/VZ which hold the fd open).
+    ///
+    /// Returns the number of files rotated.
+    pub async fn rotate_serial_logs(&self) -> usize {
+        let entries = match std::fs::read_dir(&self.runtime_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to read runtime dir for log rotation");
+                return 0;
+            }
+        };
+
+        let mut rotated = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.ends_with(".serial.log") {
+                continue;
+            }
+
+            let metadata = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if metadata.len() <= LOG_ROTATE_THRESHOLD {
+                continue;
+            }
+
+            match rotate_log_file(&path, LOG_ROTATE_KEEP).await {
+                Ok(()) => {
+                    info!(path = %path.display(), "rotated serial log");
+                    rotated += 1;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to rotate serial log");
+                }
+            }
+        }
+        rotated
+    }
+
     /// Connect to the guest agent for a running VM.
     ///
     /// Delegates vsock connection to the VMM backend, which handles the
@@ -659,6 +735,41 @@ impl<B: VmmBackend> HuskCore<B> {
     }
 }
 
+/// Serial log files exceeding this size are eligible for rotation.
+const LOG_ROTATE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MiB
+
+/// How many bytes to keep when rotating a serial log.
+const LOG_ROTATE_KEEP: u64 = 5 * 1024 * 1024; // 5 MiB
+
+/// Truncate a log file, keeping only the last `keep_bytes`.
+///
+/// Uses the copy-truncate pattern: read tail, truncate, write back.
+/// Small data-loss window between read and truncate is acceptable
+/// for diagnostic serial console output.
+async fn rotate_log_file(path: &std::path::Path, keep_bytes: u64) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let file_len = tokio::fs::metadata(path).await?.len();
+    if file_len <= keep_bytes {
+        return Ok(());
+    }
+
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(file_len - keep_bytes))
+        .await?;
+    let mut buf = Vec::with_capacity(keep_bytes as usize);
+    file.read_to_end(&mut buf).await?;
+    drop(file);
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    file.write_all(&buf).await?;
+    Ok(())
+}
+
 /// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.
 #[cfg(feature = "linux-net")]
 async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
@@ -715,5 +826,56 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
             std::io::Error::other("umount failed"),
         ))),
         Err(e) => Err(CoreError::Storage(husk_storage::StorageError::Io(e))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rotate_log_file_truncates_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.serial.log");
+
+        // Write a 12 MiB file with a recognizable pattern at the end
+        let data: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        rotate_log_file(&path, LOG_ROTATE_KEEP).await.unwrap();
+
+        let result = std::fs::read(&path).unwrap();
+        assert!(
+            result.len() as u64 == LOG_ROTATE_KEEP,
+            "expected {} bytes, got {}",
+            LOG_ROTATE_KEEP,
+            result.len()
+        );
+        // The kept portion should match the tail of the original data
+        let expected_tail = &data[data.len() - LOG_ROTATE_KEEP as usize..];
+        assert_eq!(&result, expected_tail);
+    }
+
+    #[tokio::test]
+    async fn rotate_log_file_skips_small_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.serial.log");
+
+        let data = vec![0u8; 1024]; // 1 KiB
+        std::fs::write(&path, &data).unwrap();
+
+        rotate_log_file(&path, LOG_ROTATE_KEEP).await.unwrap();
+
+        let result = std::fs::read(&path).unwrap();
+        assert_eq!(result.len(), 1024, "small file should not be modified");
+    }
+
+    #[tokio::test]
+    async fn rotate_log_file_nonexistent_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.serial.log");
+
+        let result = rotate_log_file(&path, LOG_ROTATE_KEEP).await;
+        assert!(result.is_err());
     }
 }
