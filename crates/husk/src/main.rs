@@ -162,6 +162,21 @@ enum Commands {
         #[arg(long, short = 'n')]
         tail: Option<u64>,
     },
+
+    /// Print version information (client and daemon)
+    Version,
+
+    /// Configuration management
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Validate the configuration file
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -667,6 +682,30 @@ async fn main() -> Result<()> {
         Commands::Shell { name, command } => {
             run_shell(cli.api_url, cli.config, name, command).await
         }
+        Commands::Version => {
+            println!("husk {}", env!("CARGO_PKG_VERSION"));
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap();
+            if let Ok(resp) = client
+                .get(format!("{}/v1/health", cli.api_url))
+                .send()
+                .await
+                && resp.status().is_success()
+                && let Ok(health) = resp.json::<serde_json::Value>().await
+            {
+                let version = health["version"].as_str().unwrap_or("unknown");
+                let total = health["vms"]["total"].as_u64().unwrap_or(0);
+                let running = health["vms"]["running"].as_u64().unwrap_or(0);
+                println!("daemon {version} ({total} VMs, {running} running)");
+            }
+            Ok(())
+        }
+        Commands::Config { action } => match action {
+            ConfigAction::Check => check_config(cli.config.as_deref()),
+        },
     }
 }
 
@@ -1116,6 +1155,138 @@ fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
     Ok((base, prefix_len))
 }
 
+/// Check if a binary name can be found in PATH.
+#[cfg(feature = "linux-net")]
+fn find_in_path(name: &Path) -> Option<PathBuf> {
+    if name.is_absolute() {
+        return name.is_file().then(|| name.to_path_buf());
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Validate the configuration file and report results.
+fn check_config(explicit_path: Option<&Path>) -> Result<()> {
+    let path = resolve_config_path(explicit_path);
+    let mut all_ok = true;
+
+    let config = match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            println!("Config: {}", path.display());
+            match toml::from_str::<Config>(&contents) {
+                Ok(config) => config,
+                Err(e) => {
+                    println!("  parse .............. FAIL ({e})");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if explicit_path.is_some() {
+                println!("Config: {} (not found)", path.display());
+                println!("  config file .............. FAIL (not found)");
+                std::process::exit(1);
+            } else {
+                println!("Config: (defaults, no config file found)");
+                Config::default()
+            }
+        }
+        Err(e) => {
+            println!("Config: {}", path.display());
+            println!("  config file .............. FAIL ({e})");
+            std::process::exit(1);
+        }
+    };
+
+    // data_dir
+    let dd = &config.data_dir;
+    if dd.exists() {
+        println!("  data_dir ({}) ... OK", dd.display());
+    } else {
+        match std::fs::create_dir_all(dd) {
+            Ok(()) => {
+                println!("  data_dir ({}) ... OK (created)", dd.display());
+            }
+            Err(e) => {
+                println!("  data_dir ({}) ... FAIL ({e})", dd.display());
+                all_ok = false;
+            }
+        }
+    }
+
+    // default_kernel
+    let kernel = &config.default_kernel;
+    if kernel.is_file() {
+        println!("  default_kernel ({}) ... OK", kernel.display());
+    } else if kernel.exists() {
+        println!(
+            "  default_kernel ({}) ... FAIL (not a regular file)",
+            kernel.display()
+        );
+        all_ok = false;
+    } else {
+        println!(
+            "  default_kernel ({}) ... FAIL (not found)",
+            kernel.display()
+        );
+        all_ok = false;
+    }
+
+    #[cfg(feature = "linux-net")]
+    {
+        // firecracker_bin
+        let fc = &config.firecracker_bin;
+        match find_in_path(fc) {
+            Some(resolved) => {
+                if fc.is_absolute() {
+                    println!("  firecracker_bin ({}) ... OK", fc.display());
+                } else {
+                    println!(
+                        "  firecracker_bin ({}) ... OK ({})",
+                        fc.display(),
+                        resolved.display()
+                    );
+                }
+            }
+            None => {
+                println!("  firecracker_bin ({}) ... FAIL (not found)", fc.display());
+                all_ok = false;
+            }
+        }
+
+        // host_interface
+        let iface = &config.host_interface;
+        let iface_path = PathBuf::from(format!("/sys/class/net/{iface}"));
+        if iface_path.exists() {
+            println!("  host_interface ({iface}) ... OK");
+        } else {
+            println!("  host_interface ({iface}) ... FAIL (not found)");
+            all_ok = false;
+        }
+
+        // bridge_subnet
+        match parse_cidr(&config.bridge_subnet) {
+            Ok(_) => println!("  bridge_subnet ({}) ... OK", config.bridge_subnet),
+            Err(e) => {
+                println!("  bridge_subnet ({}) ... FAIL ({e})", config.bridge_subnet);
+                all_ok = false;
+            }
+        }
+    }
+
+    if all_ok {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
 async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     tracing::info!("starting husk daemon");
 
@@ -1170,10 +1341,12 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             config.dns_servers,
             runtime_dir.clone(),
         ));
-        husk_api::serve(core, listen).await?;
 
-        // Cleanup on graceful shutdown. axum::serve handles SIGINT/SIGTERM,
-        // so this code runs on normal daemon stop. If the process is killed
+        spawn_log_rotation(Arc::clone(&core));
+        husk_api::serve(Arc::clone(&core), listen).await?;
+        drain_vms_on_shutdown(&core).await;
+
+        // Network cleanup after VM drain. If the process is killed
         // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
         // handles the next launch.
         let _ = husk_net::cleanup_nat().await;
@@ -1191,8 +1364,41 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             storage,
             runtime_dir.clone(),
         ));
-        husk_api::serve(core, listen).await?;
+
+        spawn_log_rotation(Arc::clone(&core));
+        husk_api::serve(Arc::clone(&core), listen).await?;
+        drain_vms_on_shutdown(&core).await;
         Ok(())
+    }
+}
+
+/// Spawn a background task that rotates oversized serial logs every hour.
+fn spawn_log_rotation<B: husk_vmm::VmmBackend + 'static>(core: Arc<husk_core::HuskCore<B>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.tick().await; // first tick fires immediately, skip it
+        loop {
+            interval.tick().await;
+            let count = core.rotate_serial_logs().await;
+            if count > 0 {
+                tracing::info!(count, "rotated serial logs");
+            }
+        }
+    });
+}
+
+/// Drain all running/paused VMs with a 30-second timeout.
+async fn drain_vms_on_shutdown<B: husk_vmm::VmmBackend>(core: &husk_core::HuskCore<B>) {
+    tracing::info!("shutting down, draining VMs");
+    match tokio::time::timeout(std::time::Duration::from_secs(30), core.drain_vms()).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!(count, "drained VMs on shutdown");
+            }
+        }
+        Err(_) => {
+            tracing::warn!("VM drain timed out after 30s");
+        }
     }
 }
 
