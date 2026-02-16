@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit update-deps check-deps
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit update-deps check-deps setup
 
 all: lint test
 
@@ -152,3 +152,7 @@ update-deps:
 # Check for outdated dependencies
 check-deps:
 	upd --check
+
+# Install development dependencies
+setup:
+	cargo install cargo-nextest cargo-audit upd
