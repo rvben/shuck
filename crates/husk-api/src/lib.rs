@@ -587,6 +587,14 @@ async fn exec_vm<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<ErrorResponse>)> {
+    info!(
+        audit = "exec_request",
+        vm = %name,
+        command = %req.command,
+        args_count = req.args.len(),
+        env_count = req.env.len(),
+        has_working_dir = req.working_dir.is_some()
+    );
     let mut conn = core
         .agent_connect(&name)
         .await
@@ -601,6 +609,14 @@ async fn exec_vm<B: VmmBackend + 'static>(
         .exec(&req.command, &args, req.working_dir.as_deref(), &env)
         .await
         .map_err(|e| map_error(e.into()))?;
+    info!(
+        audit = "exec_result",
+        vm = %name,
+        command = %req.command,
+        exit_code = result.exit_code,
+        stdout_bytes = result.stdout.len(),
+        stderr_bytes = result.stderr.len()
+    );
     Ok(Json(ExecResponse {
         exit_code: result.exit_code,
         stdout: result.stdout,
@@ -625,6 +641,7 @@ async fn read_file_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<Json<ReadFileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    info!(audit = "read_file_request", vm = %name, path = %req.path);
     let mut conn = core
         .agent_connect(&name)
         .await
@@ -634,6 +651,12 @@ async fn read_file_handler<B: VmmBackend + 'static>(
         .await
         .map_err(|e| map_error(e.into()))?;
     let size = data.len() as u64;
+    info!(
+        audit = "read_file_result",
+        vm = %name,
+        path = %req.path,
+        size_bytes = size
+    );
     Ok(Json(ReadFileResponse {
         data: husk_agent_proto::base64_encode(&data),
         size,
@@ -658,6 +681,13 @@ async fn write_file_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<WriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    info!(
+        audit = "write_file_request",
+        vm = %name,
+        path = %req.path,
+        mode = req.mode,
+        payload_bytes = req.data.len()
+    );
     let data = husk_agent_proto::base64_decode(&req.data).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -674,6 +704,12 @@ async fn write_file_handler<B: VmmBackend + 'static>(
         .write_file(&req.path, &data, req.mode)
         .await
         .map_err(|e| map_error(e.into()))?;
+    info!(
+        audit = "write_file_result",
+        vm = %name,
+        path = %req.path,
+        bytes_written
+    );
     Ok(Json(WriteFileResponse { bytes_written }))
 }
 
@@ -694,6 +730,7 @@ async fn shell_ws<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    info!(audit = "shell_upgrade", vm = %name);
     ws.on_upgrade(move |socket| shell_ws_session(core, name, socket))
 }
 
@@ -733,6 +770,13 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         },
         _ => return,
     };
+    info!(
+        audit = "shell_start",
+        vm = %name,
+        cols,
+        rows,
+        command = command.as_deref().unwrap_or("/bin/sh")
+    );
 
     // Connect to the guest agent.
     let mut conn = match core.agent_connect(&name).await {
@@ -821,6 +865,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
                         }
                     }
                     Ok(ShellEvent::Exit(code)) => {
+                        info!(audit = "shell_exit", vm = %name, exit_code = code);
                         let _ = send_ws_output(&mut ws, &WsShellOutput::Exit { exit_code: code }).await;
                         break;
                     }
