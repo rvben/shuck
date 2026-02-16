@@ -822,7 +822,6 @@ fn record_to_response(r: VmRecord) -> VmResponse {
 mod tests {
     use super::*;
 
-    use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
     use axum::body::Body;
@@ -830,25 +829,43 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
+    fn make_core(
+        state: husk_state::StateStore,
+        storage: husk_storage::StorageConfig,
+        runtime_dir: PathBuf,
+    ) -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
             std::path::Path::new("/nonexistent"),
             std::path::Path::new("/tmp"),
         );
+
+        #[cfg(feature = "linux-net")]
+        {
+            let ip_allocator =
+                husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24);
+            Arc::new(HuskCore::new(
+                vmm,
+                state,
+                ip_allocator,
+                storage,
+                "husk0".into(),
+                vec!["8.8.8.8".into(), "1.1.1.1".into()],
+                runtime_dir,
+            ))
+        }
+
+        #[cfg(not(feature = "linux-net"))]
+        {
+            Arc::new(HuskCore::new(vmm, state, storage, runtime_dir))
+        }
+    }
+
+    fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
         let state = husk_state::StateStore::open_memory().unwrap();
-        let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
         let storage = husk_storage::StorageConfig {
             data_dir: PathBuf::from("/tmp/husk-test"),
         };
-        Arc::new(HuskCore::new(
-            vmm,
-            state,
-            ip_allocator,
-            storage,
-            "husk0".into(),
-            vec!["8.8.8.8".into(), "1.1.1.1".into()],
-            PathBuf::from("/tmp/husk-test/run"),
-        ))
+        make_core(state, storage, PathBuf::from("/tmp/husk-test/run"))
     }
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {

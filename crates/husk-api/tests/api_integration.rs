@@ -8,7 +8,6 @@
 //! - Testing concurrent request handling
 //! - Exercising the full middleware stack (tracing)
 
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,25 +19,42 @@ use tower::ServiceExt;
 use husk_api::{VmResponse, router};
 use husk_core::HuskCore;
 
-fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
+fn make_core(
+    state: husk_state::StateStore,
+    storage: husk_storage::StorageConfig,
+    runtime_dir: PathBuf,
+) -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
     let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
     );
+
+    #[cfg(feature = "linux-net")]
+    {
+        let ip_allocator = husk_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24);
+        Arc::new(HuskCore::new(
+            vmm,
+            state,
+            ip_allocator,
+            storage,
+            "husk0".into(),
+            vec!["8.8.8.8".into(), "1.1.1.1".into()],
+            runtime_dir,
+        ))
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    {
+        Arc::new(HuskCore::new(vmm, state, storage, runtime_dir))
+    }
+}
+
+fn test_core() -> Arc<HuskCore<husk_vmm::firecracker::FirecrackerBackend>> {
     let state = husk_state::StateStore::open_memory().unwrap();
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        PathBuf::from("/tmp/husk-test/run"),
-    ))
+    make_core(state, storage, PathBuf::from("/tmp/husk-test/run"))
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -101,23 +117,10 @@ async fn health_counts_vms_correctly() {
         state.insert_vm(&record).unwrap();
     }
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        PathBuf::from("/tmp/husk-test/run"),
-    ));
+    let core = make_core(state, storage, PathBuf::from("/tmp/husk-test/run"));
 
     let app = router(core);
     let response = app
@@ -437,23 +440,10 @@ async fn vm_response_json_structure() {
     state.insert_vm(&record).unwrap();
 
     // Build a core with this pre-populated state
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let populated_core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        PathBuf::from("/tmp/husk-test/run"),
-    ));
+    let populated_core = make_core(state, storage, PathBuf::from("/tmp/husk-test/run"));
 
     let app = router(populated_core.clone());
     let response = app
@@ -520,23 +510,10 @@ async fn list_vms_returns_all_records() {
         state.insert_vm(&record).unwrap();
     }
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        PathBuf::from("/tmp/husk-test/run"),
-    ));
+    let core = make_core(state, storage, PathBuf::from("/tmp/husk-test/run"));
 
     let app = router(core);
     let response = app
@@ -638,7 +615,10 @@ async fn write_file_missing_data_returns_422() {
 }
 
 // ── Port Forward Endpoints ───────────────────────────────────────────
+//
+// Port forward routes are only registered with the linux-net feature.
 
+#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn add_port_forward_nonexistent_vm_returns_404() {
     let app = router(test_core());
@@ -661,6 +641,7 @@ async fn add_port_forward_nonexistent_vm_returns_404() {
     assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
+#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn list_port_forwards_nonexistent_vm_returns_404() {
     let app = router(test_core());
@@ -678,6 +659,7 @@ async fn list_port_forwards_nonexistent_vm_returns_404() {
     assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
+#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn remove_port_forward_nonexistent_vm_returns_404() {
     let app = router(test_core());
@@ -695,6 +677,7 @@ async fn remove_port_forward_nonexistent_vm_returns_404() {
     assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
+#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn add_port_forward_missing_fields_returns_422() {
     let app = router(test_core());
@@ -714,6 +697,7 @@ async fn add_port_forward_missing_fields_returns_422() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn add_port_forward_invalid_json_returns_400() {
     let app = router(test_core());
@@ -730,6 +714,7 @@ async fn add_port_forward_invalid_json_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn list_port_forwards_empty_for_existing_vm() {
     let state = husk_state::StateStore::open_memory().unwrap();
@@ -755,23 +740,10 @@ async fn list_port_forwards_empty_for_existing_vm() {
     };
     state.insert_vm(&record).unwrap();
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        PathBuf::from("/tmp/husk-test/run"),
-    ));
+    let core = make_core(state, storage, PathBuf::from("/tmp/husk-test/run"));
 
     let app = router(core);
     let response = app
@@ -816,23 +788,10 @@ async fn vm_response_with_null_optional_fields() {
     };
     state.insert_vm(&record).unwrap();
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        PathBuf::from("/tmp/husk-test/run"),
-    ));
+    let core = make_core(state, storage, PathBuf::from("/tmp/husk-test/run"));
 
     let app = router(core);
     let response = app
@@ -901,23 +860,10 @@ async fn logs_returns_serial_output() {
     let serial_log = runtime_dir.path().join(format!("{vm_id}.serial.log"));
     std::fs::write(&serial_log, "Linux version 6.1.102\nBoot complete\n").unwrap();
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        runtime_dir.path().to_path_buf(),
-    ));
+    let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
     let app = router(core);
     let response = app
@@ -965,23 +911,10 @@ async fn logs_tail_returns_last_n_lines() {
     let serial_log = runtime_dir.path().join(format!("{vm_id}.serial.log"));
     std::fs::write(&serial_log, "line1\nline2\nline3\nline4\nline5\n").unwrap();
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        runtime_dir.path().to_path_buf(),
-    ));
+    let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
     let app = router(core);
     let response = app
@@ -1028,23 +961,10 @@ async fn logs_no_serial_file_returns_404() {
     state.insert_vm(&record).unwrap();
 
     // Do NOT create the serial log file
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        runtime_dir.path().to_path_buf(),
-    ));
+    let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
     let app = router(core);
     let response = app
@@ -1099,23 +1019,10 @@ fn logs_test_core(
         std::fs::write(&serial_log, content).unwrap();
     }
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        runtime_dir.path().to_path_buf(),
-    ));
+    let core = make_core(state, storage, runtime_dir.path().to_path_buf());
     (core, runtime_dir)
 }
 
@@ -1349,23 +1256,10 @@ async fn logs_large_file_is_truncated() {
     let large_content: String = line.repeat(repeat_count);
     std::fs::write(&serial_log, &large_content).unwrap();
 
-    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
-        std::path::Path::new("/nonexistent"),
-        std::path::Path::new("/tmp"),
-    );
-    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
     let storage = husk_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husk-test"),
     };
-    let core = Arc::new(HuskCore::new(
-        vmm,
-        state,
-        ip_allocator,
-        storage,
-        "husk0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        runtime_dir.path().to_path_buf(),
-    ));
+    let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
     let app = router(core);
     let response = app
