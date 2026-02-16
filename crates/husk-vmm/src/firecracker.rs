@@ -113,6 +113,21 @@ impl FirecrackerBackend {
             .ok_or_else(|| VmmError::InvalidConfig(format!("{label} is not valid UTF-8")))
     }
 
+    fn boot_source_payload(
+        kernel_image_path: &str,
+        boot_args: &str,
+        initrd_path: Option<&str>,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "kernel_image_path": kernel_image_path,
+            "boot_args": boot_args,
+        });
+        if let Some(initrd_path) = initrd_path {
+            payload["initrd_path"] = serde_json::json!(initrd_path);
+        }
+        payload
+    }
+
     /// Spawn a Firecracker process, configure it, and start the VM.
     ///
     /// Separated from `create_vm` so the caller can clean up the serial log
@@ -168,15 +183,19 @@ impl FirecrackerBackend {
         let kernel_path_str = Self::path_to_str(&config.kernel_path, "kernel_path")?;
         let rootfs_path_str = Self::path_to_str(&config.rootfs_path, "rootfs_path")?;
         let vsock_path_str = Self::path_to_str(vsock_path, "vsock_path")?;
+        let initrd_path_str = config
+            .initrd_path
+            .as_deref()
+            .map(|path| Self::path_to_str(path, "initrd_path"))
+            .transpose()?;
 
         // Boot source
+        let boot_source =
+            Self::boot_source_payload(kernel_path_str, &kernel_args, initrd_path_str);
         Self::fc_put(
             socket_path,
             "/boot-source",
-            &serde_json::json!({
-                "kernel_image_path": kernel_path_str,
-                "boot_args": kernel_args,
-            }),
+            &boot_source,
         )
         .await?;
 
@@ -542,6 +561,30 @@ mod tests {
             FirecrackerBackend::path_to_str(path, "test").unwrap(),
             "/tmp/test.sock"
         );
+    }
+
+    #[test]
+    fn boot_source_payload_omits_initrd_when_not_set() {
+        let payload =
+            FirecrackerBackend::boot_source_payload("/tmp/vmlinux", "console=ttyS0", None);
+        assert_eq!(payload["kernel_image_path"], "/tmp/vmlinux");
+        assert_eq!(payload["boot_args"], "console=ttyS0");
+        assert!(
+            payload.get("initrd_path").is_none(),
+            "initrd_path should be omitted when not configured"
+        );
+    }
+
+    #[test]
+    fn boot_source_payload_includes_initrd_when_set() {
+        let payload = FirecrackerBackend::boot_source_payload(
+            "/tmp/vmlinux",
+            "console=ttyS0",
+            Some("/tmp/initrd.img"),
+        );
+        assert_eq!(payload["kernel_image_path"], "/tmp/vmlinux");
+        assert_eq!(payload["boot_args"], "console=ttyS0");
+        assert_eq!(payload["initrd_path"], "/tmp/initrd.img");
     }
 
     #[tokio::test]
