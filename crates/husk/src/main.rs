@@ -1106,9 +1106,39 @@ fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
     PathBuf::from("/etc/husk/config.toml")
 }
 
+/// Apply environment variable overrides to the configuration.
+///
+/// Environment variables take precedence over file-based config.
+fn apply_env_overrides(config: &mut Config) {
+    if let Ok(val) = std::env::var("HUSK_DATA_DIR") {
+        config.data_dir = PathBuf::from(val);
+    }
+    if let Ok(val) = std::env::var("HUSK_DEFAULT_KERNEL") {
+        config.default_kernel = PathBuf::from(val);
+    }
+    #[cfg(feature = "linux-net")]
+    {
+        if let Ok(val) = std::env::var("HUSK_FIRECRACKER_BIN") {
+            config.firecracker_bin = PathBuf::from(val);
+        }
+        if let Ok(val) = std::env::var("HUSK_HOST_INTERFACE") {
+            config.host_interface = val;
+        }
+        if let Ok(val) = std::env::var("HUSK_BRIDGE_NAME") {
+            config.bridge_name = val;
+        }
+        if let Ok(val) = std::env::var("HUSK_BRIDGE_SUBNET") {
+            config.bridge_subnet = val;
+        }
+        if let Ok(val) = std::env::var("HUSK_DNS_SERVERS") {
+            config.dns_servers = val.split(',').map(|s| s.trim().to_string()).collect();
+        }
+    }
+}
+
 fn load_config(explicit_path: Option<&Path>) -> Config {
     let path = resolve_config_path(explicit_path);
-    match std::fs::read_to_string(&path) {
+    let mut config = match std::fs::read_to_string(&path) {
         Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
             eprintln!("Warning: invalid config file: {e}");
             Config::default()
@@ -1121,7 +1151,9 @@ fn load_config(explicit_path: Option<&Path>) -> Config {
             );
             Config::default()
         }
-    }
+    };
+    apply_env_overrides(&mut config);
+    config
 }
 
 /// Parse a CIDR string (e.g. "172.20.0.0/24") into base address and prefix length.
@@ -1204,17 +1236,28 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
         }
     };
 
+    let dd_from_env = std::env::var("HUSK_DATA_DIR").is_ok();
+    let kernel_from_env = std::env::var("HUSK_DEFAULT_KERNEL").is_ok();
+
     // data_dir
     let dd = &config.data_dir;
+    let dd_env_hint = if dd_from_env {
+        " (from HUSK_DATA_DIR)"
+    } else {
+        ""
+    };
     if dd.exists() {
-        println!("  data_dir ({}) ... OK", dd.display());
+        println!("  data_dir ({}) ... OK{dd_env_hint}", dd.display());
     } else {
         match std::fs::create_dir_all(dd) {
             Ok(()) => {
-                println!("  data_dir ({}) ... OK (created)", dd.display());
+                println!(
+                    "  data_dir ({}) ... OK (created){dd_env_hint}",
+                    dd.display()
+                );
             }
             Err(e) => {
-                println!("  data_dir ({}) ... FAIL ({e})", dd.display());
+                println!("  data_dir ({}) ... FAIL ({e}){dd_env_hint}", dd.display());
                 all_ok = false;
             }
         }
@@ -1222,17 +1265,25 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
 
     // default_kernel
     let kernel = &config.default_kernel;
+    let kernel_env_hint = if kernel_from_env {
+        " (from HUSK_DEFAULT_KERNEL)"
+    } else {
+        ""
+    };
     if kernel.is_file() {
-        println!("  default_kernel ({}) ... OK", kernel.display());
+        println!(
+            "  default_kernel ({}) ... OK{kernel_env_hint}",
+            kernel.display()
+        );
     } else if kernel.exists() {
         println!(
-            "  default_kernel ({}) ... FAIL (not a regular file)",
+            "  default_kernel ({}) ... FAIL (not a regular file){kernel_env_hint}",
             kernel.display()
         );
         all_ok = false;
     } else {
         println!(
-            "  default_kernel ({}) ... FAIL (not found)",
+            "  default_kernel ({}) ... FAIL (not found){kernel_env_hint}",
             kernel.display()
         );
         all_ok = false;
@@ -1240,41 +1291,69 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
 
     #[cfg(feature = "linux-net")]
     {
+        let fc_from_env = std::env::var("HUSK_FIRECRACKER_BIN").is_ok();
+        let iface_from_env = std::env::var("HUSK_HOST_INTERFACE").is_ok();
+        let subnet_from_env = std::env::var("HUSK_BRIDGE_SUBNET").is_ok();
+
         // firecracker_bin
         let fc = &config.firecracker_bin;
+        let fc_env_hint = if fc_from_env {
+            " (from HUSK_FIRECRACKER_BIN)"
+        } else {
+            ""
+        };
         match find_in_path(fc) {
             Some(resolved) => {
                 if fc.is_absolute() {
-                    println!("  firecracker_bin ({}) ... OK", fc.display());
+                    println!("  firecracker_bin ({}) ... OK{fc_env_hint}", fc.display());
                 } else {
                     println!(
-                        "  firecracker_bin ({}) ... OK ({})",
+                        "  firecracker_bin ({}) ... OK ({}){fc_env_hint}",
                         fc.display(),
                         resolved.display()
                     );
                 }
             }
             None => {
-                println!("  firecracker_bin ({}) ... FAIL (not found)", fc.display());
+                println!(
+                    "  firecracker_bin ({}) ... FAIL (not found){fc_env_hint}",
+                    fc.display()
+                );
                 all_ok = false;
             }
         }
 
         // host_interface
         let iface = &config.host_interface;
+        let iface_env_hint = if iface_from_env {
+            " (from HUSK_HOST_INTERFACE)"
+        } else {
+            ""
+        };
         let iface_path = PathBuf::from(format!("/sys/class/net/{iface}"));
         if iface_path.exists() {
-            println!("  host_interface ({iface}) ... OK");
+            println!("  host_interface ({iface}) ... OK{iface_env_hint}");
         } else {
-            println!("  host_interface ({iface}) ... FAIL (not found)");
+            println!("  host_interface ({iface}) ... FAIL (not found){iface_env_hint}");
             all_ok = false;
         }
 
         // bridge_subnet
+        let subnet_env_hint = if subnet_from_env {
+            " (from HUSK_BRIDGE_SUBNET)"
+        } else {
+            ""
+        };
         match parse_cidr(&config.bridge_subnet) {
-            Ok(_) => println!("  bridge_subnet ({}) ... OK", config.bridge_subnet),
+            Ok(_) => println!(
+                "  bridge_subnet ({}) ... OK{subnet_env_hint}",
+                config.bridge_subnet
+            ),
             Err(e) => {
-                println!("  bridge_subnet ({}) ... FAIL ({e})", config.bridge_subnet);
+                println!(
+                    "  bridge_subnet ({}) ... FAIL ({e}){subnet_env_hint}",
+                    config.bridge_subnet
+                );
                 all_ok = false;
             }
         }
@@ -1475,6 +1554,34 @@ mod tests {
         assert!(parse_octal_mode("999").is_err());
         assert!(parse_octal_mode("abc").is_err());
         assert!(parse_octal_mode("").is_err());
+    }
+
+    #[test]
+    fn env_override_data_dir() {
+        // SAFETY: test is single-threaded; no other threads read this env var.
+        unsafe { std::env::set_var("HUSK_DATA_DIR", "/tmp/husk-env-test") };
+        let config = load_config(None);
+        assert_eq!(config.data_dir, PathBuf::from("/tmp/husk-env-test"));
+        unsafe { std::env::remove_var("HUSK_DATA_DIR") };
+    }
+
+    #[test]
+    fn env_override_default_kernel() {
+        // SAFETY: test is single-threaded; no other threads read this env var.
+        unsafe { std::env::set_var("HUSK_DEFAULT_KERNEL", "/tmp/custom-kernel") };
+        let config = load_config(None);
+        assert_eq!(config.default_kernel, PathBuf::from("/tmp/custom-kernel"));
+        unsafe { std::env::remove_var("HUSK_DEFAULT_KERNEL") };
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn env_override_dns_servers_comma_separated() {
+        // SAFETY: test is single-threaded; no other threads read this env var.
+        unsafe { std::env::set_var("HUSK_DNS_SERVERS", "1.1.1.1, 8.8.4.4, 9.9.9.9") };
+        let config = load_config(None);
+        assert_eq!(config.dns_servers, vec!["1.1.1.1", "8.8.4.4", "9.9.9.9"]);
+        unsafe { std::env::remove_var("HUSK_DNS_SERVERS") };
     }
 
     #[cfg(feature = "linux-net")]
