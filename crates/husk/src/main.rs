@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -25,8 +25,18 @@ struct Cli {
     #[arg(long)]
     api_token: Option<String>,
 
+    /// Output format for command responses.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -373,6 +383,41 @@ fn resolve_api_token(cli_api_token: Option<String>, config_path: Option<&Path>) 
     cli_api_token.or_else(|| load_config(config_path).api_token)
 }
 
+fn render_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<str>) -> String {
+    if format == OutputFormat::Json {
+        serde_json::to_string_pretty(value).expect("json serialization should succeed")
+    } else {
+        text.as_ref().to_string()
+    }
+}
+
+fn render_error_output(format: OutputFormat, message: impl Into<String>) -> String {
+    let message = message.into();
+    if format == OutputFormat::Json {
+        serde_json::json!({
+            "error": message,
+            "status": "error"
+        })
+        .to_string()
+    } else {
+        format!("Error: {message}")
+    }
+}
+
+fn print_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<str>) {
+    println!("{}", render_output(format, value, text));
+}
+
+fn exit_with_error(format: OutputFormat, message: impl Into<String>) -> ! {
+    let rendered = render_error_output(format, message);
+    if format == OutputFormat::Json {
+        println!("{rendered}");
+    } else {
+        eprintln!("{rendered}");
+    }
+    std::process::exit(1);
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -417,6 +462,7 @@ async fn main() -> Result<()> {
         config: config_path,
         api_url,
         api_token: cli_api_token,
+        output,
         command,
     } = cli;
 
@@ -486,22 +532,37 @@ async fn main() -> Result<()> {
 
             if !resp.status().is_success() {
                 let msg = api_error(resp, &format!("VM '{name}'")).await;
-                eprintln!("Error: {msg}");
+                let mut full = msg.clone();
                 if msg.contains("already exists") {
-                    eprintln!("Hint: stop or destroy it first with `husk destroy {name}`");
+                    full.push_str(&format!(
+                        " (hint: stop or destroy it first with `husk destroy {name}`)"
+                    ));
                 }
-                std::process::exit(1);
+                exit_with_error(output, full);
             }
 
             let vm: serde_json::Value = resp.json().await?;
-            println!("Created VM: {}", vm["name"].as_str().unwrap_or("-"));
-            println!("  ID:    {}", vm["id"].as_str().unwrap_or("-"));
-            println!("  State: {}", vm["state"].as_str().unwrap_or("-"));
-            println!("  CPUs:  {}", vm["vcpu_count"]);
-            println!("  RAM:   {} MiB", vm["mem_size_mib"]);
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "run",
+                        "vm": vm,
+                        "userdata_queued": userdata.is_some(),
+                    }),
+                    "",
+                );
+            } else {
+                println!("Created VM: {}", vm["name"].as_str().unwrap_or("-"));
+                println!("  ID:    {}", vm["id"].as_str().unwrap_or("-"));
+                println!("  State: {}", vm["state"].as_str().unwrap_or("-"));
+                println!("  CPUs:  {}", vm["vcpu_count"]);
+                println!("  RAM:   {} MiB", vm["mem_size_mib"]);
 
-            if userdata.is_some() {
-                println!("  Userdata script queued (check status with `husk info {name}`)");
+                if userdata.is_some() {
+                    println!("  Userdata script queued (check status with `husk info {name}`)");
+                }
             }
             Ok(())
         }
@@ -515,19 +576,29 @@ async fn main() -> Result<()> {
             .await?;
 
             if !resp.status().is_success() {
-                eprintln!("Error: {}", api_error(resp, "listing VMs").await);
-                std::process::exit(1);
+                let msg = api_error(resp, "listing VMs").await;
+                exit_with_error(output, msg);
             }
 
             let vms: Vec<serde_json::Value> = resp.json().await?;
-            if vms.is_empty() {
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "list",
+                        "vms": vms,
+                    }),
+                    "",
+                );
+            } else if vms.is_empty() {
                 println!("No VMs found");
             } else {
                 println!(
                     "{:<20} {:<12} {:>4}   {:<10} {:<16}",
                     "NAME", "STATE", "CPUS", "MEMORY", "GUEST IP"
                 );
-                for vm in vms {
+                for vm in &vms {
                     println!(
                         "{:<20} {:<12} {:>4}   {:>4} MiB   {:<16}",
                         vm["name"].as_str().unwrap_or("-"),
@@ -550,26 +621,38 @@ async fn main() -> Result<()> {
             .await?;
 
             if !resp.status().is_success() {
-                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                std::process::exit(1);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
             }
 
             let vm: serde_json::Value = resp.json().await?;
-            let s = |key: &str| vm[key].as_str().unwrap_or("-").to_string();
-            println!("Name:      {}", s("name"));
-            println!("State:     {}", s("state"));
-            println!("vCPUs:     {}", vm["vcpu_count"]);
-            println!("Memory:    {} MiB", vm["mem_size_mib"]);
-            if let Some(ip) = vm["guest_ip"].as_str() {
-                println!("Guest IP:  {ip}");
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "info",
+                        "vm": vm,
+                    }),
+                    "",
+                );
+            } else {
+                let s = |key: &str| vm[key].as_str().unwrap_or("-").to_string();
+                println!("Name:      {}", s("name"));
+                println!("State:     {}", s("state"));
+                println!("vCPUs:     {}", vm["vcpu_count"]);
+                println!("Memory:    {} MiB", vm["mem_size_mib"]);
+                if let Some(ip) = vm["guest_ip"].as_str() {
+                    println!("Guest IP:  {ip}");
+                }
+                if let Some(ip) = vm["host_ip"].as_str() {
+                    println!("Host IP:   {ip}");
+                }
+                if let Some(status) = vm["userdata_status"].as_str() {
+                    println!("Userdata:  {status}");
+                }
+                println!("ID:        {}", s("id"));
             }
-            if let Some(ip) = vm["host_ip"].as_str() {
-                println!("Host IP:   {ip}");
-            }
-            if let Some(status) = vm["userdata_status"].as_str() {
-                println!("Userdata:  {status}");
-            }
-            println!("ID:        {}", s("id"));
             Ok(())
         }
         Commands::Stop { name } => {
@@ -582,14 +665,21 @@ async fn main() -> Result<()> {
             .await?;
 
             if resp.status().is_success() {
-                println!("Stopped VM: {name}");
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "stop",
+                        "vm": name,
+                    }),
+                    format!("Stopped VM: {name}"),
+                );
             } else {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
-                eprintln!("Error: {msg}");
+                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
                 if msg.contains("stopped") {
-                    eprintln!("Hint: VM is already stopped");
+                    msg.push_str(" (hint: VM is already stopped)");
                 }
-                std::process::exit(1);
+                exit_with_error(output, msg);
             }
             Ok(())
         }
@@ -603,14 +693,21 @@ async fn main() -> Result<()> {
             .await?;
 
             if resp.status().is_success() {
-                println!("Paused VM: {name}");
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "pause",
+                        "vm": name,
+                    }),
+                    format!("Paused VM: {name}"),
+                );
             } else {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
-                eprintln!("Error: {msg}");
+                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
                 if msg.contains("stopped") {
-                    eprintln!("Hint: start the VM first with `husk run`");
+                    msg.push_str(" (hint: start the VM first with `husk run`)");
                 }
-                std::process::exit(1);
+                exit_with_error(output, msg);
             }
             Ok(())
         }
@@ -624,16 +721,23 @@ async fn main() -> Result<()> {
             .await?;
 
             if resp.status().is_success() {
-                println!("Resumed VM: {name}");
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "resume",
+                        "vm": name,
+                    }),
+                    format!("Resumed VM: {name}"),
+                );
             } else {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
-                eprintln!("Error: {msg}");
+                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
                 if msg.contains("stopped") {
-                    eprintln!("Hint: start the VM first with `husk run`");
+                    msg.push_str(" (hint: start the VM first with `husk run`)");
                 } else if msg.contains("running") {
-                    eprintln!("Hint: VM is already running, nothing to resume");
+                    msg.push_str(" (hint: VM is already running, nothing to resume)");
                 }
-                std::process::exit(1);
+                exit_with_error(output, msg);
             }
             Ok(())
         }
@@ -647,10 +751,18 @@ async fn main() -> Result<()> {
             .await?;
 
             if resp.status().is_success() {
-                println!("Destroyed VM: {name}");
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "destroy",
+                        "vm": name,
+                    }),
+                    format!("Destroyed VM: {name}"),
+                );
             } else {
-                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                std::process::exit(1);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
             }
             Ok(())
         }
@@ -681,18 +793,31 @@ async fn main() -> Result<()> {
             .await?;
 
             if !resp.status().is_success() {
-                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                std::process::exit(1);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
             }
 
             let result: serde_json::Value = resp.json().await?;
-            let stdout = result["stdout"].as_str().unwrap_or("");
-            let stderr = result["stderr"].as_str().unwrap_or("");
-            if !stdout.is_empty() {
-                print!("{stdout}");
-            }
-            if !stderr.is_empty() {
-                eprint!("{stderr}");
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "exec",
+                        "vm": name,
+                        "result": result,
+                    }),
+                    "",
+                );
+            } else {
+                let stdout = result["stdout"].as_str().unwrap_or("");
+                let stderr = result["stderr"].as_str().unwrap_or("");
+                if !stdout.is_empty() {
+                    print!("{stdout}");
+                }
+                if !stderr.is_empty() {
+                    eprint!("{stderr}");
+                }
             }
             let exit_code = result["exit_code"].as_i64().unwrap_or(1) as i32;
             if exit_code != 0 {
@@ -732,10 +857,21 @@ async fn main() -> Result<()> {
                     if resp.status().is_success() {
                         let result: serde_json::Value = resp.json().await?;
                         let bytes = result["bytes_written"].as_u64().unwrap_or(0);
-                        println!("{bytes} bytes copied to {name}:{path}");
+                        print_output(
+                            output,
+                            &serde_json::json!({
+                                "status": "ok",
+                                "action": "cp",
+                                "direction": "to_vm",
+                                "vm": name,
+                                "path": path,
+                                "bytes": bytes,
+                            }),
+                            format!("{bytes} bytes copied to {name}:{path}"),
+                        );
                     } else {
-                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                        std::process::exit(1);
+                        let msg = api_error(resp, &format!("VM '{name}'")).await;
+                        exit_with_error(output, msg);
                     }
                 }
                 (CpPath::Vm { name, path }, CpPath::Local(local)) => {
@@ -756,10 +892,22 @@ async fn main() -> Result<()> {
                             .map_err(|e| anyhow::anyhow!("invalid base64 from server: {e}"))?;
                         std::fs::write(&local, &data)
                             .with_context(|| format!("writing {}", local.display()))?;
-                        println!("{} bytes copied from {name}:{path}", data.len());
+                        print_output(
+                            output,
+                            &serde_json::json!({
+                                "status": "ok",
+                                "action": "cp",
+                                "direction": "from_vm",
+                                "vm": name,
+                                "path": path,
+                                "bytes": data.len(),
+                                "destination": local,
+                            }),
+                            format!("{} bytes copied from {name}:{path}", data.len()),
+                        );
                     } else {
-                        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                        std::process::exit(1);
+                        let msg = api_error(resp, &format!("VM '{name}'")).await;
+                        exit_with_error(output, msg);
                     }
                 }
                 (CpPath::Local(_), CpPath::Local(_)) => {
@@ -775,7 +923,7 @@ async fn main() -> Result<()> {
         }
         Commands::PortForward { name, action } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            port_forward(api_url, api_token, name, action).await
+            port_forward(api_url, api_token, name, action, output).await
         }
         Commands::Logs { name, follow, tail } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -796,11 +944,17 @@ async fn main() -> Result<()> {
             let resp = api_request(with_api_auth(client.get(&url), api_token.as_deref())).await?;
 
             if !resp.status().is_success() {
-                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                std::process::exit(1);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
             }
 
             if follow {
+                if output == OutputFormat::Json {
+                    exit_with_error(
+                        output,
+                        "json output is not supported with --follow for streaming logs",
+                    );
+                }
                 use tokio::io::AsyncWriteExt;
                 let mut stream = resp.bytes_stream();
                 let mut stdout = tokio::io::stdout();
@@ -812,14 +966,28 @@ async fn main() -> Result<()> {
                             stdout.flush().await?;
                         }
                         Err(e) => {
-                            eprintln!("Error reading stream: {e}");
-                            std::process::exit(1);
+                            exit_with_error(output, format!("error reading stream: {e}"));
                         }
                     }
                 }
             } else {
                 let body = resp.text().await?;
-                print!("{body}");
+                if output == OutputFormat::Json {
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "logs",
+                            "vm": name,
+                            "follow": false,
+                            "tail": tail,
+                            "logs": body,
+                        }),
+                        "",
+                    );
+                } else {
+                    print!("{body}");
+                }
             }
             Ok(())
         }
@@ -828,7 +996,7 @@ async fn main() -> Result<()> {
             run_shell(api_url, config_path, name, command, api_token.as_deref()).await
         }
         Commands::Version => {
-            println!("husk {}", env!("CARGO_PKG_VERSION"));
+            let mut daemon_info: Option<serde_json::Value> = None;
 
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
@@ -840,12 +1008,47 @@ async fn main() -> Result<()> {
                 let version = health["version"].as_str().unwrap_or("unknown");
                 let total = health["vms"]["total"].as_u64().unwrap_or(0);
                 let running = health["vms"]["running"].as_u64().unwrap_or(0);
-                println!("daemon {version} ({total} VMs, {running} running)");
+                daemon_info = Some(serde_json::json!({
+                    "version": version,
+                    "vms_total": total,
+                    "vms_running": running,
+                }));
+            }
+
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "version",
+                        "client_version": env!("CARGO_PKG_VERSION"),
+                        "daemon": daemon_info,
+                    }),
+                    "",
+                );
+            } else {
+                println!("husk {}", env!("CARGO_PKG_VERSION"));
+                if let Some(daemon) = daemon_info {
+                    println!(
+                        "daemon {} ({} VMs, {} running)",
+                        daemon["version"].as_str().unwrap_or("unknown"),
+                        daemon["vms_total"].as_u64().unwrap_or(0),
+                        daemon["vms_running"].as_u64().unwrap_or(0)
+                    );
+                }
             }
             Ok(())
         }
         Commands::Config { action } => match action {
-            ConfigAction::Check => check_config(config_path.as_deref()),
+            ConfigAction::Check => {
+                if output == OutputFormat::Json {
+                    exit_with_error(
+                        output,
+                        "`husk config check` does not yet support --output json",
+                    );
+                }
+                check_config(config_path.as_deref())
+            }
         },
     }
 }
@@ -866,14 +1069,10 @@ async fn port_forward(
     _api_token: Option<String>,
     _name: String,
     _action: PortForwardAction,
+    output: OutputFormat,
 ) -> Result<()> {
-    eprintln!("Error: port forwarding is not supported on this platform");
-    eprintln!();
-    eprintln!("Port forwarding requires Linux with Firecracker and nftables.");
-    eprintln!("On macOS, guests use shared NAT via Virtualization.framework");
-    eprintln!("and can reach the host network, but inbound port mapping is");
-    eprintln!("not available.");
-    std::process::exit(1);
+    let message = "port forwarding is not supported on this platform (requires Linux with Firecracker + nftables; macOS uses shared NAT without inbound host mapping)";
+    exit_with_error(output, message);
 }
 
 #[cfg(feature = "linux-net")]
@@ -882,6 +1081,7 @@ async fn port_forward(
     api_token: Option<String>,
     name: String,
     action: PortForwardAction,
+    output: OutputFormat,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     match action {
@@ -901,10 +1101,20 @@ async fn port_forward(
             )
             .await?;
             if resp.status().is_success() {
-                println!("Port forward added: {host_port} -> {name}:{guest_port}");
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "port-forward-add",
+                        "vm": name,
+                        "host_port": host_port,
+                        "guest_port": guest_port,
+                    }),
+                    format!("Port forward added: {host_port} -> {name}:{guest_port}"),
+                );
             } else {
-                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                std::process::exit(1);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
             }
         }
         PortForwardAction::Remove { host_port } => {
@@ -914,13 +1124,19 @@ async fn port_forward(
             ))
             .await?;
             if resp.status().is_success() {
-                println!("Port forward removed: {host_port}");
-            } else {
-                eprintln!(
-                    "Error: {}",
-                    api_error(resp, &format!("port forward {host_port}")).await
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "port-forward-remove",
+                        "vm": name,
+                        "host_port": host_port,
+                    }),
+                    format!("Port forward removed: {host_port}"),
                 );
-                std::process::exit(1);
+            } else {
+                let msg = api_error(resp, &format!("port forward {host_port}")).await;
+                exit_with_error(output, msg);
             }
         }
         PortForwardAction::List => {
@@ -930,19 +1146,30 @@ async fn port_forward(
             ))
             .await?;
             if !resp.status().is_success() {
-                eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-                std::process::exit(1);
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
             }
 
             let forwards: Vec<serde_json::Value> = resp.json().await?;
-            if forwards.is_empty() {
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "port-forward-list",
+                        "vm": name,
+                        "forwards": forwards,
+                    }),
+                    "",
+                );
+            } else if forwards.is_empty() {
                 println!("No port forwards for {name}");
             } else {
                 println!(
                     "{:<12} {:<12} {:<10}",
                     "HOST PORT", "GUEST PORT", "PROTOCOL"
                 );
-                for pf in forwards {
+                for pf in &forwards {
                     println!(
                         "{:<12} {:<12} {:<10}",
                         pf["host_port"],
@@ -1762,6 +1989,7 @@ async fn drain_vms_on_shutdown<B: husk_vmm::VmmBackend>(core: &husk_core::HuskCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn parse_cp_path_local() {
@@ -1832,6 +2060,42 @@ mod tests {
         assert!(parse_octal_mode("999").is_err());
         assert!(parse_octal_mode("abc").is_err());
         assert!(parse_octal_mode("").is_err());
+    }
+
+    #[test]
+    fn output_flag_defaults_to_text() {
+        let cli = Cli::try_parse_from(["husk", "list"]).expect("cli should parse");
+        assert_eq!(cli.output, OutputFormat::Text);
+    }
+
+    #[test]
+    fn output_flag_accepts_json() {
+        let cli = Cli::try_parse_from(["husk", "--output", "json", "list"])
+            .expect("cli should parse with json output");
+        assert_eq!(cli.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn render_output_json_is_machine_readable() {
+        let rendered = render_output(
+            OutputFormat::Json,
+            &serde_json::json!({
+                "status": "ok",
+                "vm": "test-vm",
+            }),
+            "ignored",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["vm"], "test-vm");
+    }
+
+    #[test]
+    fn render_error_output_json_has_stable_fields() {
+        let rendered = render_error_output(OutputFormat::Json, "boom");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["error"], "boom");
     }
 
     #[test]
