@@ -112,6 +112,160 @@ impl FirecrackerBackend {
         path.to_str()
             .ok_or_else(|| VmmError::InvalidConfig(format!("{label} is not valid UTF-8")))
     }
+
+    /// Spawn a Firecracker process, configure it, and start the VM.
+    ///
+    /// Separated from `create_vm` so the caller can clean up the serial log
+    /// file on any failure (spawn, API config, or start).
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_and_configure(
+        &self,
+        id: Uuid,
+        config: VmConfig,
+        socket_path: &Path,
+        log_path: &Path,
+        vsock_path: &Path,
+        serial_log_path: &Path,
+        serial_file: std::fs::File,
+        stderr_file: std::fs::File,
+    ) -> Result<VmInfo, VmmError> {
+        // Spawn the Firecracker process
+        let process = tokio::process::Command::new(&self.firecracker_bin)
+            .arg("--api-sock")
+            .arg(socket_path)
+            .arg("--log-path")
+            .arg(log_path)
+            .arg("--level")
+            .arg("Info")
+            .stdout(serial_file)
+            .stderr(stderr_file)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| VmmError::ProcessError(format!("spawn firecracker: {e}")))?;
+
+        let pid = process.id();
+
+        // Wait for the API socket to appear
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !socket_path.exists() {
+            return Err(VmmError::ProcessError(
+                "Firecracker socket did not appear within 5s".into(),
+            ));
+        }
+
+        // Configure the VM via the Firecracker API
+        let kernel_args = config.kernel_args.clone().unwrap_or_else(|| {
+            "console=ttyS0 reboot=k panic=1 pci=off \
+             ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off"
+                .to_string()
+        });
+
+        let kernel_path_str = Self::path_to_str(&config.kernel_path, "kernel_path")?;
+        let rootfs_path_str = Self::path_to_str(&config.rootfs_path, "rootfs_path")?;
+        let vsock_path_str = Self::path_to_str(vsock_path, "vsock_path")?;
+
+        // Boot source
+        Self::fc_put(
+            socket_path,
+            "/boot-source",
+            &serde_json::json!({
+                "kernel_image_path": kernel_path_str,
+                "boot_args": kernel_args,
+            }),
+        )
+        .await?;
+
+        // Root drive
+        Self::fc_put(
+            socket_path,
+            "/drives/rootfs",
+            &serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": rootfs_path_str,
+                "is_root_device": true,
+                "is_read_only": false,
+            }),
+        )
+        .await?;
+
+        // Machine config
+        Self::fc_put(
+            socket_path,
+            "/machine-config",
+            &serde_json::json!({
+                "vcpu_count": config.vcpu_count,
+                "mem_size_mib": config.mem_size_mib,
+            }),
+        )
+        .await?;
+
+        // Network interface (optional)
+        if let Some(ref tap) = config.tap_device {
+            let mac = config
+                .guest_mac
+                .clone()
+                .unwrap_or_else(|| "AA:FC:00:00:00:01".into());
+            Self::fc_put(
+                socket_path,
+                "/network-interfaces/eth0",
+                &serde_json::json!({
+                    "iface_id": "eth0",
+                    "guest_mac": mac,
+                    "host_dev_name": tap,
+                }),
+            )
+            .await?;
+        }
+
+        // Vsock
+        Self::fc_put(
+            socket_path,
+            "/vsock",
+            &serde_json::json!({
+                "guest_cid": config.vsock_cid,
+                "uds_path": vsock_path_str,
+            }),
+        )
+        .await?;
+
+        // Start the VM
+        Self::fc_put(
+            socket_path,
+            "/actions",
+            &serde_json::json!({
+                "action_type": "InstanceStart",
+            }),
+        )
+        .await?;
+
+        let info = VmInfo {
+            id,
+            name: config.name,
+            state: VmState::Running,
+            pid,
+            vcpu_count: config.vcpu_count,
+            mem_size_mib: config.mem_size_mib,
+            vsock_cid: config.vsock_cid,
+        };
+
+        let instance = FcInstance {
+            info: info.clone(),
+            socket_path: socket_path.to_owned(),
+            vsock_path: vsock_path.to_owned(),
+            log_path: log_path.to_owned(),
+            serial_log_path: serial_log_path.to_owned(),
+            process,
+        };
+
+        self.instances.lock().await.insert(id, instance);
+
+        Ok(info)
+    }
 }
 
 impl VmmBackend for FirecrackerBackend {
@@ -142,142 +296,33 @@ impl VmmBackend for FirecrackerBackend {
         let serial_file = std::fs::File::create(&serial_log_path)
             .map_err(|e| VmmError::ProcessError(format!("create serial log: {e}")))?;
 
-        // Spawn the Firecracker process
-        let process = tokio::process::Command::new(&self.firecracker_bin)
-            .arg("--api-sock")
-            .arg(&socket_path)
-            .arg("--log-path")
-            .arg(&log_path)
-            .arg("--level")
-            .arg("Info")
-            .stdout(serial_file.try_clone().map_err(VmmError::Io)?)
-            .stderr(serial_file)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| VmmError::ProcessError(format!("spawn firecracker: {e}")))?;
+        // FC process stderr goes to the FC log file (separate from guest serial).
+        let stderr_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
-        let pid = process.id();
-
-        // Wait for the API socket to appear
-        for _ in 0..50 {
-            if socket_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if !socket_path.exists() {
-            return Err(VmmError::ProcessError(
-                "Firecracker socket did not appear within 5s".into(),
-            ));
-        }
-
-        // Configure the VM via the Firecracker API
-        let kernel_args = config.kernel_args.clone().unwrap_or_else(|| {
-            "console=ttyS0 reboot=k panic=1 pci=off \
-             ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off"
-                .to_string()
-        });
-
-        let kernel_path_str = Self::path_to_str(&config.kernel_path, "kernel_path")?;
-        let rootfs_path_str = Self::path_to_str(&config.rootfs_path, "rootfs_path")?;
-        let vsock_path_str = Self::path_to_str(&vsock_path, "vsock_path")?;
-
-        // Boot source
-        Self::fc_put(
-            &socket_path,
-            "/boot-source",
-            &serde_json::json!({
-                "kernel_image_path": kernel_path_str,
-                "boot_args": kernel_args,
-            }),
-        )
-        .await?;
-
-        // Root drive
-        Self::fc_put(
-            &socket_path,
-            "/drives/rootfs",
-            &serde_json::json!({
-                "drive_id": "rootfs",
-                "path_on_host": rootfs_path_str,
-                "is_root_device": true,
-                "is_read_only": false,
-            }),
-        )
-        .await?;
-
-        // Machine config
-        Self::fc_put(
-            &socket_path,
-            "/machine-config",
-            &serde_json::json!({
-                "vcpu_count": config.vcpu_count,
-                "mem_size_mib": config.mem_size_mib,
-            }),
-        )
-        .await?;
-
-        // Network interface (optional)
-        if let Some(ref tap) = config.tap_device {
-            let mac = config
-                .guest_mac
-                .clone()
-                .unwrap_or_else(|| "AA:FC:00:00:00:01".into());
-            Self::fc_put(
+        // Spawn, configure, and start — cleaning up the serial log on any failure.
+        match self
+            .spawn_and_configure(
+                id,
+                config,
                 &socket_path,
-                "/network-interfaces/eth0",
-                &serde_json::json!({
-                    "iface_id": "eth0",
-                    "guest_mac": mac,
-                    "host_dev_name": tap,
-                }),
+                &log_path,
+                &vsock_path,
+                &serial_log_path,
+                serial_file,
+                stderr_file,
             )
-            .await?;
+            .await
+        {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                let _ = std::fs::remove_file(&serial_log_path);
+                Err(e)
+            }
         }
-
-        // Vsock
-        Self::fc_put(
-            &socket_path,
-            "/vsock",
-            &serde_json::json!({
-                "guest_cid": config.vsock_cid,
-                "uds_path": vsock_path_str,
-            }),
-        )
-        .await?;
-
-        // Start the VM
-        Self::fc_put(
-            &socket_path,
-            "/actions",
-            &serde_json::json!({
-                "action_type": "InstanceStart",
-            }),
-        )
-        .await?;
-
-        let info = VmInfo {
-            id,
-            name: config.name,
-            state: VmState::Running,
-            pid,
-            vcpu_count: config.vcpu_count,
-            mem_size_mib: config.mem_size_mib,
-            vsock_cid: config.vsock_cid,
-        };
-
-        let instance = FcInstance {
-            info: info.clone(),
-            socket_path,
-            vsock_path,
-            log_path,
-            serial_log_path,
-            process,
-        };
-
-        self.instances.lock().await.insert(id, instance);
-
-        Ok(info)
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

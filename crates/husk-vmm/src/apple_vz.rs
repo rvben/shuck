@@ -91,6 +91,158 @@ impl AppleVzBackend {
             instances: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    /// Configure, validate, and start a VZ virtual machine.
+    ///
+    /// Separated from `create_vm` so the caller can clean up the serial log
+    /// file on any failure (config, validation, or start).
+    async fn create_and_start_vm(
+        &self,
+        config: VmConfig,
+        queue: DispatchRetained<DispatchQueue>,
+        serial_write_fd: i32,
+    ) -> Result<
+        (
+            QueueConfined<Retained<VZVirtualMachine>>,
+            DispatchRetained<DispatchQueue>,
+        ),
+        VmmError,
+    > {
+        let vm = dispatch_sync_fallible(queue.clone(), {
+            let config = config.clone();
+            let queue_for_vm = queue.clone();
+            // Safety: All VZ API calls in this closure execute on the VM's dedicated
+            // serial dispatch queue via `dispatch_sync_fallible`. The objc2 bindings
+            // are `unsafe` because they call into Objective-C; the VZ framework
+            // guarantees thread-safety when called from the correct queue.
+            move || -> Result<QueueConfined<Retained<VZVirtualMachine>>, VmmError> {
+                // Boot loader
+                let kernel_path = config
+                    .kernel_path
+                    .to_str()
+                    .ok_or_else(|| VmmError::InvalidConfig("kernel path not valid UTF-8".into()))?;
+                let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(kernel_path));
+                let boot_loader = unsafe {
+                    VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
+                };
+                if let Some(ref args) = config.kernel_args {
+                    unsafe { boot_loader.setCommandLine(&NSString::from_str(args)) };
+                }
+                if let Some(ref initrd) = config.initrd_path {
+                    let initrd_str = initrd.to_str().ok_or_else(|| {
+                        VmmError::InvalidConfig("initrd path not valid UTF-8".into())
+                    })?;
+                    let initrd_url = NSURL::fileURLWithPath(&NSString::from_str(initrd_str));
+                    unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
+                }
+
+                let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
+                unsafe {
+                    vz_config.setCPUCount(config.vcpu_count as usize);
+                    vz_config.setMemorySize(u64::from(config.mem_size_mib) * 1024 * 1024);
+                    vz_config.setBootLoader(Some(&*boot_loader));
+                }
+
+                // Block storage (rootfs)
+                let rootfs_path = config
+                    .rootfs_path
+                    .to_str()
+                    .ok_or_else(|| {
+                        VmmError::InvalidConfig("rootfs path not valid UTF-8".into())
+                    })?;
+                let rootfs_url = NSURL::fileURLWithPath(&NSString::from_str(rootfs_path));
+                let disk_attachment = unsafe {
+                    VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                        VZDiskImageStorageDeviceAttachment::alloc(),
+                        &rootfs_url,
+                        false,
+                    )
+                    .map_err(|e| VmmError::InvalidConfig(format!("disk attachment: {e}")))?
+                };
+                let block_device = unsafe {
+                    VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                        VZVirtioBlockDeviceConfiguration::alloc(),
+                        &disk_attachment,
+                    )
+                };
+                let storage_device = block_device.into_super();
+                unsafe {
+                    vz_config
+                        .setStorageDevices(&NSArray::from_retained_slice(&[storage_device]));
+                }
+
+                // Network (NAT — VZ handles it internally)
+                let nat = unsafe { VZNATNetworkDeviceAttachment::new() };
+                let net_device = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
+                unsafe { net_device.setAttachment(Some(&*nat)) };
+                let net_config = net_device.into_super();
+                unsafe {
+                    vz_config
+                        .setNetworkDevices(&NSArray::from_retained_slice(&[net_config]));
+                }
+
+                // Vsock
+                let socket_device = unsafe { VZVirtioSocketDeviceConfiguration::new() };
+                let socket_config = socket_device.into_super();
+                unsafe {
+                    vz_config
+                        .setSocketDevices(&NSArray::from_retained_slice(&[socket_config]));
+                }
+
+                // Platform (required for Linux on ARM64)
+                let platform = unsafe { VZGenericPlatformConfiguration::new() };
+                unsafe {
+                    vz_config.setPlatform(&platform);
+                }
+
+                // Serial console (hvc0 — virtio console)
+                // Attach output to a log file for `husk logs`. No input needed (None).
+                let write_handle = NSFileHandle::initWithFileDescriptor(
+                    NSFileHandle::alloc(),
+                    serial_write_fd,
+                );
+                let attachment = unsafe {
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        None,
+                        Some(&*write_handle),
+                    )
+                };
+                let serial_port =
+                    unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+                unsafe { serial_port.setAttachment(Some(&*attachment)) };
+                let serial_config = serial_port.into_super();
+                unsafe {
+                    vz_config
+                        .setSerialPorts(&NSArray::from_retained_slice(&[serial_config]));
+                }
+
+                // Validate
+                unsafe {
+                    vz_config
+                        .validateWithError()
+                        .map_err(|e| VmmError::InvalidConfig(format!("validation: {e}")))?;
+                }
+
+                // Create VM bound to its serial dispatch queue
+                let vm = unsafe {
+                    VZVirtualMachine::initWithConfiguration_queue(
+                        VZVirtualMachine::alloc(),
+                        &vz_config,
+                        &queue_for_vm,
+                    )
+                };
+                Ok(QueueConfined(vm))
+            }
+        })
+        .await?;
+
+        // Start the VM
+        let vm_inner = vm.0.clone();
+        dispatch_vz_op(queue.clone(), QueueConfined(vm_inner), VzOp::Start).await?;
+
+        Ok((vm, queue))
+    }
 }
 
 impl Drop for AppleVzBackend {
@@ -228,132 +380,17 @@ impl VmmBackend for AppleVzBackend {
             serial_file.as_raw_fd()
         };
 
-        // Create the VM on its dedicated dispatch queue.
-        let vm = dispatch_sync_fallible(queue.clone(), {
-            let config = config.clone();
-            let queue_for_vm = queue.clone();
-            // Safety: All VZ API calls in this closure execute on the VM's dedicated
-            // serial dispatch queue via `dispatch_sync_fallible`. The objc2 bindings
-            // are `unsafe` because they call into Objective-C; the VZ framework
-            // guarantees thread-safety when called from the correct queue.
-            move || -> Result<QueueConfined<Retained<VZVirtualMachine>>, VmmError> {
-                // Boot loader
-                let kernel_path = config
-                    .kernel_path
-                    .to_str()
-                    .ok_or_else(|| VmmError::InvalidConfig("kernel path not valid UTF-8".into()))?;
-                let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(kernel_path));
-                let boot_loader = unsafe {
-                    VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
-                };
-                if let Some(ref args) = config.kernel_args {
-                    unsafe { boot_loader.setCommandLine(&NSString::from_str(args)) };
-                }
-                if let Some(ref initrd) = config.initrd_path {
-                    let initrd_str = initrd.to_str().ok_or_else(|| {
-                        VmmError::InvalidConfig("initrd path not valid UTF-8".into())
-                    })?;
-                    let initrd_url = NSURL::fileURLWithPath(&NSString::from_str(initrd_str));
-                    unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
-                }
-
-                let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
-                unsafe {
-                    vz_config.setCPUCount(config.vcpu_count as usize);
-                    vz_config.setMemorySize(u64::from(config.mem_size_mib) * 1024 * 1024);
-                    vz_config.setBootLoader(Some(&*boot_loader));
-                }
-
-                // Block storage (rootfs)
-                let rootfs_path = config
-                    .rootfs_path
-                    .to_str()
-                    .ok_or_else(|| VmmError::InvalidConfig("rootfs path not valid UTF-8".into()))?;
-                let rootfs_url = NSURL::fileURLWithPath(&NSString::from_str(rootfs_path));
-                let disk_attachment = unsafe {
-                    VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-                        VZDiskImageStorageDeviceAttachment::alloc(),
-                        &rootfs_url,
-                        false,
-                    )
-                    .map_err(|e| VmmError::InvalidConfig(format!("disk attachment: {e}")))?
-                };
-                let block_device = unsafe {
-                    VZVirtioBlockDeviceConfiguration::initWithAttachment(
-                        VZVirtioBlockDeviceConfiguration::alloc(),
-                        &disk_attachment,
-                    )
-                };
-                let storage_device = block_device.into_super();
-                unsafe {
-                    vz_config.setStorageDevices(&NSArray::from_retained_slice(&[storage_device]));
-                }
-
-                // Network (NAT — VZ handles it internally)
-                let nat = unsafe { VZNATNetworkDeviceAttachment::new() };
-                let net_device = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-                unsafe { net_device.setAttachment(Some(&*nat)) };
-                let net_config = net_device.into_super();
-                unsafe {
-                    vz_config.setNetworkDevices(&NSArray::from_retained_slice(&[net_config]));
-                }
-
-                // Vsock
-                let socket_device = unsafe { VZVirtioSocketDeviceConfiguration::new() };
-                let socket_config = socket_device.into_super();
-                unsafe {
-                    vz_config.setSocketDevices(&NSArray::from_retained_slice(&[socket_config]));
-                }
-
-                // Platform (required for Linux on ARM64)
-                let platform = unsafe { VZGenericPlatformConfiguration::new() };
-                unsafe {
-                    vz_config.setPlatform(&platform);
-                }
-
-                // Serial console (hvc0 — virtio console)
-                // Attach output to a log file for `husk logs`. No input needed (None).
-                let write_handle = NSFileHandle::initWithFileDescriptor(
-                    NSFileHandle::alloc(),
-                    serial_write_fd,
-                );
-                let attachment = unsafe {
-                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                        VZFileHandleSerialPortAttachment::alloc(),
-                        None,
-                        Some(&*write_handle),
-                    )
-                };
-                let serial_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
-                unsafe { serial_port.setAttachment(Some(&*attachment)) };
-                let serial_config = serial_port.into_super();
-                unsafe {
-                    vz_config.setSerialPorts(&NSArray::from_retained_slice(&[serial_config]));
-                }
-
-                // Validate
-                unsafe {
-                    vz_config
-                        .validateWithError()
-                        .map_err(|e| VmmError::InvalidConfig(format!("validation: {e}")))?;
-                }
-
-                // Create VM bound to its serial dispatch queue
-                let vm = unsafe {
-                    VZVirtualMachine::initWithConfiguration_queue(
-                        VZVirtualMachine::alloc(),
-                        &vz_config,
-                        &queue_for_vm,
-                    )
-                };
-                Ok(QueueConfined(vm))
+        // Create and start the VM, cleaning up the serial log on any failure.
+        let (vm, queue) = match self
+            .create_and_start_vm(config.clone(), queue, serial_write_fd)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = std::fs::remove_file(&serial_log_path);
+                return Err(e);
             }
-        })
-        .await?;
-
-        // Start the VM (temporarily move out of QueueConfined for the op)
-        let vm_inner = vm.0.clone();
-        dispatch_vz_op(queue.clone(), QueueConfined(vm_inner), VzOp::Start).await?;
+        };
 
         let info = VmInfo {
             id,

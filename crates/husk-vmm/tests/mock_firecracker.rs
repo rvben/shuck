@@ -204,3 +204,138 @@ async fn create_vm_missing_binary() {
         "expected ProcessError, got: {err}"
     );
 }
+
+/// Verify that the serial log file is cleaned up when create_vm fails
+/// due to a missing Firecracker binary.
+#[tokio::test]
+async fn create_vm_failure_cleans_up_serial_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("run");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let backend = FirecrackerBackend::new("/nonexistent/firecracker", &runtime_dir);
+
+    let config = VmConfig {
+        name: "orphan-test".into(),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        kernel_path: "/tmp/vmlinux".into(),
+        rootfs_path: "/tmp/rootfs.ext4".into(),
+        kernel_args: None,
+        initrd_path: None,
+        vsock_cid: 3,
+        tap_device: None,
+        guest_mac: None,
+    };
+
+    let _ = backend.create_vm(config).await.unwrap_err();
+
+    // No .serial.log files should remain after a failed create
+    let serial_logs: Vec<_> = std::fs::read_dir(&runtime_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().is_some_and(|ext| ext == "log")
+                && e.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("serial")
+        })
+        .collect();
+    assert!(
+        serial_logs.is_empty(),
+        "serial log files should be cleaned up on create_vm failure, found: {serial_logs:?}"
+    );
+}
+
+/// Verify that the serial log file is cleaned up when create_vm fails
+/// due to a Firecracker API error (e.g., invalid kernel path).
+#[tokio::test]
+async fn create_vm_api_failure_cleans_up_serial_log() {
+    let (dir, socket_path) = spawn_error_fc().await;
+
+    // Create a shell script that simulates a firecracker binary:
+    // it creates the socket (by copying the mock one) and then waits.
+    // Instead, we use a trick: pre-create the API socket pointing to
+    // the mock FC, and use `true` as the binary (exits immediately).
+    // The backend will find the socket (mock one), then the API call
+    // will fail with a 400 error from the mock.
+
+    let runtime_dir = dir.path().join("run");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    // The mock FC server is listening on `socket_path`. We need the
+    // backend to use that socket. We can create a symlink in runtime_dir
+    // with the expected name pattern: `{uuid}.sock`.
+    // But we don't know the UUID. Instead, we'll verify that NO serial
+    // log files remain after failure, regardless of path.
+
+    // For this test, we test at a higher level: use a script that creates
+    // the expected socket path. Since we can't easily predict the UUID,
+    // we'll create a wrapper script.
+    let wrapper_script = dir.path().join("fake-fc.sh");
+    std::fs::write(
+        &wrapper_script,
+        format!(
+            "#!/bin/sh\n\
+             # Parse --api-sock argument\n\
+             SOCK=\"\"\n\
+             while [ $# -gt 0 ]; do\n\
+               case \"$1\" in\n\
+                 --api-sock) SOCK=\"$2\"; shift 2;;\n\
+                 *) shift;;\n\
+               esac\n\
+             done\n\
+             # Symlink the mock FC socket to the expected path\n\
+             ln -sf {} \"$SOCK\"\n\
+             # Keep running until killed\n\
+             sleep 60\n",
+            socket_path.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let backend = FirecrackerBackend::new(&wrapper_script, &runtime_dir);
+
+    let config = VmConfig {
+        name: "api-fail-test".into(),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        kernel_path: "/tmp/vmlinux".into(),
+        rootfs_path: "/tmp/rootfs.ext4".into(),
+        kernel_args: None,
+        initrd_path: None,
+        vsock_cid: 3,
+        tap_device: None,
+        guest_mac: None,
+    };
+
+    let err = backend.create_vm(config).await.unwrap_err();
+    assert!(
+        matches!(err, VmmError::ApiError(_)),
+        "expected ApiError, got: {err}"
+    );
+
+    // No .serial.log files should remain
+    let serial_logs: Vec<_> = std::fs::read_dir(&runtime_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".serial.log")
+        })
+        .collect();
+    assert!(
+        serial_logs.is_empty(),
+        "serial log files should be cleaned up on API failure, found: {serial_logs:?}"
+    );
+}

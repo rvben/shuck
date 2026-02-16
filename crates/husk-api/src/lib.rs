@@ -552,6 +552,8 @@ async fn get_logs<B: VmmBackend + 'static>(
         let initial = axum::body::Bytes::from(initial_content.into_bytes());
 
         let stream = async_stream::stream! {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
             if !initial.is_empty() {
                 yield Ok::<axum::body::Bytes, std::io::Error>(initial);
             }
@@ -563,13 +565,26 @@ async fn get_logs<B: VmmBackend + 'static>(
                     Ok(meta) => {
                         let len = meta.len();
                         if len > offset {
-                            match tokio::fs::read(&log_path).await {
-                                Ok(data) => {
-                                    if (offset as usize) < data.len() {
-                                        let new_data = axum::body::Bytes::from(data[offset as usize..].to_vec());
-                                        offset = data.len() as u64;
-                                        yield Ok(new_data);
+                            match tokio::fs::File::open(&log_path).await {
+                                Ok(mut file) => {
+                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                                        yield Err(e);
+                                        break;
                                     }
+                                    let mut buf = Vec::with_capacity((len - offset) as usize);
+                                    match file.read_to_end(&mut buf).await {
+                                        Ok(_) => {
+                                            offset += buf.len() as u64;
+                                            yield Ok(axum::body::Bytes::from(buf));
+                                        }
+                                        Err(e) => {
+                                            yield Err(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    break;
                                 }
                                 Err(e) => {
                                     yield Err(e);
