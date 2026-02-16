@@ -485,7 +485,7 @@ impl<B: VmmBackend> HuskCore<B> {
 
     /// Execute the userdata script inside a running VM.
     ///
-    /// Retries agent connection with exponential backoff (up to 30s total),
+    /// Retries agent connection with exponential backoff (up to 120s total),
     /// writes the script to `/tmp/husk-userdata.sh`, executes it via `sh`,
     /// and updates `userdata_status` to `completed` or `failed`.
     pub async fn run_userdata(&self, name: &str) -> Result<(), CoreError> {
@@ -504,14 +504,14 @@ impl<B: VmmBackend> HuskCore<B> {
             // (e.g. VM destroyed or stopped while we were waiting).
             let mut conn = {
                 let mut backoff = std::time::Duration::from_secs(1);
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
                 loop {
                     match self.agent_connect(name).await {
                         Ok(c) => break c,
                         Err(ref e @ (CoreError::Vmm(_) | CoreError::Agent(_)))
                             if tokio::time::Instant::now() + backoff < deadline =>
                         {
-                            debug!(
+                            info!(
                                 %name,
                                 error = %e,
                                 retry_in = ?backoff,
