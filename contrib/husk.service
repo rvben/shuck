@@ -1,0 +1,19 @@
+[Unit]
+Description=Husk microVM manager daemon
+After=network.target
+Documentation=https://github.com/rvben/husk
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/husk daemon
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ReadWritePaths=/var/lib/husk
+RuntimeDirectory=husk
+
+[Install]
+WantedBy=multi-user.target

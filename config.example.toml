@@ -1,0 +1,44 @@
+# Husk configuration file
+#
+# Config file discovery order:
+#   1. --config flag (explicit path)
+#   2. ~/.config/husk/config.toml (user config)
+#   3. /etc/husk/config.toml (system config)
+#
+# All fields are optional and have sensible defaults.
+
+# ── Storage ──────────────────────────────────────────────────────────
+
+# Base directory for VM images, state database, and runtime files.
+#   macOS default: ~/.local/share/husk
+#   Linux default: /var/lib/husk
+# data_dir = "/var/lib/husk"
+
+# ── Kernel ───────────────────────────────────────────────────────────
+
+# Default kernel used when --kernel is not passed to `husk run`.
+#   macOS default: <data_dir>/kernels/Image-virt   (uncompressed ARM64 Image)
+#   Linux default: <data_dir>/kernels/vmlinux       (uncompressed x86_64 ELF)
+# default_kernel = "/var/lib/husk/kernels/vmlinux"
+
+# ── Firecracker (Linux only) ─────────────────────────────────────────
+
+# Path to the Firecracker binary. Must be on a filesystem that supports
+# execution. On most distros the default of "firecracker" works if it's
+# installed in $PATH.
+# firecracker_bin = "firecracker"
+
+# ── Networking (Linux only) ──────────────────────────────────────────
+
+# Host interface used for outbound NAT from guest VMs.
+# host_interface = "eth0"
+
+# Bridge device created by the daemon for guest networking.
+# bridge_name = "husk0"
+
+# Subnet from which /30 blocks are allocated to each VM.
+# The gateway (.1 of the subnet) is assigned to the bridge.
+# bridge_subnet = "172.20.0.0/24"
+
+# DNS servers injected into guest /etc/resolv.conf via the agent.
+# dns_servers = ["8.8.8.8", "1.1.1.1"]
