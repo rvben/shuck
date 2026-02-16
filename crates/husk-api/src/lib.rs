@@ -181,7 +181,7 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskCore<B>>) -> Router {
         );
 
     router
-        .route("/v1/health", get(health))
+        .route("/v1/health", get(health::<B>))
         .layer(axum::middleware::from_fn(trace_request))
         .with_state(core)
 }
@@ -218,8 +218,33 @@ async fn trace_request(
 
 // ── Handlers ──────────────────────────────────────────────────────────
 
-async fn health() -> &'static str {
-    "ok"
+async fn health<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> Json<HealthResponse> {
+    let (total, running) = match core.list_vms() {
+        Ok(vms) => {
+            let total = vms.len() as u64;
+            let running = vms.iter().filter(|v| v.state == "running").count() as u64;
+            (total, running)
+        }
+        Err(_) => (0, 0),
+    };
+    Json(HealthResponse {
+        status: "ok".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        vms: VmCounts { total, running },
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: String,
+    version: String,
+    vms: VmCounts,
+}
+
+#[derive(Debug, Serialize)]
+struct VmCounts {
+    total: u64,
+    running: u64,
 }
 
 async fn list_vms<B: VmmBackend + 'static>(
@@ -516,6 +541,10 @@ async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), a
 
 // ── Logs Handler ─────────────────────────────────────────────────────
 
+/// Maximum bytes to read from a serial log in non-follow mode.
+/// Logs exceeding this size are truncated to the last 1 MiB.
+const LOG_MAX_READ_BYTES: u64 = 1024 * 1024;
+
 async fn get_logs<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -523,7 +552,7 @@ async fn get_logs<B: VmmBackend + 'static>(
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     let log_path = core.serial_log_path(&name).map_err(map_error)?;
 
-    let content = tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+    let metadata = tokio::fs::metadata(&log_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             (
                 StatusCode::NOT_FOUND,
@@ -540,6 +569,50 @@ async fn get_logs<B: VmmBackend + 'static>(
             )
         }
     })?;
+
+    let file_size = metadata.len();
+    let truncated = !params.follow && file_size > LOG_MAX_READ_BYTES;
+
+    let content = if truncated {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("reading serial log: {e}"),
+                }),
+            )
+        })?;
+        file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("seeking serial log: {e}"),
+                    }),
+                )
+            })?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("reading serial log: {e}"),
+                }),
+            )
+        })?;
+        format!("[... truncated, showing last 1 MiB ...]\n{buf}")
+    } else {
+        tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("reading serial log: {e}"),
+                }),
+            )
+        })?
+    };
 
     if params.follow {
         let initial_content = if let Some(n) = params.tail {
@@ -762,6 +835,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].as_str().is_some());
+        assert_eq!(json["vms"]["total"], 0);
+        assert_eq!(json["vms"]["running"], 0);
     }
 
     #[tokio::test]

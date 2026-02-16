@@ -54,7 +54,7 @@ async fn response_text(response: axum::response::Response) -> String {
 // ── Health Endpoint ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn health_returns_ok_text() {
+async fn health_returns_json_with_version_and_vm_counts() {
     let app = router(test_core());
     let response = app
         .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
@@ -62,8 +62,74 @@ async fn health_returns_ok_text() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body = response_text(response).await;
-    assert_eq!(body, "ok");
+    let json = response_json(response).await;
+    assert_eq!(json["status"], "ok");
+    let version = json["version"]
+        .as_str()
+        .expect("version should be a string");
+    assert!(!version.is_empty(), "version should not be empty");
+    assert_eq!(json["vms"]["total"], 0);
+    assert_eq!(json["vms"]["running"], 0);
+}
+
+#[tokio::test]
+async fn health_counts_vms_correctly() {
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+
+    // Insert 3 VMs: 2 running, 1 stopped
+    for (i, vm_state) in ["running", "running", "stopped"].iter().enumerate() {
+        let record = husk_state::VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: format!("health-vm-{i}"),
+            state: (*vm_state).into(),
+            pid: Some(1000 + i as u32),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3 + i as u32,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            created_at: now,
+            updated_at: now,
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+        };
+        state.insert_vm(&record).unwrap();
+    }
+
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        PathBuf::from("/tmp/husk-test/run"),
+    ));
+
+    let app = router(core);
+    let response = app
+        .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["vms"]["total"], 3);
+    assert_eq!(json["vms"]["running"], 2);
 }
 
 // ── List Endpoint ────────────────────────────────────────────────────
@@ -1247,4 +1313,80 @@ async fn logs_tail_one_from_multiline() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_text(response).await;
     assert_eq!(body, "third\n");
+}
+
+#[tokio::test]
+async fn logs_large_file_is_truncated() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let vm_id = uuid::Uuid::new_v4();
+    let record = husk_state::VmRecord {
+        id: vm_id,
+        name: "big-log".into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+    };
+    state.insert_vm(&record).unwrap();
+
+    // Create a serial log larger than 1 MiB
+    let serial_log = runtime_dir.path().join(format!("{vm_id}.serial.log"));
+    let line = "kernel: [    0.000000] Booting Linux on physical CPU\n";
+    let repeat_count = (1024 * 1024 * 2) / line.len() + 1; // ~2 MiB
+    let large_content: String = line.repeat(repeat_count);
+    std::fs::write(&serial_log, &large_content).unwrap();
+
+    let vmm = husk_vmm::firecracker::FirecrackerBackend::new(
+        std::path::Path::new("/nonexistent"),
+        std::path::Path::new("/tmp"),
+    );
+    let ip_allocator = husk_net::IpAllocator::new(Ipv4Addr::new(172, 20, 0, 0), 24);
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = Arc::new(HuskCore::new(
+        vmm,
+        state,
+        ip_allocator,
+        storage,
+        "husk0".into(),
+        vec!["8.8.8.8".into(), "1.1.1.1".into()],
+        runtime_dir.path().to_path_buf(),
+    ));
+
+    let app = router(core);
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/big-log/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(
+        body.starts_with("[... truncated, showing last 1 MiB ...]"),
+        "should have truncation notice"
+    );
+    // Body should be roughly 1 MiB + notice, not the full 2 MiB
+    assert!(
+        body.len() < 1024 * 1024 + 1024 * 100,
+        "body should be ~1 MiB, got {} bytes",
+        body.len()
+    );
 }
