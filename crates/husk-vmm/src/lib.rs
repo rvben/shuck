@@ -1,4 +1,5 @@
 pub mod firecracker;
+pub mod vsock;
 
 #[cfg(unix)]
 pub mod fd_stream;

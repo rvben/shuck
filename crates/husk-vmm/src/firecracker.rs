@@ -452,32 +452,9 @@ impl VmmBackend for FirecrackerBackend {
             inst.vsock_path.clone()
         };
 
-        let stream = tokio::net::UnixStream::connect(&vsock_path)
+        crate::vsock::connect_firecracker_vsock(&vsock_path, port)
             .await
-            .map_err(|e| VmmError::ProcessError(format!("vsock connect: {e}")))?;
-
-        // Firecracker vsock CONNECT handshake
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let mut buf_stream = BufReader::new(stream);
-        buf_stream
-            .get_mut()
-            .write_all(format!("CONNECT {port}\n").as_bytes())
-            .await
-            .map_err(|e| VmmError::ProcessError(format!("vsock handshake write: {e}")))?;
-
-        let mut response = String::new();
-        buf_stream
-            .read_line(&mut response)
-            .await
-            .map_err(|e| VmmError::ProcessError(format!("vsock handshake read: {e}")))?;
-
-        if !response.starts_with("OK ") {
-            return Err(VmmError::ProcessError(format!(
-                "vsock CONNECT rejected (port {port})"
-            )));
-        }
-
-        Ok(buf_stream.into_inner())
+            .map_err(|e| VmmError::ProcessError(format!("{e}")))
     }
 }
 

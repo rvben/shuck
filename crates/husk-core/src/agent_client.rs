@@ -6,7 +6,7 @@ use husk_agent_proto::{
     ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode, base64_encode,
     read_message, write_message,
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -41,31 +41,19 @@ impl AgentClient {
         vsock_uds_path: &Path,
         port: u32,
     ) -> Result<AgentConnection<tokio::net::UnixStream>, AgentError> {
-        let stream = tokio::net::UnixStream::connect(vsock_uds_path)
-            .await
-            .map_err(AgentError::Connection)?;
-
-        // Firecracker vsock CONNECT handshake
-        let mut buf_stream = BufReader::new(stream);
-        buf_stream
-            .get_mut()
-            .write_all(format!("CONNECT {port}\n").as_bytes())
-            .await
-            .map_err(AgentError::Connection)?;
-
-        let mut response = String::new();
-        buf_stream
-            .read_line(&mut response)
-            .await
-            .map_err(AgentError::Connection)?;
-
-        if !response.starts_with("OK ") {
-            return Err(AgentError::VsockConnectRejected(port));
-        }
-
-        // Reconstruct the UnixStream from the BufReader. Any buffered data
-        // beyond the OK line belongs to the agent protocol.
-        let stream = buf_stream.into_inner();
+        let stream =
+            husk_vmm::vsock::connect_firecracker_vsock(vsock_uds_path, port)
+                .await
+                .map_err(|e| match e {
+                    husk_vmm::vsock::VsockConnectError::Rejected(port) => {
+                        AgentError::VsockConnectRejected(port)
+                    }
+                    husk_vmm::vsock::VsockConnectError::Connect(e)
+                    | husk_vmm::vsock::VsockConnectError::HandshakeWrite(e)
+                    | husk_vmm::vsock::VsockConnectError::HandshakeRead(e) => {
+                        AgentError::Connection(e)
+                    }
+                })?;
         Ok(AgentConnection { stream })
     }
 
