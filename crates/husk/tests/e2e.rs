@@ -581,6 +581,150 @@ async fn shell_after_pause_resume_macos() {
 
 // ── Logs E2E tests ─────────────────────────────────────────────────────
 
+/// Full VM lifecycle on macOS with Apple VZ: create, list, info, exec,
+/// pause, resume, stop, destroy.
+///
+/// Requires:
+/// - Running `husk daemon` on localhost:7777
+/// - Valid kernel at ~/.local/share/husk/kernels/Image-virt
+/// - Valid aarch64 rootfs image
+/// - macOS host with Virtualization.framework
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn vm_lifecycle_macos() {
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+
+    let home = std::env::var("HOME").expect("HOME not set");
+    let data_dir = format!("{home}/.local/share/husk");
+
+    // 1. Health check
+    let resp = client
+        .get(format!("{base}/v1/health"))
+        .send()
+        .await
+        .expect("daemon should be reachable");
+    assert_eq!(resp.status(), 200);
+
+    // 2. Create a VM
+    let vm_name = "e2e-lifecycle-macos";
+    let create_body = serde_json::json!({
+        "name": vm_name,
+        "kernel_path": format!("{data_dir}/kernels/Image-virt"),
+        "rootfs_path": format!("{data_dir}/images/alpine-aarch64.ext4"),
+        "vcpu_count": 1,
+        "mem_size_mib": 128,
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("create should succeed");
+    assert_eq!(resp.status(), 201);
+    let vm: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(vm["name"], vm_name);
+    assert!(vm["id"].as_str().is_some());
+
+    // 3. List VMs (should contain our VM)
+    let resp = client.get(format!("{base}/v1/vms")).send().await.unwrap();
+    let vms: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(vms.iter().any(|v| v["name"] == vm_name));
+
+    // 4. Get VM info
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(info["name"], vm_name);
+
+    // 5. Wait for agent to be ready
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // 6. Execute a command inside the VM
+    let exec_body = serde_json::json!({
+        "command": "echo",
+        "args": ["hello from VZ"],
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/exec"))
+        .json(&exec_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["stdout"].as_str().unwrap().contains("hello from VZ"));
+
+    // 7. Pause the VM
+    let resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(info["state"], "paused");
+
+    // 8. Resume the VM
+    let resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 9. Verify VM is functional after resume
+    let exec_body = serde_json::json!({
+        "command": "echo",
+        "args": ["post-resume"],
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/exec"))
+        .json(&exec_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(result["exit_code"], 0);
+
+    // 10. Stop the VM
+    let resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/stop"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 11. Destroy the VM
+    let resp = client
+        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 12. Verify it's gone
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
 /// Verify serial log output: full logs contain kernel markers, tail limits
 /// line count, and logs return 404 after VM is destroyed.
 ///
@@ -599,6 +743,87 @@ async fn logs_serial_output() {
         "name": vm_name,
         "kernel_path": "/var/lib/husk/kernels/vmlinux",
         "rootfs_path": "/var/lib/husk/images/ubuntu-22.04.ext4",
+        "vcpu_count": 1,
+        "mem_size_mib": 128,
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("create should succeed");
+    assert_eq!(resp.status(), 201);
+
+    // 2. Wait for the VM to boot and produce serial output
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // 3. Full logs should contain kernel boot markers
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Linux version") || body.contains("Booting"),
+        "expected kernel boot marker in logs, got: {}",
+        &body[..body.len().min(200)]
+    );
+
+    // 4. Tail should limit output
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}/logs?tail=5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let line_count = body.lines().count();
+    assert!(
+        line_count <= 5,
+        "tail=5 should return at most 5 lines, got {line_count}"
+    );
+
+    // 5. Destroy the VM
+    let resp = client
+        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 6. Logs should return 404 after destroy
+    let resp = client
+        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// macOS equivalent of `logs_serial_output`, using Apple VZ paths.
+///
+/// Requires:
+/// - Running `husk daemon` on localhost:7777
+/// - Valid kernel at ~/.local/share/husk/kernels/Image-virt
+/// - Valid aarch64 rootfs image
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn logs_serial_output_macos() {
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+    let vm_name = "e2e-logs-macos";
+
+    let home = std::env::var("HOME").expect("HOME not set");
+    let data_dir = format!("{home}/.local/share/husk");
+
+    // 1. Create a VM
+    let create_body = serde_json::json!({
+        "name": vm_name,
+        "kernel_path": format!("{data_dir}/kernels/Image-virt"),
+        "rootfs_path": format!("{data_dir}/images/alpine-aarch64.ext4"),
         "vcpu_count": 1,
         "mem_size_mib": 128,
     });
