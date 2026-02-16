@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-k3s-rootfs build-k3s-kernel test-k3s
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s
 
 all: lint test
 
@@ -113,6 +113,14 @@ update-rootfs: build-agent-aarch64
 	@echo "Rootfs updated. Verify with:"
 	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/husk-agent' $(ROOTFS_IMAGE)"
 	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
+
+# Build initramfs for Alpine-based husk VMs
+build-initramfs:
+	guest/build-initramfs.sh
+
+# Validate initramfs/inittab consistency (module presence, load order, DHCP config)
+test-initramfs:
+	guest/test-initramfs.sh
 
 # Build k3s-ready rootfs image (requires root, debootstrap)
 K3S_ROOTFS ?= k3s-rootfs.ext4

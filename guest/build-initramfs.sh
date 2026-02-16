@@ -1,0 +1,197 @@
+#!/bin/bash
+# Build the initramfs for Alpine-based husk VMs.
+#
+# Downloads the Alpine linux-virt kernel package, extracts the required
+# modules, bundles them with a BusyBox-based init, and produces a gzip
+# compressed cpio archive.
+#
+# Usage:
+#   ./guest/build-initramfs.sh [ALPINE_VERSION] [ARCH]
+#
+# Defaults: ALPINE_VERSION=3.21  ARCH=aarch64
+#
+# Output: ~/.local/share/husk/kernels/initramfs-virt.gz
+
+set -euo pipefail
+
+ALPINE_VERSION="${1:-3.21}"
+ARCH="${2:-aarch64}"
+OUTPUT_DIR="${HOME}/.local/share/husk/kernels"
+WORK_DIR="$(mktemp -d)"
+
+cleanup() { rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
+
+echo "Building initramfs for Alpine $ALPINE_VERSION ($ARCH)"
+
+# ── Download Alpine kernel package ──────────────────────────────────
+
+APK_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}/"
+echo "Fetching package index from $APK_URL"
+
+APK_NAME=$(curl -sL "$APK_URL" | grep -o "linux-virt-[0-9][^\"]*\.apk" | head -1)
+if [ -z "$APK_NAME" ]; then
+    echo "ERROR: could not find linux-virt package for Alpine $ALPINE_VERSION $ARCH" >&2
+    exit 1
+fi
+
+echo "Downloading $APK_NAME"
+curl -sL "${APK_URL}${APK_NAME}" -o "$WORK_DIR/linux-virt.apk"
+
+# ── Extract kernel modules ──────────────────────────────────────────
+
+echo "Extracting kernel modules"
+mkdir -p "$WORK_DIR/apk"
+tar xzf "$WORK_DIR/linux-virt.apk" -C "$WORK_DIR/apk"
+
+KVER=$(ls "$WORK_DIR/apk/lib/modules/" | head -1)
+if [ -z "$KVER" ]; then
+    echo "ERROR: no kernel version directory found in package" >&2
+    exit 1
+fi
+echo "Kernel version: $KVER"
+
+APK_MDIR="$WORK_DIR/apk/lib/modules/$KVER"
+
+# ── Download BusyBox static binary ──────────────────────────────────
+
+BUSYBOX_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}/"
+BB_NAME=$(curl -sL "$BUSYBOX_URL" | grep -o "busybox-static-[0-9][^\"]*\.apk" | head -1)
+echo "Downloading BusyBox ($BB_NAME)"
+curl -sL "${BUSYBOX_URL}${BB_NAME}" -o "$WORK_DIR/busybox.apk"
+
+mkdir -p "$WORK_DIR/bb"
+tar xzf "$WORK_DIR/busybox.apk" -C "$WORK_DIR/bb"
+
+# ── Build initramfs tree ────────────────────────────────────────────
+
+INITRAMFS="$WORK_DIR/initramfs"
+mkdir -p "$INITRAMFS"/{bin,dev,lib/modules/"$KVER",mnt/root,proc,sys}
+
+# BusyBox
+cp "$WORK_DIR/bb/bin/busybox.static" "$INITRAMFS/bin/busybox"
+chmod 755 "$INITRAMFS/bin/busybox"
+
+# Create symlinks for commands used by init
+for cmd in mount umount mkdir insmod sh switch_root; do
+    ln -s busybox "$INITRAMFS/bin/$cmd"
+done
+# insmod is also expected at /sbin/insmod by some paths
+mkdir -p "$INITRAMFS/sbin"
+ln -s ../bin/busybox "$INITRAMFS/sbin/insmod"
+
+# Modules needed for boot:
+#   Block:      virtio_blk
+#   Filesystem: crc16, crc32_generic, crc32c_generic, mbcache, jbd2, ext4
+#   Network:    af_packet (for DHCP), failover, net_failover, virtio_net
+#   Vsock:      vsock, vmw_vsock_virtio_transport_common, vmw_vsock_virtio_transport
+MODULES=(
+    # Block
+    "kernel/drivers/block/virtio_blk.ko"
+    # Filesystem
+    "kernel/lib/crc16.ko"
+    "kernel/crypto/crc32_generic.ko"
+    "kernel/crypto/crc32c_generic.ko"
+    "kernel/fs/mbcache.ko"
+    "kernel/fs/jbd2/jbd2.ko"
+    "kernel/fs/ext4/ext4.ko"
+    # Network (af_packet required for DHCP raw sockets)
+    "kernel/net/packet/af_packet.ko"
+    # Network (dependency order: failover → net_failover → virtio_net)
+    "kernel/net/core/failover.ko"
+    "kernel/drivers/net/net_failover.ko"
+    "kernel/drivers/net/virtio_net.ko"
+    # Vsock
+    "kernel/net/vmw_vsock/vsock.ko"
+    "kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko"
+    "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko"
+)
+
+for mod in "${MODULES[@]}"; do
+    src="$APK_MDIR/$mod"
+    # Alpine packages .ko.gz, decompress to .ko
+    if [ -f "${src}.gz" ]; then
+        base=$(basename "$mod")
+        gzip -dc "${src}.gz" > "$INITRAMFS/lib/modules/$KVER/$base"
+    elif [ -f "$src" ]; then
+        cp "$src" "$INITRAMFS/lib/modules/$KVER/"
+    else
+        echo "WARNING: module $mod not found, skipping" >&2
+    fi
+done
+
+# ── Init script ─────────────────────────────────────────────────────
+
+cat > "$INITRAMFS/init" << 'INIT_EOF'
+#!/bin/sh
+/bin/mount -t proc proc /proc
+/bin/mount -t sysfs sys /sys
+/bin/mount -t devtmpfs devtmpfs /dev
+
+MDIR=/lib/modules/KVER_PLACEHOLDER
+
+# Load block device modules
+/bin/insmod $MDIR/virtio_blk.ko
+
+# Load filesystem dependency modules
+/bin/insmod $MDIR/crc16.ko
+/bin/insmod $MDIR/crc32_generic.ko
+/bin/insmod $MDIR/crc32c_generic.ko
+/bin/insmod $MDIR/mbcache.ko
+/bin/insmod $MDIR/jbd2.ko
+/bin/insmod $MDIR/ext4.ko
+
+# Wait for /dev/vda to appear
+i=0
+while [ ! -b /dev/vda ] && [ $i -lt 50 ]; do
+    i=$((i + 1))
+done
+
+if [ ! -b /dev/vda ]; then
+    echo "FATAL: /dev/vda not found"
+    exec /bin/sh
+fi
+
+# Mount rootfs
+/bin/mount -t ext4 /dev/vda /mnt/root
+
+if [ ! -d /mnt/root/sbin ]; then
+    echo "FATAL: rootfs mount failed"
+    exec /bin/sh
+fi
+
+# Copy modules to rootfs for use after switch_root
+/bin/mkdir -p /mnt/root/lib/modules
+for m in $MDIR/*.ko; do
+    /bin/busybox cp "$m" /mnt/root/lib/modules/
+done
+
+# Clean up
+/bin/umount /proc
+/bin/umount /sys
+/bin/umount /dev
+
+exec /bin/switch_root /mnt/root /sbin/init
+INIT_EOF
+
+# Substitute kernel version into init script
+sed -i.bak "s/KVER_PLACEHOLDER/$KVER/" "$INITRAMFS/init"
+rm -f "$INITRAMFS/init.bak"
+chmod 755 "$INITRAMFS/init"
+
+# ── Pack initramfs ──────────────────────────────────────────────────
+
+echo "Packing initramfs"
+mkdir -p "$OUTPUT_DIR"
+(cd "$INITRAMFS" && find . | cpio -o -H newc --quiet | gzip -9) > "$OUTPUT_DIR/initramfs-virt.gz"
+
+echo "Built: $OUTPUT_DIR/initramfs-virt.gz ($(du -h "$OUTPUT_DIR/initramfs-virt.gz" | cut -f1))"
+
+# Also copy the uncompressed kernel Image if present in the APK
+KERNEL_IMAGE="$WORK_DIR/apk/boot/vmlinuz-virt"
+if [ -f "$KERNEL_IMAGE" ]; then
+    # Alpine packages the compressed vmlinuz; the uncompressed Image
+    # must be extracted from it for Apple Virtualization.framework.
+    echo "Note: vmlinuz-virt is in the package but VZ needs the uncompressed Image."
+    echo "      Download it separately or extract from the kernel build."
+fi
