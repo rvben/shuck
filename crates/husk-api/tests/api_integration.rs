@@ -321,6 +321,62 @@ async fn exec_on_nonexistent_vm_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn exec_running_vm_with_unavailable_agent_returns_503() {
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let vm_name = "agent-unavailable";
+    let record = husk_state::VmRecord {
+        id: uuid::Uuid::new_v4(),
+        name: vm_name.into(),
+        state: "running".into(),
+        pid: Some(1234),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 42,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+    };
+    state.insert_vm(&record).unwrap();
+
+    let storage = husk_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husk-test"),
+    };
+    let core = make_core(state, storage, PathBuf::from("/tmp/husk-test/run"));
+    let app = router(core);
+
+    let body = serde_json::json!({
+        "command": "echo",
+        "args": ["hello"]
+    });
+    let response = app
+        .oneshot(
+            Request::post(format!("/v1/vms/{vm_name}/exec"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = response_json(response).await;
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("agent not ready")),
+        "expected agent-not-ready error message, got: {json}"
+    );
+}
+
 // ── File Read/Write on Nonexistent VM ────────────────────────────────
 
 #[tokio::test]

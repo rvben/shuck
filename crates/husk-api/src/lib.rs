@@ -518,7 +518,10 @@ async fn exec_vm<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut conn = core.agent_connect(&name).await.map_err(map_error)?;
+    let mut conn = core
+        .agent_connect(&name)
+        .await
+        .map_err(map_agent_connect_error)?;
     let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
     let env: Vec<(&str, &str)> = req
         .env
@@ -553,7 +556,10 @@ async fn read_file_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<Json<ReadFileResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut conn = core.agent_connect(&name).await.map_err(map_error)?;
+    let mut conn = core
+        .agent_connect(&name)
+        .await
+        .map_err(map_agent_connect_error)?;
     let data = conn
         .read_file(&req.path)
         .await
@@ -591,7 +597,10 @@ async fn write_file_handler<B: VmmBackend + 'static>(
             }),
         )
     })?;
-    let mut conn = core.agent_connect(&name).await.map_err(map_error)?;
+    let mut conn = core
+        .agent_connect(&name)
+        .await
+        .map_err(map_agent_connect_error)?;
     let bytes_written = conn
         .write_file(&req.path, &data, req.mode)
         .await
@@ -1054,6 +1063,23 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     (status, Json(ErrorResponse { error: message }))
+}
+
+fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
+    match err {
+        CoreError::Vmm(husk_vmm::VmmError::VmNotFound(_))
+        | CoreError::Vmm(husk_vmm::VmmError::ProcessError(_))
+        | CoreError::Vmm(husk_vmm::VmmError::ApiError(_))
+        | CoreError::Agent(husk_core::AgentError::Connection(_))
+        | CoreError::Agent(husk_core::AgentError::VsockConnectRejected(_))
+        | CoreError::Agent(husk_core::AgentError::NotReady(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("agent not ready: {err}"),
+            }),
+        ),
+        other => map_error(other),
+    }
 }
 
 fn record_to_response(r: VmRecord) -> VmResponse {
