@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit update-deps check-deps
 
 all: lint test
 
@@ -140,3 +140,15 @@ test-k3s:
 # Run the daemon (development)
 run-daemon:
 	cargo run --package husk -- daemon --listen 127.0.0.1:7777
+
+# Security audit
+audit:
+	cargo audit
+
+# Update dependencies (requires: cargo install upd)
+update-deps:
+	upd
+
+# Check for outdated dependencies
+check-deps:
+	upd --check

@@ -61,3 +61,12 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: make test-macos
       - run: make test-initramfs
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - run: make audit
