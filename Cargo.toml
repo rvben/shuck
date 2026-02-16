@@ -17,6 +17,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 repository = "https://github.com/rvben/husk"
+license = "MIT"
+authors = ["Ruben Jongejan <ruben.jongejan@gmail.com>"]
+description = "An open-source microVM manager built on Firecracker"
+keywords = ["microvm", "firecracker", "virtualization"]
+categories = ["virtualization"]
 
 [workspace.dependencies]
 # Async runtime
