@@ -928,7 +928,7 @@ async fn get_logs<B: VmmBackend + 'static>(
             .header("content-type", "text/plain; charset=utf-8")
             .header("transfer-encoding", "chunked")
             .body(body)
-            .unwrap())
+            .expect("static response builder"))
     } else {
         let output = if let Some(n) = params.tail {
             tail_lines(&content, n)
@@ -939,7 +939,7 @@ async fn get_logs<B: VmmBackend + 'static>(
         Ok(axum::response::Response::builder()
             .header("content-type", "text/plain; charset=utf-8")
             .body(axum::body::Body::from(output))
-            .unwrap())
+            .expect("static response builder"))
     }
 }
 

@@ -323,7 +323,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("husk=info".parse().unwrap()),
+                .add_directive("husk=info".parse().expect("static directive")),
         )
         .init();
 
@@ -687,8 +687,7 @@ async fn main() -> Result<()> {
 
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .unwrap();
+                .build()?;
             if let Ok(resp) = client
                 .get(format!("{}/v1/health", cli.api_url))
                 .send()

@@ -192,7 +192,9 @@ impl<B: VmmBackend> HuskCore<B> {
         let vm_dir = self.storage.vm_dir(&req.name);
         if vm_dir.exists() {
             warn!(name = %req.name, "removing stale VM directory from incomplete cleanup");
-            let _ = tokio::fs::remove_dir_all(&vm_dir).await;
+            if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
+                warn!(dir = %vm_dir.display(), error = %e, "failed to remove stale VM directory");
+            }
         }
         let vm_rootfs = vm_dir.join("rootfs.ext4");
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
@@ -274,7 +276,9 @@ impl<B: VmmBackend> HuskCore<B> {
         let vm_dir = self.storage.vm_dir(&req.name);
         if vm_dir.exists() {
             warn!(name = %req.name, "removing stale VM directory from incomplete cleanup");
-            let _ = tokio::fs::remove_dir_all(&vm_dir).await;
+            if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
+                warn!(dir = %vm_dir.display(), error = %e, "failed to remove stale VM directory");
+            }
         }
         let vm_rootfs = vm_dir.join("rootfs.ext4");
         husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
@@ -340,26 +344,38 @@ impl<B: VmmBackend> HuskCore<B> {
     async fn rollback_create(&self, resources: AllocatedResources) {
         if let Some(vm_id) = resources.vm_id {
             debug!(%vm_id, "rolling back: destroying VM");
-            let _ = self.vmm.destroy_vm(vm_id).await;
+            if let Err(e) = self.vmm.destroy_vm(vm_id).await {
+                warn!(%vm_id, error = %e, "rollback: failed to destroy VM");
+            }
         }
         if let Some(ref dir) = resources.vm_dir {
             debug!(dir = %dir.display(), "rolling back: removing VM directory");
-            let _ = tokio::fs::remove_dir_all(dir).await;
+            if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+                warn!(dir = %dir.display(), error = %e, "rollback: failed to remove VM directory");
+            }
         }
         #[cfg(feature = "linux-net")]
         if let Some(ref tap) = resources.tap_name {
             debug!(tap, "rolling back: removing TAP");
-            let _ = husk_net::remove_all_port_forwards(tap).await;
-            let _ = husk_net::delete_tap(tap).await;
+            if let Err(e) = husk_net::remove_all_port_forwards(tap).await {
+                warn!(tap, error = %e, "rollback: failed to remove port forwards");
+            }
+            if let Err(e) = husk_net::delete_tap(tap).await {
+                warn!(tap, error = %e, "rollback: failed to delete TAP device");
+            }
         }
         if let Some(cid) = resources.cid {
             debug!(cid, "rolling back: releasing CID");
-            let _ = self.state.release_cid(cid);
+            if let Err(e) = self.state.release_cid(cid) {
+                warn!(cid, error = %e, "rollback: failed to release CID");
+            }
         }
         #[cfg(feature = "linux-net")]
         if let Some(guest_ip) = resources.guest_ip {
             debug!(%guest_ip, "rolling back: releasing IP");
-            let _ = self.ip_allocator.release(guest_ip);
+            if let Err(e) = self.ip_allocator.release(guest_ip) {
+                warn!(%guest_ip, error = %e, "rollback: failed to release IP");
+            }
         }
     }
 
@@ -436,14 +452,19 @@ impl<B: VmmBackend> HuskCore<B> {
         #[cfg(feature = "linux-net")]
         {
             if let Some(ref tap) = record.tap_device {
-                let _ = husk_net::remove_all_port_forwards(tap).await;
-                let _ = husk_net::delete_tap(tap).await;
+                if let Err(e) = husk_net::remove_all_port_forwards(tap).await {
+                    warn!(%name, tap, error = %e, "failed to remove port forwards during destroy");
+                }
+                if let Err(e) = husk_net::delete_tap(tap).await {
+                    warn!(%name, tap, error = %e, "failed to delete TAP device during destroy");
+                }
             }
 
             if let Some(ref guest_ip_str) = record.guest_ip
                 && let Ok(guest_ip) = guest_ip_str.parse::<Ipv4Addr>()
+                && let Err(e) = self.ip_allocator.release(guest_ip)
             {
-                let _ = self.ip_allocator.release(guest_ip);
+                warn!(%name, %guest_ip, error = %e, "failed to release IP during destroy");
             }
         }
 
@@ -451,10 +472,14 @@ impl<B: VmmBackend> HuskCore<B> {
         self.state.delete_port_forwards_for_vm(record.id)?;
 
         let vm_dir = self.storage.vm_dir(&record.name);
-        let _ = tokio::fs::remove_dir_all(&vm_dir).await;
+        if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
+            warn!(%name, dir = %vm_dir.display(), error = %e, "failed to remove VM directory during destroy");
+        }
 
         let serial_log = self.runtime_dir.join(format!("{}.serial.log", record.id));
-        let _ = tokio::fs::remove_file(&serial_log).await;
+        if let Err(e) = tokio::fs::remove_file(&serial_log).await {
+            warn!(%name, path = %serial_log.display(), error = %e, "failed to remove serial log during destroy");
+        }
 
         self.state.delete_vm(record.id)?;
         info!(%name, "VM destroyed");
@@ -653,7 +678,9 @@ impl<B: VmmBackend> HuskCore<B> {
 
         if let Err(ref e) = result {
             warn!(%name, error = %e, "userdata execution error");
-            let _ = self.state.update_userdata_status(record.id, "failed");
+            if let Err(status_err) = self.state.update_userdata_status(record.id, "failed") {
+                warn!(%name, error = %status_err, "failed to update userdata status to failed");
+            }
         }
 
         result
@@ -800,8 +827,10 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
 
     // Remove symlink if present (e.g. systemd-resolved's stub-resolv.conf)
     // so we can write a static file that persists across boot.
-    if resolv_path.is_symlink() {
-        let _ = tokio::fs::remove_file(&resolv_path).await;
+    if resolv_path.is_symlink()
+        && let Err(e) = tokio::fs::remove_file(&resolv_path).await
+    {
+        warn!(path = %resolv_path.display(), error = %e, "failed to remove resolv.conf symlink");
     }
 
     let contents: String = servers
@@ -815,8 +844,10 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
     let resolved_link = mount_dir
         .path()
         .join("etc/systemd/system/systemd-resolved.service");
-    if !resolved_link.exists() {
-        let _ = tokio::fs::symlink("/dev/null", &resolved_link).await;
+    if !resolved_link.exists()
+        && let Err(e) = tokio::fs::symlink("/dev/null", &resolved_link).await
+    {
+        warn!(path = %resolved_link.display(), error = %e, "failed to mask systemd-resolved");
     }
 
     // Always unmount, even if write failed
