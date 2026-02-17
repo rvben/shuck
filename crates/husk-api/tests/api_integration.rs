@@ -462,6 +462,99 @@ async fn image_endpoints_roundtrip() {
 }
 
 #[tokio::test]
+async fn secret_endpoints_roundtrip() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    let runtime_dir = temp.path().join("run");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let core = make_core(
+        husk_state::StateStore::open_memory().unwrap(),
+        husk_storage::StorageConfig {
+            data_dir: data_dir.clone(),
+        },
+        runtime_dir,
+    );
+    let app = router(core);
+
+    let create = serde_json::json!({
+        "name": "db-password",
+        "value": "hunter2",
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/secrets")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&create).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let secret = response_json(response).await;
+    assert_eq!(secret["name"], "db-password");
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/secrets").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let secrets = response_json(response).await;
+    assert_eq!(secrets.as_array().unwrap().len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/secrets/db-password/reveal")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let revealed = response_json(response).await;
+    assert_eq!(revealed["value"], "hunter2");
+
+    let rotate = serde_json::json!({ "value": "new-secret" });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/secrets/db-password/rotate")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&rotate).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/secrets/db-password/reveal")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let revealed = response_json(response).await;
+    assert_eq!(revealed["value"], "new-secret");
+
+    let response = app
+        .oneshot(
+            Request::delete("/v1/secrets/db-password")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn restore_missing_snapshot_returns_404() {
     let app = router(test_core());
     let body = serde_json::json!({

@@ -25,10 +25,10 @@ use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use husk_core::{
-    CoreError, CreateHostGroupRequest, CreateServiceRequest, CreateSnapshotRequest,
-    CreateVmRequest, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskCore, ImageRecord,
-    ImportImageRequest, RestoreSnapshotRequest, ServiceRecord, ShellEvent, SnapshotRecord,
-    VmRecord,
+    CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
+    CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, ExportImageResult, HostGroupRecord,
+    HuskCore, ImageRecord, ImportImageRequest, RestoreSnapshotRequest, RotateSecretRequest,
+    SecretMetadata, ServiceRecord, ShellEvent, SnapshotRecord, VmRecord,
 };
 use husk_vmm::VmmBackend;
 
@@ -98,6 +98,21 @@ pub struct ExportImageResponse {
     pub name: String,
     pub destination_path: String,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SecretResponse {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RevealedSecretResponse {
+    pub name: String,
+    pub value: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -343,6 +358,12 @@ pub enum WsShellOutput {
         get_image,
         delete_image,
         export_image,
+        list_secrets,
+        create_secret,
+        get_secret,
+        reveal_secret,
+        rotate_secret,
+        delete_secret,
         list_snapshots,
         create_snapshot,
         get_snapshot,
@@ -369,6 +390,8 @@ pub enum WsShellOutput {
         SnapshotResponse,
         ImageResponse,
         ExportImageResponse,
+        SecretResponse,
+        RevealedSecretResponse,
         ErrorResponse,
         ExecRequest,
         ExecResponse,
@@ -387,6 +410,8 @@ pub enum WsShellOutput {
         RestoreSnapshotRequest,
         ImportImageRequest,
         ExportImageRequest,
+        CreateSecretRequest,
+        RotateSecretRequest,
         ScaleServiceRequest,
         CreateVmRequest,
     )),
@@ -395,6 +420,7 @@ pub enum WsShellOutput {
         (name = "host_groups", description = "Host group management"),
         (name = "services", description = "Service model resources"),
         (name = "images", description = "Image catalog resources"),
+        (name = "secrets", description = "Encrypted secret resources"),
         (name = "snapshots", description = "Snapshot lifecycle resources"),
         (name = "exec", description = "Command execution in VMs"),
         (name = "files", description = "File transfer to/from VMs"),
@@ -574,6 +600,16 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         )
         .route("/v1/images/{name}/export", post(export_image::<B>))
         .route(
+            "/v1/secrets",
+            get(list_secrets::<B>).post(create_secret::<B>),
+        )
+        .route(
+            "/v1/secrets/{name}",
+            get(get_secret::<B>).delete(delete_secret::<B>),
+        )
+        .route("/v1/secrets/{name}/reveal", get(reveal_secret::<B>))
+        .route("/v1/secrets/{name}/rotate", post(rotate_secret::<B>))
+        .route(
             "/v1/snapshots",
             get(list_snapshots::<B>).post(create_snapshot::<B>),
         )
@@ -752,6 +788,10 @@ async fn rate_limit_middleware(
 }
 
 fn is_protected_route(method: &Method, path: &str) -> bool {
+    if path.starts_with("/v1/secrets") {
+        return true;
+    }
+
     if !(path.starts_with("/v1/vms")
         || path.starts_with("/v1/services")
         || path.starts_with("/v1/host-groups")
@@ -1182,6 +1222,126 @@ async fn export_image<B: VmmBackend + 'static>(
 ) -> Result<(StatusCode, Json<ExportImageResponse>), (StatusCode, Json<ErrorResponse>)> {
     let result = core.export_image(&name, req).await.map_err(map_error)?;
     Ok((StatusCode::CREATED, Json(export_result_to_response(result))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/secrets",
+    tag = "secrets",
+    responses(
+        (status = 200, description = "List of secret metadata", body = Vec<SecretResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn list_secrets<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<SecretResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let secrets = core.list_secrets().map_err(map_error)?;
+    Ok(Json(
+        secrets
+            .into_iter()
+            .map(secret_to_response)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/secrets",
+    tag = "secrets",
+    request_body = CreateSecretRequest,
+    responses(
+        (status = 201, description = "Secret created", body = SecretResponse),
+        (status = 409, description = "Secret already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn create_secret<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<CreateSecretRequest>,
+) -> Result<(StatusCode, Json<SecretResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let secret = core.create_secret(req).map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(secret_to_response(secret))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/secrets/{name}",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name")),
+    responses(
+        (status = 200, description = "Secret metadata", body = SecretResponse),
+        (status = 404, description = "Secret not found", body = ErrorResponse)
+    )
+)]
+async fn get_secret<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<SecretResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let secret = core.get_secret(&name).map_err(map_error)?;
+    Ok(Json(secret_to_response(secret)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/secrets/{name}/reveal",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name")),
+    responses(
+        (status = 200, description = "Revealed secret value", body = RevealedSecretResponse),
+        (status = 404, description = "Secret not found", body = ErrorResponse),
+        (status = 500, description = "Decryption error", body = ErrorResponse)
+    )
+)]
+async fn reveal_secret<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<RevealedSecretResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let revealed = core.reveal_secret(&name).map_err(map_error)?;
+    Ok(Json(RevealedSecretResponse {
+        name: revealed.name,
+        value: revealed.value,
+        updated_at: revealed.updated_at.to_rfc3339(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/secrets/{name}/rotate",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name")),
+    request_body = RotateSecretRequest,
+    responses(
+        (status = 200, description = "Secret rotated", body = SecretResponse),
+        (status = 404, description = "Secret not found", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn rotate_secret<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<RotateSecretRequest>,
+) -> Result<Json<SecretResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let secret = core.rotate_secret(&name, req).map_err(map_error)?;
+    Ok(Json(secret_to_response(secret)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/secrets/{name}",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name")),
+    responses(
+        (status = 204, description = "Secret deleted"),
+        (status = 404, description = "Secret not found", body = ErrorResponse)
+    )
+)]
+async fn delete_secret<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_secret(&name).map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -2153,6 +2313,9 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             (StatusCode::NOT_FOUND, "service_not_found", err.to_string())
         }
         CoreError::ImageNotFound(_) => (StatusCode::NOT_FOUND, "image_not_found", err.to_string()),
+        CoreError::SecretNotFound(_) => {
+            (StatusCode::NOT_FOUND, "secret_not_found", err.to_string())
+        }
         CoreError::SnapshotNotFound(_) => {
             (StatusCode::NOT_FOUND, "snapshot_not_found", err.to_string())
         }
@@ -2178,9 +2341,19 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "image_already_exists",
             err.to_string(),
         ),
+        CoreError::SecretAlreadyExists(_) => (
+            StatusCode::CONFLICT,
+            "secret_already_exists",
+            err.to_string(),
+        ),
         CoreError::SnapshotAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "snapshot_already_exists",
+            err.to_string(),
+        ),
+        CoreError::SecretCrypto(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "secret_crypto_error",
             err.to_string(),
         ),
         CoreError::Agent(husk_core::AgentError::NotReady(_)) => (
@@ -2276,6 +2449,15 @@ fn export_result_to_response(r: ExportImageResult) -> ExportImageResponse {
         name: r.name,
         destination_path: r.destination_path.to_string_lossy().into_owned(),
         size_bytes: r.size_bytes,
+    }
+}
+
+fn secret_to_response(r: SecretMetadata) -> SecretResponse {
+    SecretResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        created_at: r.created_at.to_rfc3339(),
+        updated_at: r.updated_at.to_rfc3339(),
     }
 }
 
@@ -2756,6 +2938,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secret_crud_and_reveal_basic() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let runtime_dir = temp.path().join("run");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let core = make_core(
+            husk_state::StateStore::open_memory().unwrap(),
+            husk_storage::StorageConfig {
+                data_dir: data_dir.clone(),
+            },
+            runtime_dir,
+        );
+        let app = router(core);
+
+        let create = serde_json::json!({
+            "name": "db-password",
+            "value": "hunter2",
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/secrets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        assert_eq!(created["name"], "db-password");
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/secrets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = response_json(response).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/secrets/db-password/reveal")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let revealed = response_json(response).await;
+        assert_eq!(revealed["value"], "hunter2");
+
+        let rotate = serde_json::json!({ "value": "new-value" });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/secrets/db-password/rotate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&rotate).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/secrets/db-password/reveal")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let revealed = response_json(response).await;
+        assert_eq!(revealed["value"], "new-value");
+
+        let response = app
+            .oneshot(
+                Request::delete("/v1/secrets/db-password")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn restore_missing_snapshot_returns_404() {
         let app = router(test_core());
         let body = serde_json::json!({
@@ -2990,11 +3265,17 @@ mod tests {
         assert!(!is_protected_route(&Method::GET, "/v1/services"));
         assert!(!is_protected_route(&Method::GET, "/v1/host-groups"));
         assert!(!is_protected_route(&Method::GET, "/v1/images"));
+        assert!(is_protected_route(&Method::GET, "/v1/secrets"));
         assert!(!is_protected_route(&Method::GET, "/v1/snapshots"));
         assert!(is_protected_route(&Method::POST, "/v1/services"));
         assert!(is_protected_route(&Method::POST, "/v1/host-groups"));
         assert!(is_protected_route(&Method::POST, "/v1/images"));
         assert!(is_protected_route(&Method::DELETE, "/v1/images/base"));
+        assert!(is_protected_route(&Method::POST, "/v1/secrets"));
+        assert!(is_protected_route(
+            &Method::DELETE,
+            "/v1/secrets/db-password"
+        ));
         assert!(is_protected_route(&Method::POST, "/v1/snapshots"));
         assert!(is_protected_route(&Method::DELETE, "/v1/snapshots/snap-1"));
         assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
@@ -3108,6 +3389,16 @@ mod tests {
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_secret_read_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(Request::get("/v1/secrets").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -3266,6 +3557,9 @@ mod tests {
         let (status, _) = map_error(CoreError::ImageNotFound("test".into()));
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        let (status, _) = map_error(CoreError::SecretNotFound("test".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
         let (status, _) = map_error(CoreError::HostGroupAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 
@@ -3273,6 +3567,9 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = map_error(CoreError::ImageAlreadyExists("test".into()));
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = map_error(CoreError::SecretAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = map_error(CoreError::InvalidArgument("bad value".into()));
@@ -3284,6 +3581,9 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
         let (status, _) = map_error(CoreError::Agent(AgentError::UnexpectedResponse));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, _) = map_error(CoreError::SecretCrypto("decrypt failed".into()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
         let (status, _) = map_error(CoreError::Storage(

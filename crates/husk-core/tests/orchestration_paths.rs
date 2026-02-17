@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use husk_core::{
-    CoreError, CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskCore,
-    ImportImageRequest, RestoreSnapshotRequest,
+    CoreError, CreateSecretRequest, CreateSnapshotRequest, CreateVmRequest, ExportImageRequest,
+    HuskCore, ImportImageRequest, RestoreSnapshotRequest, RotateSecretRequest,
 };
 use husk_state::{PortForwardRecord, StateStore, VmRecord};
 use husk_storage::StorageConfig;
@@ -1235,4 +1235,71 @@ async fn export_missing_image_returns_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::ImageNotFound(_)));
+}
+
+#[tokio::test]
+async fn secret_roundtrip_create_reveal_rotate_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let created = core
+        .create_secret(CreateSecretRequest {
+            name: "db-password".into(),
+            value: "hunter2".into(),
+        })
+        .unwrap();
+    assert_eq!(created.name, "db-password");
+    assert!(data_dir.join("keys/secrets.key").exists());
+
+    let listed = core.list_secrets().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "db-password");
+
+    let metadata = core.get_secret("db-password").unwrap();
+    assert_eq!(metadata.id, created.id);
+
+    let revealed = core.reveal_secret("db-password").unwrap();
+    assert_eq!(revealed.value, "hunter2");
+
+    core.rotate_secret(
+        "db-password",
+        RotateSecretRequest {
+            value: "new-password".into(),
+        },
+    )
+    .unwrap();
+    let revealed = core.reveal_secret("db-password").unwrap();
+    assert_eq!(revealed.value, "new-password");
+
+    core.delete_secret("db-password").unwrap();
+    assert!(core.list_secrets().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reveal_missing_secret_returns_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let err = core.reveal_secret("missing").unwrap_err();
+    assert!(matches!(err, CoreError::SecretNotFound(_)));
 }

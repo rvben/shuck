@@ -25,6 +25,7 @@ uuid = { workspace = true }
 serde_json = { workspace = true }
 utoipa = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
+ring = "0.17"
 
 [dev-dependencies]
 husk-agent = { path = "../husk-agent" }

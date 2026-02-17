@@ -44,6 +44,12 @@ pub enum StateError {
     ImageNotFoundByName(String),
     #[error("image already exists: {0}")]
     ImageAlreadyExists(String),
+    #[error("secret not found: {0}")]
+    SecretNotFound(Uuid),
+    #[error("secret not found by name: {0}")]
+    SecretNotFoundByName(String),
+    #[error("secret already exists: {0}")]
+    SecretAlreadyExists(String),
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
     #[error("lock poisoned")]
@@ -133,6 +139,17 @@ pub struct ImageRecord {
     pub format: String,
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
+}
+
+/// Persistent secret record (ciphertext only; plaintext never stored).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// SQLite-backed state store. Thread-safe via internal Mutex.
@@ -240,6 +257,15 @@ impl StateStore {
                 format TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS secrets (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                ciphertext BLOB NOT NULL,
+                nonce BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )?;
 
@@ -730,6 +756,107 @@ impl StateStore {
         Ok(())
     }
 
+    // ── Secrets ──────────────────────────────────────────────────────
+
+    /// Insert a new secret record.
+    pub fn insert_secret(&self, record: &SecretRecord) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO secrets (id, name, ciphertext, nonce, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.ciphertext,
+                record.nonce,
+                record.created_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::SecretAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get a secret by ID.
+    pub fn get_secret(&self, id: Uuid) -> Result<SecretRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, ciphertext, nonce, created_at, updated_at
+             FROM secrets WHERE id = ?1",
+            params![id.to_string()],
+            row_to_secret_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::SecretNotFound(id),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// Get a secret by name.
+    pub fn get_secret_by_name(&self, name: &str) -> Result<SecretRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, ciphertext, nonce, created_at, updated_at
+             FROM secrets WHERE name = ?1",
+            params![name],
+            row_to_secret_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::SecretNotFoundByName(name.into()),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all secrets.
+    pub fn list_secrets(&self) -> Result<Vec<SecretRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, ciphertext, nonce, created_at, updated_at
+             FROM secrets ORDER BY created_at",
+        )?;
+        let records = stmt
+            .query_map([], row_to_secret_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Update encrypted payload and nonce for a secret by ID.
+    pub fn update_secret_payload(
+        &self,
+        id: Uuid,
+        ciphertext: &[u8],
+        nonce: &[u8],
+    ) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE secrets
+             SET ciphertext = ?2, nonce = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id.to_string(), ciphertext, nonce, Utc::now().to_rfc3339()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::SecretNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Delete a secret record.
+    pub fn delete_secret(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute("DELETE FROM secrets WHERE id = ?1", params![id.to_string()])?;
+        if deleted == 0 {
+            return Err(StateError::SecretNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Allocate the next vsock CID.
     ///
     /// Reuses previously released CIDs (lowest first) before incrementing.
@@ -996,6 +1123,21 @@ fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord>
     })
 }
 
+fn row_to_secret_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecord> {
+    let id_str: String = row.get(0)?;
+    let created_str: String = row.get(4)?;
+    let updated_str: String = row.get(5)?;
+
+    Ok(SecretRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        ciphertext: row.get(2)?,
+        nonce: row.get(3)?,
+        created_at: parse_datetime(&created_str)?,
+        updated_at: parse_datetime(&updated_str)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1205,17 @@ mod tests {
             format: "ext4".into(),
             size_bytes: 1024,
             created_at: Utc::now(),
+        }
+    }
+
+    fn make_secret(name: &str, payload: &[u8]) -> SecretRecord {
+        SecretRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            ciphertext: payload.to_vec(),
+            nonce: vec![7; 12],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -1779,5 +1932,72 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let err = store.delete_image(Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StateError::ImageNotFound(_)));
+    }
+
+    // ── Secrets ──────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_get_secret() {
+        let store = StateStore::open_memory().unwrap();
+        let secret = make_secret("db-password", b"ciphertext");
+        store.insert_secret(&secret).unwrap();
+
+        let fetched = store.get_secret(secret.id).unwrap();
+        assert_eq!(fetched.name, "db-password");
+        assert_eq!(fetched.ciphertext, b"ciphertext");
+    }
+
+    #[test]
+    fn get_secret_by_name() {
+        let store = StateStore::open_memory().unwrap();
+        let secret = make_secret("api-token", b"abc");
+        store.insert_secret(&secret).unwrap();
+
+        let fetched = store.get_secret_by_name("api-token").unwrap();
+        assert_eq!(fetched.id, secret.id);
+    }
+
+    #[test]
+    fn list_secrets_returns_all() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_secret(&make_secret("sec-a", b"a")).unwrap();
+        store.insert_secret(&make_secret("sec-b", b"b")).unwrap();
+
+        let secrets = store.list_secrets().unwrap();
+        assert_eq!(secrets.len(), 2);
+    }
+
+    #[test]
+    fn update_secret_payload_persists() {
+        let store = StateStore::open_memory().unwrap();
+        let secret = make_secret("rotated", b"old");
+        store.insert_secret(&secret).unwrap();
+
+        store
+            .update_secret_payload(secret.id, b"new", &[1, 2, 3, 4])
+            .unwrap();
+
+        let fetched = store.get_secret(secret.id).unwrap();
+        assert_eq!(fetched.ciphertext, b"new");
+        assert_eq!(fetched.nonce, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn duplicate_secret_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_secret(&make_secret("dup", b"a")).unwrap();
+
+        let err = store.insert_secret(&make_secret("dup", b"b")).unwrap_err();
+        assert!(
+            matches!(err, StateError::SecretAlreadyExists(ref name) if name == "dup"),
+            "expected SecretAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_secret() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.delete_secret(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::SecretNotFound(_)));
     }
 }

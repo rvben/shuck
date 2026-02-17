@@ -191,6 +191,12 @@ enum Commands {
         action: ImageAction,
     },
 
+    /// Manage encrypted secrets
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+
     /// Open an interactive shell in a VM
     Shell {
         /// VM name
@@ -382,6 +388,43 @@ enum ImageAction {
     /// Delete an image by name
     Delete {
         /// Image name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Create a secret
+    Create {
+        /// Secret name
+        name: String,
+        /// Secret plaintext value
+        #[arg(long)]
+        value: String,
+    },
+    /// List secret metadata
+    List,
+    /// Get secret metadata by name
+    Get {
+        /// Secret name
+        name: String,
+    },
+    /// Reveal decrypted secret value
+    Reveal {
+        /// Secret name
+        name: String,
+    },
+    /// Rotate secret to a new value
+    Rotate {
+        /// Secret name
+        name: String,
+        /// New plaintext value
+        #[arg(long)]
+        value: String,
+    },
+    /// Delete a secret by name
+    Delete {
+        /// Secret name
         name: String,
     },
 }
@@ -1108,6 +1151,10 @@ async fn main() -> Result<()> {
         Commands::Image { action } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             image_command(api_url, api_token, action, output).await
+        }
+        Commands::Secret { action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            secret_command(api_url, api_token, action, output).await
         }
         Commands::Logs { name, follow, tail } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -2063,6 +2110,184 @@ async fn image_command(
                 );
             } else {
                 let msg = api_error(resp, &format!("image '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn secret_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: SecretAction,
+    output: OutputFormat,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        SecretAction::Create { name, value } => {
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/secrets")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({
+                    "name": &name,
+                    "value": &value,
+                })),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let secret: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "secret-create",
+                        "secret": secret,
+                    }),
+                    format!("Created secret: {}", secret["name"].as_str().unwrap_or("-")),
+                );
+            } else {
+                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        SecretAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/secrets")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing secrets").await;
+                exit_with_error(output, msg);
+            }
+
+            let secrets: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "secret-list",
+                        "secrets": secrets,
+                    }),
+                    "",
+                );
+            } else if secrets.is_empty() {
+                println!("No secrets found");
+            } else {
+                println!("{:<24} {}", "NAME", "UPDATED");
+                for secret in &secrets {
+                    println!(
+                        "{:<24} {}",
+                        secret["name"].as_str().unwrap_or("-"),
+                        secret["updated_at"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        SecretAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/secrets/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let secret: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "secret-get",
+                        "secret": secret,
+                    }),
+                    "",
+                );
+            } else {
+                println!("Name:     {}", secret["name"].as_str().unwrap_or("-"));
+                println!("Created:  {}", secret["created_at"].as_str().unwrap_or("-"));
+                println!("Updated:  {}", secret["updated_at"].as_str().unwrap_or("-"));
+            }
+        }
+        SecretAction::Reveal { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/secrets/{name}/reveal")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let revealed: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "secret-reveal",
+                        "secret": revealed,
+                    }),
+                    "",
+                );
+            } else {
+                println!("{}", revealed["value"].as_str().unwrap_or(""));
+            }
+        }
+        SecretAction::Rotate { name, value } => {
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/secrets/{name}/rotate")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({
+                    "value": &value,
+                })),
+            )
+            .await?;
+            if resp.status().is_success() {
+                let secret: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "secret-rotate",
+                        "secret": secret,
+                    }),
+                    format!("Rotated secret: {}", secret["name"].as_str().unwrap_or("-")),
+                );
+            } else {
+                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        SecretAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/secrets/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "secret-delete",
+                        "secret": &name,
+                    }),
+                    format!("Deleted secret: {name}"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("secret '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -3230,6 +3455,50 @@ mod tests {
                 assert_eq!(destination, PathBuf::from("/tmp/exported.ext4"));
             }
             _ => panic!("expected image export command"),
+        }
+    }
+
+    #[test]
+    fn parse_secret_create_command() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "secret",
+            "create",
+            "db-password",
+            "--value",
+            "hunter2",
+        ])
+        .expect("secret create parses");
+        match cli.command {
+            Commands::Secret {
+                action: SecretAction::Create { name, value },
+            } => {
+                assert_eq!(name, "db-password");
+                assert_eq!(value, "hunter2");
+            }
+            _ => panic!("expected secret create command"),
+        }
+    }
+
+    #[test]
+    fn parse_secret_rotate_command() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "secret",
+            "rotate",
+            "db-password",
+            "--value",
+            "new-value",
+        ])
+        .expect("secret rotate parses");
+        match cli.command {
+            Commands::Secret {
+                action: SecretAction::Rotate { name, value },
+            } => {
+                assert_eq!(name, "db-password");
+                assert_eq!(value, "new-value");
+            }
+            _ => panic!("expected secret rotate command"),
         }
     }
 

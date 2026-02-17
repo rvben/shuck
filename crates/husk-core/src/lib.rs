@@ -8,11 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use husk_vmm::VmmBackend;
+use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub use husk_state::{HostGroupRecord, ImageRecord, ServiceRecord, SnapshotRecord, VmRecord};
+pub use husk_state::{
+    HostGroupRecord, ImageRecord, SecretRecord, ServiceRecord, SnapshotRecord, VmRecord,
+};
 pub use husk_vmm::{VmInfo, VmState};
 
 pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, ShellEvent};
@@ -45,6 +48,12 @@ pub enum CoreError {
     ImageNotFound(String),
     #[error("image already exists: {0}")]
     ImageAlreadyExists(String),
+    #[error("secret not found: {0}")]
+    SecretNotFound(String),
+    #[error("secret already exists: {0}")]
+    SecretAlreadyExists(String),
+    #[error("secret crypto error: {0}")]
+    SecretCrypto(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("VMM error: {0}")]
@@ -158,6 +167,40 @@ pub struct ExportImageResult {
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub destination_path: PathBuf,
     pub size_bytes: u64,
+}
+
+/// Parameters for creating a secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CreateSecretRequest {
+    pub name: String,
+    pub value: String,
+}
+
+/// Parameters for rotating an existing secret's value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct RotateSecretRequest {
+    pub value: String,
+}
+
+/// Public metadata for a secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct SecretMetadata {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Decrypted secret payload returned by reveal operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct RevealedSecret {
+    pub name: String,
+    pub value: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -971,6 +1014,114 @@ impl<B: VmmBackend> HuskCore<B> {
         })
     }
 
+    /// Create a new encrypted secret.
+    pub fn create_secret(&self, req: CreateSecretRequest) -> Result<SecretMetadata, CoreError> {
+        if req.name.trim().is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "secret name cannot be empty".into(),
+            ));
+        }
+
+        let key = load_or_create_secret_key(&self.storage.data_dir)?;
+        let (ciphertext, nonce) = encrypt_secret(&key, req.value.as_bytes())?;
+        let now = chrono::Utc::now();
+        let record = SecretRecord {
+            id: Uuid::new_v4(),
+            name: req.name,
+            ciphertext,
+            nonce,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.state.insert_secret(&record).map_err(|e| match e {
+            husk_state::StateError::SecretAlreadyExists(name) => {
+                CoreError::SecretAlreadyExists(name)
+            }
+            other => CoreError::State(other),
+        })?;
+
+        Ok(secret_to_metadata(record))
+    }
+
+    /// List secret metadata (never includes plaintext values).
+    pub fn list_secrets(&self) -> Result<Vec<SecretMetadata>, CoreError> {
+        Ok(self
+            .state
+            .list_secrets()?
+            .into_iter()
+            .map(secret_to_metadata)
+            .collect())
+    }
+
+    /// Get metadata for a secret by name.
+    pub fn get_secret(&self, name: &str) -> Result<SecretMetadata, CoreError> {
+        let record = self.state.get_secret_by_name(name).map_err(|e| match e {
+            husk_state::StateError::SecretNotFoundByName(_) => {
+                CoreError::SecretNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })?;
+        Ok(secret_to_metadata(record))
+    }
+
+    /// Reveal decrypted plaintext for a secret by name.
+    pub fn reveal_secret(&self, name: &str) -> Result<RevealedSecret, CoreError> {
+        let record = self.state.get_secret_by_name(name).map_err(|e| match e {
+            husk_state::StateError::SecretNotFoundByName(_) => {
+                CoreError::SecretNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })?;
+        let key = load_or_create_secret_key(&self.storage.data_dir)?;
+        let plaintext = decrypt_secret(&key, &record.nonce, &record.ciphertext)?;
+        let value = String::from_utf8(plaintext)
+            .map_err(|e| CoreError::SecretCrypto(format!("secret is not valid UTF-8: {e}")))?;
+
+        Ok(RevealedSecret {
+            name: record.name,
+            value,
+            updated_at: record.updated_at,
+        })
+    }
+
+    /// Rotate (replace) the value of an existing secret.
+    pub fn rotate_secret(
+        &self,
+        name: &str,
+        req: RotateSecretRequest,
+    ) -> Result<SecretMetadata, CoreError> {
+        let existing = self.state.get_secret_by_name(name).map_err(|e| match e {
+            husk_state::StateError::SecretNotFoundByName(_) => {
+                CoreError::SecretNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })?;
+        let key = load_or_create_secret_key(&self.storage.data_dir)?;
+        let (ciphertext, nonce) = encrypt_secret(&key, req.value.as_bytes())?;
+        self.state
+            .update_secret_payload(existing.id, &ciphertext, &nonce)
+            .map_err(|e| match e {
+                husk_state::StateError::SecretNotFound(_) => CoreError::SecretNotFound(name.into()),
+                other => CoreError::State(other),
+            })?;
+        self.get_secret(name)
+    }
+
+    /// Delete a secret by name.
+    pub fn delete_secret(&self, name: &str) -> Result<(), CoreError> {
+        let secret = self.state.get_secret_by_name(name).map_err(|e| match e {
+            husk_state::StateError::SecretNotFoundByName(_) => {
+                CoreError::SecretNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })?;
+        self.state.delete_secret(secret.id).map_err(|e| match e {
+            husk_state::StateError::SecretNotFound(_) => CoreError::SecretNotFound(name.into()),
+            other => CoreError::State(other),
+        })
+    }
+
     /// Path to a VM's serial console log file.
     pub fn serial_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         let record = self.lookup_vm(name)?;
@@ -1324,6 +1475,136 @@ impl<B: VmmBackend> HuskCore<B> {
             other => CoreError::State(other),
         })
     }
+}
+
+const SECRET_KEY_LEN: usize = 32;
+const SECRET_NONCE_LEN: usize = 12;
+
+fn secret_to_metadata(secret: SecretRecord) -> SecretMetadata {
+    SecretMetadata {
+        id: secret.id,
+        name: secret.name,
+        created_at: secret.created_at,
+        updated_at: secret.updated_at,
+    }
+}
+
+fn load_or_create_secret_key(data_dir: &Path) -> Result<[u8; SECRET_KEY_LEN], CoreError> {
+    let key_path = data_dir.join("keys/secrets.key");
+    match std::fs::read(&key_path) {
+        Ok(bytes) => {
+            if bytes.len() != SECRET_KEY_LEN {
+                return Err(CoreError::InvalidArgument(format!(
+                    "invalid secret key length in {}: expected {}, got {}",
+                    key_path.display(),
+                    SECRET_KEY_LEN,
+                    bytes.len()
+                )));
+            }
+            let mut key = [0u8; SECRET_KEY_LEN];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Storage(husk_storage::StorageError::Io(e))),
+    }
+
+    let parent = key_path
+        .parent()
+        .ok_or_else(|| CoreError::InvalidArgument("invalid secret key path".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| CoreError::Storage(husk_storage::StorageError::Io(e)))?;
+
+    let mut key = [0u8; SECRET_KEY_LEN];
+    ring::rand::SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| CoreError::SecretCrypto("failed to generate secret key".into()))?;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&key_path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(&key)
+                .map_err(|e| CoreError::Storage(husk_storage::StorageError::Io(e)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let bytes = std::fs::read(&key_path)
+                .map_err(|read_err| CoreError::Storage(husk_storage::StorageError::Io(read_err)))?;
+            if bytes.len() != SECRET_KEY_LEN {
+                return Err(CoreError::InvalidArgument(format!(
+                    "invalid secret key length in {}: expected {}, got {}",
+                    key_path.display(),
+                    SECRET_KEY_LEN,
+                    bytes.len()
+                )));
+            }
+            let mut existing = [0u8; SECRET_KEY_LEN];
+            existing.copy_from_slice(&bytes);
+            Ok(existing)
+        }
+        Err(e) => Err(CoreError::Storage(husk_storage::StorageError::Io(e))),
+    }
+}
+
+fn encrypt_secret(
+    key_bytes: &[u8; SECRET_KEY_LEN],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
+    let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key_bytes)
+        .map_err(|_| CoreError::SecretCrypto("failed to initialize encryption key".into()))?;
+    let key = ring::aead::LessSafeKey::new(unbound);
+
+    let mut nonce_bytes = [0u8; SECRET_NONCE_LEN];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| CoreError::SecretCrypto("failed to generate secret nonce".into()))?;
+
+    let mut in_out = plaintext.to_vec();
+    key.seal_in_place_append_tag(
+        ring::aead::Nonce::assume_unique_for_key(nonce_bytes),
+        ring::aead::Aad::empty(),
+        &mut in_out,
+    )
+    .map_err(|_| CoreError::SecretCrypto("failed to encrypt secret".into()))?;
+    Ok((in_out, nonce_bytes.to_vec()))
+}
+
+fn decrypt_secret(
+    key_bytes: &[u8; SECRET_KEY_LEN],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CoreError> {
+    if nonce_bytes.len() != SECRET_NONCE_LEN {
+        return Err(CoreError::SecretCrypto(format!(
+            "invalid nonce length: expected {SECRET_NONCE_LEN}, got {}",
+            nonce_bytes.len()
+        )));
+    }
+
+    let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key_bytes)
+        .map_err(|_| CoreError::SecretCrypto("failed to initialize decryption key".into()))?;
+    let key = ring::aead::LessSafeKey::new(unbound);
+
+    let mut nonce = [0u8; SECRET_NONCE_LEN];
+    nonce.copy_from_slice(nonce_bytes);
+    let mut in_out = ciphertext.to_vec();
+    let plaintext = key
+        .open_in_place(
+            ring::aead::Nonce::assume_unique_for_key(nonce),
+            ring::aead::Aad::empty(),
+            &mut in_out,
+        )
+        .map_err(|_| CoreError::SecretCrypto("failed to decrypt secret".into()))?;
+    Ok(plaintext.to_vec())
 }
 
 fn infer_image_format(path: &Path) -> String {

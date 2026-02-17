@@ -795,6 +795,7 @@ dependencies = [
  "husk-state",
  "husk-storage",
  "husk-vmm",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
