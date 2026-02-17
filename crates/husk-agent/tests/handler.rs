@@ -181,6 +181,74 @@ async fn read_nonexistent_file() {
 }
 
 #[tokio::test]
+async fn write_file_invalid_base64_returns_error() {
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::WriteFile(WriteFileRequest {
+        path: "/tmp/husk-invalid-b64".into(),
+        data: "***".into(),
+        mode: None,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message.contains("base64 decode failed"),
+                "got unexpected error: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn shell_data_without_session_returns_error() {
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: base64_encode(b"echo hi\n"),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message
+                    .contains("shell messages are not valid outside a shell session"),
+                "got unexpected error: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn shell_resize_without_session_returns_error() {
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::ShellResize(ShellResizeRequest { cols: 100, rows: 50 });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message
+                    .contains("shell messages are not valid outside a shell session"),
+                "got unexpected error: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn multiple_operations_on_one_connection() {
     let mut stream = spawn_agent().await;
 
@@ -581,6 +649,145 @@ async fn shell_term_and_multiple_env_vars() {
     assert!(
         output.contains("HUSK_TEST=42"),
         "expected HUSK_TEST=42 in output, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn shell_start_without_command_uses_default_shell() {
+    let mut stream = spawn_agent().await;
+
+    if !shell_start_or_skip(
+        &mut stream,
+        ShellStartRequest {
+            command: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    {
+        return;
+    }
+
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: base64_encode(b"echo DEFAULT-SHELL\nexit 0\n"),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let mut output_data = Vec::new();
+    loop {
+        let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+        match response {
+            AgentResponse::ShellData(d) => output_data.extend(base64_decode(&d.data).unwrap()),
+            AgentResponse::ShellExit(e) => {
+                assert_eq!(e.exit_code, 0);
+                break;
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    let output = String::from_utf8_lossy(&output_data);
+    assert!(
+        output.contains("DEFAULT-SHELL"),
+        "expected default shell output, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn shell_ignores_unexpected_messages_during_session() {
+    let mut stream = spawn_agent().await;
+
+    if !shell_start_or_skip(
+        &mut stream,
+        ShellStartRequest {
+            command: Some("cat".into()),
+            env: vec![],
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    {
+        return;
+    }
+
+    // This message type is irrelevant once in shell mode and should be ignored.
+    write_message(&mut stream, &AgentRequest::Ping).await.unwrap();
+
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: base64_encode(b"after-ping\n"),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let mut output = Vec::new();
+    while let Ok(Ok(Some(AgentResponse::ShellData(d)))) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_message::<AgentResponse, _>(&mut stream),
+    )
+    .await
+    {
+        output.extend(base64_decode(&d.data).unwrap());
+        if output.windows(10).any(|w| w == b"after-ping") {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("after-ping"),
+        "expected output to contain 'after-ping', got: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn shell_invalid_base64_input_is_ignored() {
+    let mut stream = spawn_agent().await;
+
+    if !shell_start_or_skip(
+        &mut stream,
+        ShellStartRequest {
+            command: Some("cat".into()),
+            env: vec![],
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    {
+        return;
+    }
+
+    // Invalid base64 should be ignored by the shell loop.
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: "***".into(),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    // Valid data should still be processed afterwards.
+    let request = AgentRequest::ShellData(ShellDataRequest {
+        data: base64_encode(b"valid-after-invalid\n"),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let mut output = Vec::new();
+    while let Ok(Ok(Some(AgentResponse::ShellData(d)))) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_message::<AgentResponse, _>(&mut stream),
+    )
+    .await
+    {
+        output.extend(base64_decode(&d.data).unwrap());
+        if output.windows(19).any(|w| w == b"valid-after-invalid") {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("valid-after-invalid"),
+        "expected output to contain 'valid-after-invalid', got: {text:?}"
     );
 }
 

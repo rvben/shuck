@@ -1,4 +1,9 @@
-use husk_core::agent_client::{AgentClient, AgentConnection};
+use husk_agent_proto::{
+    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, ReadFileResponse, ShellExitResponse,
+    WriteFileResponse, base64_decode, read_message, write_message,
+};
+use husk_core::agent_client::{AgentClient, AgentConnection, AgentError, ShellEvent};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Spawn the agent handler on a temporary Unix socket and return the socket path.
 async fn spawn_agent() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -18,6 +23,64 @@ async fn spawn_agent() -> (tempfile::TempDir, std::path::PathBuf) {
     // Give the listener a moment to start
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
+    (dir, path)
+}
+
+/// Spawn a minimal Firecracker-vsock-like Unix listener that responds to CONNECT.
+async fn spawn_vsock_proxy(response_line: &'static [u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("firecracker.vsock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 128];
+        let _ = stream.read(&mut buf).await.unwrap();
+        stream.write_all(response_line).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    (dir, path)
+}
+
+/// Spawn a vsock proxy that accepts one or more CONNECT handshakes and then
+/// answers a single Ping request per connection.
+async fn spawn_vsock_ping_proxy(
+    ping_outcomes: Vec<bool>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("firecracker.vsock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+    tokio::spawn(async move {
+        for should_pong in ping_outcomes {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let mut handshake = [0u8; 128];
+            let _ = stream.read(&mut handshake).await.unwrap();
+            stream.write_all(b"OK 123\n").await.unwrap();
+
+            let request: AgentRequest = read_message(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, AgentRequest::Ping));
+
+            if should_pong {
+                write_message(&mut stream, &AgentResponse::Pong)
+                    .await
+                    .unwrap();
+            } else {
+                write_message(
+                    &mut stream,
+                    &AgentResponse::Error(ErrorResponse {
+                        message: "not ready yet".into(),
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     (dir, path)
 }
 
@@ -142,4 +205,387 @@ async fn agent_connection_from_raw_stream() {
 
     let result = conn.exec("echo", &["raw"], None, &[]).await.unwrap();
     assert_eq!(result.stdout.trim(), "raw");
+}
+
+#[tokio::test]
+async fn connect_maps_rejected_vsock_handshake() {
+    let (_dir, path) = spawn_vsock_proxy(b"ERR nope\n").await;
+    let err = match AgentClient::connect(&path, 52).await {
+        Ok(_) => panic!("expected connect rejection"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, AgentError::VsockConnectRejected(52)));
+}
+
+#[tokio::test]
+async fn connect_accepts_ok_vsock_handshake() {
+    let (_dir, path) = spawn_vsock_proxy(b"OK 123\n").await;
+    let connected = AgentClient::connect(&path, 52).await;
+    assert!(connected.is_ok());
+}
+
+#[tokio::test]
+async fn connect_unix_missing_socket_maps_connection_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.sock");
+    let err = match AgentClient::connect_unix(&missing).await {
+        Ok(_) => panic!("expected unix connect error"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, AgentError::Connection(_)));
+}
+
+#[tokio::test]
+async fn connect_missing_vsock_socket_maps_connection_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.firecracker.vsock");
+    let err = match AgentClient::connect(&missing, 52).await {
+        Ok(_) => panic!("expected vsock connect error"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, AgentError::Connection(_)));
+}
+
+#[tokio::test]
+async fn wait_ready_retries_until_ping_succeeds() {
+    let (_dir, path) = spawn_vsock_ping_proxy(vec![false, true]).await;
+    let start = std::time::Instant::now();
+    let result = AgentClient::wait_ready(&path, 52, std::time::Duration::from_secs(2)).await;
+    assert!(result.is_ok());
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(90),
+        "expected at least one backoff sleep before success"
+    );
+}
+
+#[tokio::test]
+async fn ping_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::Ping));
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse {
+                message: "boom".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.ping().await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "boom"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn ping_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::Ping));
+        write_message(
+            &mut server,
+            &AgentResponse::Exec(ExecResponse {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.ping().await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        match req {
+            AgentRequest::Exec(r) => assert_eq!(r.command, "echo"),
+            other => panic!("expected Exec request, got {other:?}"),
+        }
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse {
+                message: "exec failed in guest".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.exec("echo", &["x"], None, &[]).await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg.contains("exec failed")));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let _req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        write_message(&mut server, &AgentResponse::Pong)
+            .await
+            .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.exec("echo", &["x"], None, &[]).await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn read_file_invalid_base64_maps_to_agent_error() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::ReadFile(_)));
+        write_message(
+            &mut server,
+            &AgentResponse::ReadFile(ReadFileResponse {
+                data: "%%%".into(),
+                size: 3,
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.read_file("/tmp/test").await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg.contains("base64 decode failed")));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn read_file_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::ReadFile(_)));
+        write_message(&mut server, &AgentResponse::Pong)
+            .await
+            .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.read_file("/tmp/test").await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn write_file_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::WriteFile(_)));
+        write_message(&mut server, &AgentResponse::Pong)
+            .await
+            .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.write_file("/tmp/out", b"abc", Some(0o644)).await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn write_file_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::WriteFile(_)));
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse {
+                message: "write denied".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn
+        .write_file("/tmp/out", b"abc", Some(0o644))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "write denied"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_start_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        match req {
+            AgentRequest::ShellStart(r) => {
+                assert_eq!(r.command.as_deref(), Some("sh"));
+                assert_eq!(r.cols, 120);
+                assert_eq!(r.rows, 40);
+                assert!(r.env.iter().any(|(k, v)| k == "TERM" && v == "xterm"));
+            }
+            other => panic!("expected ShellStart request, got {other:?}"),
+        }
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse {
+                message: "shell denied".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shell_start(Some("sh"), 120, 40).await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "shell denied"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_start_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::ShellStart(_)));
+        write_message(&mut server, &AgentResponse::Pong)
+            .await
+            .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shell_start(Some("sh"), 80, 24).await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_recv_invalid_base64_maps_to_agent_error() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        write_message(
+            &mut server,
+            &AgentResponse::ShellData(husk_agent_proto::ShellDataResponse { data: "***".into() }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shell_recv().await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg.contains("base64 decode failed")));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_recv_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        write_message(
+            &mut server,
+            &AgentResponse::WriteFile(WriteFileResponse { bytes_written: 1 }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shell_recv().await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_recv_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse {
+                message: "shell failed".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shell_recv().await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "shell failed"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_recv_parses_exit_event() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        write_message(
+            &mut server,
+            &AgentResponse::ShellExit(ShellExitResponse { exit_code: 7 }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    match conn.shell_recv().await.unwrap() {
+        ShellEvent::Exit(code) => assert_eq!(code, 7),
+        other => panic!("expected exit event, got {other:?}"),
+    }
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_send_encodes_binary_payload() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let payload = b"\x00hello\xff".to_vec();
+    let expected = payload.clone();
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        match req {
+            AgentRequest::ShellData(r) => {
+                let decoded = base64_decode(&r.data).unwrap();
+                assert_eq!(decoded, expected);
+            }
+            other => panic!("expected shell data, got {other:?}"),
+        }
+    });
+
+    let mut conn = AgentConnection::new(client);
+    conn.shell_send(&payload).await.unwrap();
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_resize_sends_dimensions() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        match req {
+            AgentRequest::ShellResize(r) => {
+                assert_eq!(r.cols, 132);
+                assert_eq!(r.rows, 43);
+            }
+            other => panic!("expected shell resize, got {other:?}"),
+        }
+    });
+
+    let mut conn = AgentConnection::new(client);
+    conn.shell_resize(132, 43).await.unwrap();
+    server_task.await.unwrap();
 }
