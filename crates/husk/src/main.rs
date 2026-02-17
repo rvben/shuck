@@ -163,6 +163,20 @@ enum Commands {
         action: PortForwardAction,
     },
 
+    /// Manage host groups
+    #[command(alias = "hg")]
+    HostGroup {
+        #[command(subcommand)]
+        action: HostGroupAction,
+    },
+
+    /// Manage service resources
+    #[command(alias = "svc")]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Open an interactive shell in a VM
     Shell {
         /// VM name
@@ -216,6 +230,60 @@ enum PortForwardAction {
     },
     /// List port forwards
     List,
+}
+
+#[derive(Subcommand)]
+enum HostGroupAction {
+    /// Create a host group
+    Create {
+        /// Host group name
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List host groups
+    List,
+    /// Get a host group by name
+    Get {
+        /// Host group name
+        name: String,
+    },
+    /// Delete a host group by name
+    Delete {
+        /// Host group name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Create a service
+    Create {
+        /// Service name
+        name: String,
+        /// Optional host group name
+        #[arg(long)]
+        host_group: Option<String>,
+        /// Desired instance count
+        #[arg(long, default_value_t = 1)]
+        desired_instances: u32,
+        /// Optional service image reference
+        #[arg(long)]
+        image: Option<String>,
+    },
+    /// List services
+    List,
+    /// Get a service by name
+    Get {
+        /// Service name
+        name: String,
+    },
+    /// Delete a service by name
+    Delete {
+        /// Service name
+        name: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -925,6 +993,14 @@ async fn main() -> Result<()> {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             port_forward(api_url, api_token, name, action, output).await
         }
+        Commands::HostGroup { action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            host_group_command(api_url, api_token, action, output).await
+        }
+        Commands::Service { action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            service_command(api_url, api_token, action, output).await
+        }
         Commands::Logs { name, follow, tail } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let mut url = format!("{api_url}/v1/vms/{name}/logs");
@@ -1177,6 +1253,307 @@ async fn port_forward(
                         pf["protocol"].as_str().unwrap_or("tcp"),
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn host_group_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: HostGroupAction,
+    output: OutputFormat,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        HostGroupAction::Create { name, description } => {
+            let mut body = serde_json::json!({
+                "name": &name,
+            });
+            if let Some(desc) = description.as_deref() {
+                body["description"] = serde_json::json!(desc);
+            }
+
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/host-groups")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let group: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "host-group-create",
+                        "host_group": group,
+                    }),
+                    format!(
+                        "Created host group: {}",
+                        group["name"].as_str().unwrap_or("-")
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("host group '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        HostGroupAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/host-groups")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing host groups").await;
+                exit_with_error(output, msg);
+            }
+
+            let groups: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "host-group-list",
+                        "host_groups": groups,
+                    }),
+                    "",
+                );
+            } else if groups.is_empty() {
+                println!("No host groups found");
+            } else {
+                println!("{:<24} {}", "NAME", "DESCRIPTION");
+                for group in &groups {
+                    println!(
+                        "{:<24} {}",
+                        group["name"].as_str().unwrap_or("-"),
+                        group["description"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        HostGroupAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/host-groups/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("host group '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let group: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "host-group-get",
+                        "host_group": group,
+                    }),
+                    "",
+                );
+            } else {
+                let s = |key: &str| group[key].as_str().unwrap_or("-");
+                println!("Name:         {}", s("name"));
+                println!(
+                    "Description:  {}",
+                    group["description"].as_str().unwrap_or("-")
+                );
+                println!("ID:           {}", s("id"));
+                println!("Created:      {}", s("created_at"));
+                println!("Updated:      {}", s("updated_at"));
+            }
+        }
+        HostGroupAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/host-groups/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "host-group-delete",
+                        "host_group": &name,
+                    }),
+                    format!("Deleted host group: {name}"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("host group '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn service_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: ServiceAction,
+    output: OutputFormat,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        ServiceAction::Create {
+            name,
+            host_group,
+            desired_instances,
+            image,
+        } => {
+            let mut body = serde_json::json!({
+                "name": &name,
+                "desired_instances": desired_instances,
+            });
+            if let Some(group) = host_group.as_deref() {
+                body["host_group"] = serde_json::json!(group);
+            }
+            if let Some(image_ref) = image.as_deref() {
+                body["image"] = serde_json::json!(image_ref);
+            }
+
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/services")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let service: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "service-create",
+                        "service": service,
+                    }),
+                    format!(
+                        "Created service: {}",
+                        service["name"].as_str().unwrap_or("-")
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("service '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        ServiceAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/services")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing services").await;
+                exit_with_error(output, msg);
+            }
+
+            let services: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "service-list",
+                        "services": services,
+                    }),
+                    "",
+                );
+            } else if services.is_empty() {
+                println!("No services found");
+            } else {
+                println!(
+                    "{:<20} {:>7}   {:<30} {:<36}",
+                    "NAME", "DESIRED", "IMAGE", "HOST GROUP ID"
+                );
+                for service in &services {
+                    println!(
+                        "{:<20} {:>7}   {:<30} {:<36}",
+                        service["name"].as_str().unwrap_or("-"),
+                        service["desired_instances"],
+                        service["image"].as_str().unwrap_or("-"),
+                        service["host_group_id"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        ServiceAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/services/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("service '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let service: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "service-get",
+                        "service": service,
+                    }),
+                    "",
+                );
+            } else {
+                let s = |key: &str| service[key].as_str().unwrap_or("-");
+                println!("Name:              {}", s("name"));
+                println!("Desired instances: {}", service["desired_instances"]);
+                println!(
+                    "Image:             {}",
+                    service["image"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "Host group ID:     {}",
+                    service["host_group_id"].as_str().unwrap_or("-")
+                );
+                println!("ID:                {}", s("id"));
+                println!("Created:           {}", s("created_at"));
+                println!("Updated:           {}", s("updated_at"));
+            }
+        }
+        ServiceAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/services/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "service-delete",
+                        "service": &name,
+                    }),
+                    format!("Deleted service: {name}"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("service '{name}'")).await;
+                exit_with_error(output, msg);
             }
         }
     }
@@ -2139,6 +2516,85 @@ mod tests {
         let cli = Cli::try_parse_from(["husk", "--output", "json", "list"])
             .expect("cli should parse with json output");
         assert_eq!(cli.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn parse_host_group_create_command() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "host-group",
+            "create",
+            "edge",
+            "--description",
+            "edge workers",
+        ])
+        .expect("host-group create should parse");
+        match cli.command {
+            Commands::HostGroup {
+                action: HostGroupAction::Create { name, description },
+            } => {
+                assert_eq!(name, "edge");
+                assert_eq!(description.as_deref(), Some("edge workers"));
+            }
+            _ => panic!("expected host-group create command"),
+        }
+    }
+
+    #[test]
+    fn parse_service_create_command_with_defaults() {
+        let cli =
+            Cli::try_parse_from(["husk", "service", "create", "api"]).expect("service parses");
+        match cli.command {
+            Commands::Service {
+                action:
+                    ServiceAction::Create {
+                        name,
+                        host_group,
+                        desired_instances,
+                        image,
+                    },
+            } => {
+                assert_eq!(name, "api");
+                assert!(host_group.is_none());
+                assert_eq!(desired_instances, 1);
+                assert!(image.is_none());
+            }
+            _ => panic!("expected service create command"),
+        }
+    }
+
+    #[test]
+    fn parse_service_create_command_with_options() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "service",
+            "create",
+            "api",
+            "--host-group",
+            "default",
+            "--desired-instances",
+            "3",
+            "--image",
+            "ghcr.io/acme/api:1.2.3",
+        ])
+        .expect("service with options parses");
+        match cli.command {
+            Commands::Service {
+                action:
+                    ServiceAction::Create {
+                        name,
+                        host_group,
+                        desired_instances,
+                        image,
+                    },
+            } => {
+                assert_eq!(name, "api");
+                assert_eq!(host_group.as_deref(), Some("default"));
+                assert_eq!(desired_instances, 3);
+                assert_eq!(image.as_deref(), Some("ghcr.io/acme/api:1.2.3"));
+            }
+            _ => panic!("expected service create command"),
+        }
     }
 
     #[test]
