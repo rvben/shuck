@@ -177,6 +177,13 @@ enum Commands {
         action: ServiceAction,
     },
 
+    /// Manage VM snapshots
+    #[command(alias = "snap")]
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+
     /// Open an interactive shell in a VM
     Shell {
         /// VM name
@@ -289,6 +296,30 @@ enum ServiceAction {
     /// Delete a service by name
     Delete {
         /// Service name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotAction {
+    /// Create a snapshot from a stopped VM
+    Create {
+        /// Snapshot name
+        name: String,
+        /// Source VM name
+        #[arg(long)]
+        vm: String,
+    },
+    /// List snapshots
+    List,
+    /// Get a snapshot by name
+    Get {
+        /// Snapshot name
+        name: String,
+    },
+    /// Delete a snapshot by name
+    Delete {
+        /// Snapshot name
         name: String,
     },
 }
@@ -1008,6 +1039,10 @@ async fn main() -> Result<()> {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             service_command(api_url, api_token, action, output).await
         }
+        Commands::Snapshot { action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            snapshot_command(api_url, api_token, action, output).await
+        }
         Commands::Logs { name, follow, tail } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let mut url = format!("{api_url}/v1/vms/{name}/logs");
@@ -1595,6 +1630,149 @@ async fn service_command(
                 );
             } else {
                 let msg = api_error(resp, &format!("service '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn snapshot_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: SnapshotAction,
+    output: OutputFormat,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        SnapshotAction::Create { name, vm } => {
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/snapshots")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({
+                    "name": &name,
+                    "vm": &vm,
+                })),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let snapshot: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "snapshot-create",
+                        "snapshot": snapshot,
+                    }),
+                    format!(
+                        "Created snapshot {} from VM {}",
+                        snapshot["name"].as_str().unwrap_or("-"),
+                        snapshot["source_vm_name"].as_str().unwrap_or("-")
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("snapshot '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        SnapshotAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/snapshots")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing snapshots").await;
+                exit_with_error(output, msg);
+            }
+
+            let snapshots: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "snapshot-list",
+                        "snapshots": snapshots,
+                    }),
+                    "",
+                );
+            } else if snapshots.is_empty() {
+                println!("No snapshots found");
+            } else {
+                println!("{:<20} {:<20} {}", "NAME", "SOURCE VM", "FILE");
+                for snapshot in &snapshots {
+                    println!(
+                        "{:<20} {:<20} {}",
+                        snapshot["name"].as_str().unwrap_or("-"),
+                        snapshot["source_vm_name"].as_str().unwrap_or("-"),
+                        snapshot["file_path"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        SnapshotAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/snapshots/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("snapshot '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let snapshot: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "snapshot-get",
+                        "snapshot": snapshot,
+                    }),
+                    "",
+                );
+            } else {
+                println!("Name:       {}", snapshot["name"].as_str().unwrap_or("-"));
+                println!(
+                    "Source VM:  {}",
+                    snapshot["source_vm_name"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "File:       {}",
+                    snapshot["file_path"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "Created:    {}",
+                    snapshot["created_at"].as_str().unwrap_or("-")
+                );
+            }
+        }
+        SnapshotAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/snapshots/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "snapshot-delete",
+                        "snapshot": &name,
+                    }),
+                    format!("Deleted snapshot: {name}"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("snapshot '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -2655,6 +2833,21 @@ mod tests {
                 assert_eq!(desired_instances, 7);
             }
             _ => panic!("expected service scale command"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_create_command() {
+        let cli = Cli::try_parse_from(["husk", "snapshot", "create", "snap-1", "--vm", "vm-a"])
+            .expect("snapshot create parses");
+        match cli.command {
+            Commands::Snapshot {
+                action: SnapshotAction::Create { name, vm },
+            } => {
+                assert_eq!(name, "snap-1");
+                assert_eq!(vm, "vm-a");
+            }
+            _ => panic!("expected snapshot create command"),
         }
     }
 

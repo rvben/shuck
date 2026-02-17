@@ -79,6 +79,8 @@ async fn openapi_contains_critical_paths() {
         "/v1/services",
         "/v1/services/{name}",
         "/v1/services/{name}/scale",
+        "/v1/snapshots",
+        "/v1/snapshots/{name}",
         "/v1/vms",
         "/v1/vms/{name}",
         "/v1/vms/{name}/exec",

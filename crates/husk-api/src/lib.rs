@@ -25,8 +25,9 @@ use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use husk_core::{
-    CoreError, CreateHostGroupRequest, CreateServiceRequest, CreateVmRequest, HostGroupRecord,
-    HuskCore, ServiceRecord, ShellEvent, VmRecord,
+    CoreError, CreateHostGroupRequest, CreateServiceRequest, CreateSnapshotRequest,
+    CreateVmRequest, HostGroupRecord, HuskCore, ServiceRecord, ShellEvent, SnapshotRecord,
+    VmRecord,
 };
 use husk_vmm::VmmBackend;
 
@@ -69,6 +70,15 @@ pub struct ServiceResponse {
     pub image: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SnapshotResponse {
+    pub id: String,
+    pub name: String,
+    pub source_vm_name: String,
+    pub file_path: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -309,6 +319,10 @@ pub enum WsShellOutput {
         get_service,
         delete_service,
         scale_service,
+        list_snapshots,
+        create_snapshot,
+        get_snapshot,
+        delete_snapshot,
         list_vms,
         create_vm,
         get_vm,
@@ -327,6 +341,7 @@ pub enum WsShellOutput {
         VmResponse,
         HostGroupResponse,
         ServiceResponse,
+        SnapshotResponse,
         ErrorResponse,
         ExecRequest,
         ExecResponse,
@@ -341,6 +356,7 @@ pub enum WsShellOutput {
         WsShellOutput,
         CreateHostGroupRequest,
         CreateServiceRequest,
+        CreateSnapshotRequest,
         ScaleServiceRequest,
         CreateVmRequest,
     )),
@@ -348,6 +364,7 @@ pub enum WsShellOutput {
         (name = "vms", description = "VM lifecycle management"),
         (name = "host_groups", description = "Host group management"),
         (name = "services", description = "Service model resources"),
+        (name = "snapshots", description = "Snapshot lifecycle resources"),
         (name = "exec", description = "Command execution in VMs"),
         (name = "files", description = "File transfer to/from VMs"),
         (name = "shell", description = "Interactive shell sessions"),
@@ -519,6 +536,14 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             get(get_service::<B>).delete(delete_service::<B>),
         )
         .route("/v1/services/{name}/scale", post(scale_service::<B>))
+        .route(
+            "/v1/snapshots",
+            get(list_snapshots::<B>).post(create_snapshot::<B>),
+        )
+        .route(
+            "/v1/snapshots/{name}",
+            get(get_snapshot::<B>).delete(delete_snapshot::<B>),
+        )
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
@@ -691,7 +716,8 @@ async fn rate_limit_middleware(
 fn is_protected_route(method: &Method, path: &str) -> bool {
     if !(path.starts_with("/v1/vms")
         || path.starts_with("/v1/services")
-        || path.starts_with("/v1/host-groups"))
+        || path.starts_with("/v1/host-groups")
+        || path.starts_with("/v1/snapshots"))
     {
         return false;
     }
@@ -1020,6 +1046,83 @@ async fn scale_service<B: VmmBackend + 'static>(
         .scale_service(&name, req.desired_instances)
         .map_err(map_error)?;
     Ok(Json(service_to_response(service)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/snapshots",
+    tag = "snapshots",
+    responses(
+        (status = 200, description = "List of snapshots", body = Vec<SnapshotResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn list_snapshots<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<SnapshotResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshots = core.list_snapshots().map_err(map_error)?;
+    Ok(Json(
+        snapshots
+            .into_iter()
+            .map(snapshot_to_response)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/snapshots",
+    tag = "snapshots",
+    request_body = CreateSnapshotRequest,
+    responses(
+        (status = 201, description = "Snapshot created", body = SnapshotResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Snapshot already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn create_snapshot<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<CreateSnapshotRequest>,
+) -> Result<(StatusCode, Json<SnapshotResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = core.create_snapshot(req).await.map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(snapshot_to_response(snapshot))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/snapshots/{name}",
+    tag = "snapshots",
+    params(("name" = String, Path, description = "Snapshot name")),
+    responses(
+        (status = 200, description = "Snapshot details", body = SnapshotResponse),
+        (status = 404, description = "Snapshot not found", body = ErrorResponse)
+    )
+)]
+async fn get_snapshot<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<SnapshotResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = core.get_snapshot(&name).map_err(map_error)?;
+    Ok(Json(snapshot_to_response(snapshot)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/snapshots/{name}",
+    tag = "snapshots",
+    params(("name" = String, Path, description = "Snapshot name")),
+    responses(
+        (status = 204, description = "Snapshot deleted"),
+        (status = 404, description = "Snapshot not found", body = ErrorResponse)
+    )
+)]
+async fn delete_snapshot<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_snapshot(&name).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -1891,6 +1994,9 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::ServiceNotFound(_) => {
             (StatusCode::NOT_FOUND, "service_not_found", err.to_string())
         }
+        CoreError::SnapshotNotFound(_) => {
+            (StatusCode::NOT_FOUND, "snapshot_not_found", err.to_string())
+        }
         CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state", err.to_string()),
         CoreError::InvalidArgument(_) => {
             (StatusCode::BAD_REQUEST, "invalid_argument", err.to_string())
@@ -1906,6 +2012,11 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::ServiceAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "service_already_exists",
+            err.to_string(),
+        ),
+        CoreError::SnapshotAlreadyExists(_) => (
+            StatusCode::CONFLICT,
+            "snapshot_already_exists",
             err.to_string(),
         ),
         CoreError::Agent(husk_core::AgentError::NotReady(_)) => (
@@ -1981,6 +2092,16 @@ fn service_to_response(r: ServiceRecord) -> ServiceResponse {
         image: r.image,
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
+    }
+}
+
+fn snapshot_to_response(r: SnapshotRecord) -> SnapshotResponse {
+    SnapshotResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        source_vm_name: r.source_vm_name,
+        file_path: r.file_path,
+        created_at: r.created_at.to_rfc3339(),
     }
 }
 
@@ -2274,6 +2395,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_crud_basic() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let runtime_dir = temp.path().join("run");
+        std::fs::create_dir_all(data_dir.join("vms/snap-vm")).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(data_dir.join("vms/snap-vm/rootfs.ext4"), b"snapshot-source").unwrap();
+
+        let state = husk_state::StateStore::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        state
+            .insert_vm(&husk_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "snap-vm".into(),
+                state: "stopped".into(),
+                pid: Some(1234),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 7,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+            })
+            .unwrap();
+
+        let core = make_core(
+            state,
+            husk_storage::StorageConfig {
+                data_dir: data_dir.clone(),
+            },
+            runtime_dir,
+        );
+        let app = router(core);
+
+        let create = serde_json::json!({ "name": "snap-1", "vm": "snap-vm" });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/snapshots")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "snap-1");
+        assert_eq!(json["source_vm_name"], "snap-vm");
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/snapshots").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = response_json(response).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/snapshots/snap-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::delete("/v1/snapshots/snap-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn get_vm_not_found() {
         let app = router(test_core());
         let response = app
@@ -2484,8 +2694,11 @@ mod tests {
         assert!(!is_protected_route(&Method::GET, "/v1/vms/example"));
         assert!(!is_protected_route(&Method::GET, "/v1/services"));
         assert!(!is_protected_route(&Method::GET, "/v1/host-groups"));
+        assert!(!is_protected_route(&Method::GET, "/v1/snapshots"));
         assert!(is_protected_route(&Method::POST, "/v1/services"));
         assert!(is_protected_route(&Method::POST, "/v1/host-groups"));
+        assert!(is_protected_route(&Method::POST, "/v1/snapshots"));
+        assert!(is_protected_route(&Method::DELETE, "/v1/snapshots/snap-1"));
         assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
         assert!(is_protected_route(&Method::DELETE, "/v1/vms/example"));
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/shell"));
@@ -2558,6 +2771,22 @@ mod tests {
         let response = app
             .oneshot(
                 Request::post("/v1/host-groups")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_snapshot_mutation_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let body = serde_json::json!({ "name": "snap-1", "vm": "vm-a" });
+        let response = app
+            .oneshot(
+                Request::post("/v1/snapshots")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),

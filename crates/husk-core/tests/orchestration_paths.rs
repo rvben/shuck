@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
-use husk_core::{CoreError, CreateVmRequest, HuskCore};
+use husk_core::{CoreError, CreateSnapshotRequest, CreateVmRequest, HuskCore};
 use husk_state::{PortForwardRecord, StateStore, VmRecord};
 use husk_storage::StorageConfig;
 use husk_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
@@ -1024,4 +1024,94 @@ async fn reconcile_port_forwards_skips_invalid_guest_ip() {
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
     assert_eq!(core.reconcile_port_forwards_from_state().await, 0);
+}
+
+#[tokio::test]
+async fn create_snapshot_requires_stopped_vm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(data_dir.join("vms/running-vm")).unwrap();
+    std::fs::write(data_dir.join("vms/running-vm/rootfs.ext4"), b"rootfs").unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    state
+        .insert_vm(&vm_record(
+            Uuid::new_v4(),
+            "running-vm",
+            "running",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+
+    let err = core
+        .create_snapshot(CreateSnapshotRequest {
+            name: "snap-1".into(),
+            vm: "running-vm".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::InvalidState { .. }));
+}
+
+#[tokio::test]
+async fn snapshot_roundtrip_create_list_get_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(data_dir.join("vms/stopped-vm")).unwrap();
+    std::fs::write(
+        data_dir.join("vms/stopped-vm/rootfs.ext4"),
+        b"snapshot-data",
+    )
+    .unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    state
+        .insert_vm(&vm_record(
+            Uuid::new_v4(),
+            "stopped-vm",
+            "stopped",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+
+    let snapshot = core
+        .create_snapshot(CreateSnapshotRequest {
+            name: "snap-1".into(),
+            vm: "stopped-vm".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot.name, "snap-1");
+    assert_eq!(snapshot.source_vm_name, "stopped-vm");
+
+    let snapshot_path = data_dir.join("images/snapshots/snap-1.ext4");
+    assert!(snapshot_path.exists());
+    assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"snapshot-data");
+
+    let listed = core.list_snapshots().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "snap-1");
+
+    let fetched = core.get_snapshot("snap-1").unwrap();
+    assert_eq!(fetched.id, snapshot.id);
+
+    core.delete_snapshot("snap-1").await.unwrap();
+    assert!(!snapshot_path.exists());
+    assert!(core.list_snapshots().unwrap().is_empty());
 }

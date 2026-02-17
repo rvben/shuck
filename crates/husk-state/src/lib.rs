@@ -32,6 +32,12 @@ pub enum StateError {
     ServiceNotFoundByName(String),
     #[error("service already exists: {0}")]
     ServiceAlreadyExists(String),
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(Uuid),
+    #[error("snapshot not found by name: {0}")]
+    SnapshotNotFoundByName(String),
+    #[error("snapshot already exists: {0}")]
+    SnapshotAlreadyExists(String),
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
     #[error("lock poisoned")]
@@ -99,6 +105,16 @@ pub struct ServiceRecord {
     pub image: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Persistent snapshot record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub source_vm_name: String,
+    pub file_path: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// SQLite-backed state store. Thread-safe via internal Mutex.
@@ -188,6 +204,14 @@ impl StateStore {
                 image TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                source_vm_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );",
         )?;
 
@@ -507,6 +531,89 @@ impl StateStore {
         Ok(())
     }
 
+    // ── Snapshots ─────────────────────────────────────────────────────
+
+    /// Insert a new snapshot record.
+    pub fn insert_snapshot(&self, record: &SnapshotRecord) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO snapshots (id, name, source_vm_name, file_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.source_vm_name,
+                record.file_path,
+                record.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::SnapshotAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get a snapshot by ID.
+    pub fn get_snapshot(&self, id: Uuid) -> Result<SnapshotRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, source_vm_name, file_path, created_at
+             FROM snapshots WHERE id = ?1",
+            params![id.to_string()],
+            row_to_snapshot_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::SnapshotNotFound(id),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// Get a snapshot by name.
+    pub fn get_snapshot_by_name(&self, name: &str) -> Result<SnapshotRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, source_vm_name, file_path, created_at
+             FROM snapshots WHERE name = ?1",
+            params![name],
+            row_to_snapshot_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::SnapshotNotFoundByName(name.into()),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all snapshots.
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, source_vm_name, file_path, created_at
+             FROM snapshots ORDER BY created_at",
+        )?;
+        let records = stmt
+            .query_map([], row_to_snapshot_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Delete a snapshot record.
+    pub fn delete_snapshot(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM snapshots WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if deleted == 0 {
+            return Err(StateError::SnapshotNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Allocate the next vsock CID.
     ///
     /// Reuses previously released CIDs (lowest first) before incrementing.
@@ -742,6 +849,19 @@ fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRec
     })
 }
 
+fn row_to_snapshot_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
+    let id_str: String = row.get(0)?;
+    let created_str: String = row.get(4)?;
+
+    Ok(SnapshotRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        source_vm_name: row.get(2)?,
+        file_path: row.get(3)?,
+        created_at: parse_datetime(&created_str)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +907,16 @@ mod tests {
             image: Some("ghcr.io/example/service:latest".into()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn make_snapshot(name: &str, source_vm_name: &str) -> SnapshotRecord {
+        SnapshotRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            source_vm_name: source_vm_name.into(),
+            file_path: format!("/tmp/husk-snapshots/{name}.ext4"),
+            created_at: Utc::now(),
         }
     }
 
@@ -1391,5 +1521,65 @@ mod tests {
         store.delete_host_group(group.id).unwrap();
         let fetched = store.get_service(service.id).unwrap();
         assert_eq!(fetched.host_group_id, None);
+    }
+
+    // ── Snapshots ─────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_get_snapshot() {
+        let store = StateStore::open_memory().unwrap();
+        let snapshot = make_snapshot("base", "vm-a");
+        store.insert_snapshot(&snapshot).unwrap();
+
+        let fetched = store.get_snapshot(snapshot.id).unwrap();
+        assert_eq!(fetched.name, "base");
+        assert_eq!(fetched.source_vm_name, "vm-a");
+    }
+
+    #[test]
+    fn get_snapshot_by_name() {
+        let store = StateStore::open_memory().unwrap();
+        let snapshot = make_snapshot("nightly", "vm-b");
+        store.insert_snapshot(&snapshot).unwrap();
+
+        let fetched = store.get_snapshot_by_name("nightly").unwrap();
+        assert_eq!(fetched.id, snapshot.id);
+    }
+
+    #[test]
+    fn list_snapshots_returns_all() {
+        let store = StateStore::open_memory().unwrap();
+        store
+            .insert_snapshot(&make_snapshot("snap-a", "vm-a"))
+            .unwrap();
+        store
+            .insert_snapshot(&make_snapshot("snap-b", "vm-b"))
+            .unwrap();
+
+        let snapshots = store.list_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_snapshot_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store
+            .insert_snapshot(&make_snapshot("dup", "vm-a"))
+            .unwrap();
+
+        let err = store
+            .insert_snapshot(&make_snapshot("dup", "vm-b"))
+            .unwrap_err();
+        assert!(
+            matches!(err, StateError::SnapshotAlreadyExists(ref name) if name == "dup"),
+            "expected SnapshotAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_snapshot() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.delete_snapshot(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::SnapshotNotFound(_)));
     }
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub use husk_state::{HostGroupRecord, ServiceRecord, VmRecord};
+pub use husk_state::{HostGroupRecord, ServiceRecord, SnapshotRecord, VmRecord};
 pub use husk_vmm::{VmInfo, VmState};
 
 pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, ShellEvent};
@@ -37,6 +37,10 @@ pub enum CoreError {
     ServiceNotFound(String),
     #[error("service already exists: {0}")]
     ServiceAlreadyExists(String),
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(String),
+    #[error("snapshot already exists: {0}")]
+    SnapshotAlreadyExists(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("VMM error: {0}")]
@@ -95,6 +99,14 @@ pub struct CreateServiceRequest {
     pub desired_instances: Option<u32>,
     #[serde(default)]
     pub image: Option<String>,
+}
+
+/// Parameters for creating a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CreateSnapshotRequest {
+    pub name: String,
+    pub vm: String,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -706,6 +718,86 @@ impl<B: VmmBackend> HuskCore<B> {
             husk_state::StateError::ServiceNotFound(_) => CoreError::ServiceNotFound(name.into()),
             other => CoreError::State(other),
         })
+    }
+
+    /// Create a snapshot from a stopped VM.
+    pub async fn create_snapshot(
+        &self,
+        req: CreateSnapshotRequest,
+    ) -> Result<SnapshotRecord, CoreError> {
+        let vm = self.lookup_vm(&req.vm)?;
+        if vm.state != "stopped" {
+            return Err(CoreError::InvalidState {
+                name: vm.name,
+                actual: vm.state,
+                expected: "stopped".into(),
+            });
+        }
+
+        let source_rootfs = self.storage.vm_dir(&req.vm).join("rootfs.ext4");
+        let snapshots_dir = self.storage.images_dir().join("snapshots");
+        tokio::fs::create_dir_all(&snapshots_dir)
+            .await
+            .map_err(husk_storage::StorageError::Io)?;
+
+        let snapshot_path = snapshots_dir.join(format!("{}.ext4", req.name));
+        self.storage_driver
+            .clone_rootfs(&source_rootfs, &snapshot_path)
+            .await?;
+
+        let record = SnapshotRecord {
+            id: Uuid::new_v4(),
+            name: req.name.clone(),
+            source_vm_name: req.vm,
+            file_path: snapshot_path.to_string_lossy().into_owned(),
+            created_at: chrono::Utc::now(),
+        };
+
+        if let Err(err) = self.state.insert_snapshot(&record).map_err(|e| match e {
+            husk_state::StateError::SnapshotAlreadyExists(name) => {
+                CoreError::SnapshotAlreadyExists(name)
+            }
+            other => CoreError::State(other),
+        }) {
+            let _ = tokio::fs::remove_file(&snapshot_path).await;
+            return Err(err);
+        }
+
+        Ok(record)
+    }
+
+    /// List all snapshots.
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>, CoreError> {
+        Ok(self.state.list_snapshots()?)
+    }
+
+    /// Get a snapshot by name.
+    pub fn get_snapshot(&self, name: &str) -> Result<SnapshotRecord, CoreError> {
+        self.state.get_snapshot_by_name(name).map_err(|e| match e {
+            husk_state::StateError::SnapshotNotFoundByName(_) => {
+                CoreError::SnapshotNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })
+    }
+
+    /// Delete a snapshot by name.
+    pub async fn delete_snapshot(&self, name: &str) -> Result<(), CoreError> {
+        let snapshot = self.get_snapshot(name)?;
+        match tokio::fs::remove_file(&snapshot.file_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Storage(husk_storage::StorageError::Io(e))),
+        }
+
+        self.state
+            .delete_snapshot(snapshot.id)
+            .map_err(|e| match e {
+                husk_state::StateError::SnapshotNotFound(_) => {
+                    CoreError::SnapshotNotFound(name.into())
+                }
+                other => CoreError::State(other),
+            })
     }
 
     /// Path to a VM's serial console log file.

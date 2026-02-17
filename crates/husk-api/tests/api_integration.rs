@@ -282,6 +282,95 @@ async fn scale_service_endpoint_updates_desired_instances() {
 }
 
 #[tokio::test]
+async fn snapshot_endpoints_roundtrip() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    let runtime_dir = temp.path().join("run");
+    std::fs::create_dir_all(data_dir.join("vms/snap-vm")).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::write(data_dir.join("vms/snap-vm/rootfs.ext4"), b"snapshot-source").unwrap();
+
+    let state = husk_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    state
+        .insert_vm(&husk_state::VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "snap-vm".into(),
+            state: "stopped".into(),
+            pid: Some(1234),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 7,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/tmp/vmlinux".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            created_at: now,
+            updated_at: now,
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+        })
+        .unwrap();
+
+    let core = make_core(
+        state,
+        husk_storage::StorageConfig {
+            data_dir: data_dir.clone(),
+        },
+        runtime_dir,
+    );
+    let app = router(core);
+
+    let create = serde_json::json!({ "name": "snap-1", "vm": "snap-vm" });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/snapshots")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&create).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let snapshot = response_json(response).await;
+    assert_eq!(snapshot["name"], "snap-1");
+    assert_eq!(snapshot["source_vm_name"], "snap-vm");
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/snapshots").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshots = response_json(response).await;
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/snapshots/snap-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::delete("/v1/snapshots/snap-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn create_service_with_missing_host_group_returns_404() {
     let app = router(test_core());
     let body = serde_json::json!({
