@@ -661,6 +661,21 @@ mod tests {
         assert_eq!(result.unwrap(), "hello");
     }
 
+    #[tokio::test]
+    async fn dispatch_sync_fallible_propagates_api_error() {
+        let queue = DispatchQueue::new("com.husk.test.fallible-api-err", None);
+        let result: Result<(), VmmError> =
+            dispatch_sync_fallible(queue, || Err(VmmError::ApiError("api failed".into()))).await;
+        assert!(matches!(result, Err(VmmError::ApiError(ref msg)) if msg == "api failed"));
+    }
+
+    #[test]
+    fn new_sets_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
+        assert_eq!(backend.runtime_dir, dir.path().to_path_buf());
+    }
+
     #[test]
     fn drop_on_empty_backend_is_safe() {
         let dir = tempfile::tempdir().unwrap();
