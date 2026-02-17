@@ -45,3 +45,4 @@
 | 2026-02-16 | TEST-001, TEST-005, TEST-007, TEST-008 merged | Dedicated CI/nightly lanes for ignored e2e, failure injection, and contracts |
 | 2026-02-16 | TEST-003 and TEST-004 completed | Protocol + allocator/lifecycle property depth increased |
 | 2026-02-16 | TEST-006 coverage/mutation gates enabled | Coverage and mutation checks now automated in quality workflows |
+| 2026-02-17 | Coverage floor raised from 50% to 55% with targeted CLI helper tests | Workspace line coverage now sustained above 55% (`make coverage-ci`) |

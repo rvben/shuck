@@ -51,3 +51,4 @@ This folder tracks the roadmap to move every reviewed area to 100/100.
 | 2026-02-16 | Phase 2 completed: perf baselines/SLO gates and API/UX contract work closed |
 | 2026-02-16 | Phase 3 completed: CI/nightly test depth, failure-injection, contracts, and maintainability docs shipped |
 | 2026-02-16 | Phase 4 completed: all Definitions of 100 checked in per-aspect plans |
+| 2026-02-17 | Testing sustainment: workspace coverage floor increased from 50% to 55% and validated in CI command path |

@@ -119,7 +119,7 @@ test-perf-baseline:
 
 # Coverage gate (line + branch) for workspace quality floor.
 coverage-ci:
-	cargo llvm-cov --workspace --all-features --fail-under-lines 50 --lcov --output-path target/llvm-cov.info
+	cargo llvm-cov --workspace --all-features --fail-under-lines 55 --lcov --output-path target/llvm-cov.info
 
 # Mutation-testing smoke gate (tooling + target discoverability).
 mutation-gate:

@@ -33,7 +33,9 @@
 ## Coverage policy
 
 - Workspace coverage floor:
-  - line >= 50%
+  - line >= 55%
+- Last validated:
+  - 2026-02-17 (`make coverage-ci` passed with 55.50% line coverage)
 
 ## Mutation policy
 

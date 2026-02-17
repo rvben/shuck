@@ -1990,6 +1990,72 @@ async fn drain_vms_on_shutdown<B: husk_vmm::VmmBackend>(core: &husk_core::HuskCo
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests hold env mutex to serialize env mutation.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                // SAFETY: tests hold env mutex to serialize env mutation.
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                // SAFETY: tests hold env mutex to serialize env mutation.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("husk-tests-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    async fn request_single_response(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        let body_len = body.len();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = stream.read(&mut req).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{body}"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}/")).await.unwrap()
+    }
 
     #[test]
     fn parse_cp_path_local() {
@@ -2099,6 +2165,40 @@ mod tests {
     }
 
     #[test]
+    fn render_error_output_text_is_prefixed() {
+        let rendered = render_error_output(OutputFormat::Text, "boom");
+        assert_eq!(rendered, "Error: boom");
+    }
+
+    #[test]
+    fn with_api_auth_sets_bearer_header() {
+        let request = with_api_auth(
+            reqwest::Client::new().get("http://example.invalid"),
+            Some("secret"),
+        )
+        .build()
+        .unwrap();
+        let auth = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .unwrap();
+        assert_eq!(auth, "Bearer secret");
+    }
+
+    #[test]
+    fn with_api_auth_without_token_does_not_set_header() {
+        let request = with_api_auth(reqwest::Client::new().get("http://example.invalid"), None)
+            .build()
+            .unwrap();
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn daemon_bind_loopback_allowed_without_flag() {
         let listen: SocketAddr = "127.0.0.1:7777".parse().unwrap();
         assert!(validate_daemon_bind(listen, false).is_ok());
@@ -2113,39 +2213,226 @@ mod tests {
 
     #[test]
     fn env_override_data_dir() {
-        // SAFETY: test is single-threaded; no other threads read this env var.
-        unsafe { std::env::set_var("HUSK_DATA_DIR", "/tmp/husk-env-test") };
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSK_DATA_DIR", "/tmp/husk-env-test");
         let config = load_config(None);
         assert_eq!(config.data_dir, PathBuf::from("/tmp/husk-env-test"));
-        unsafe { std::env::remove_var("HUSK_DATA_DIR") };
     }
 
     #[test]
     fn env_override_default_kernel() {
-        // SAFETY: test is single-threaded; no other threads read this env var.
-        unsafe { std::env::set_var("HUSK_DEFAULT_KERNEL", "/tmp/custom-kernel") };
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSK_DEFAULT_KERNEL", "/tmp/custom-kernel");
         let config = load_config(None);
         assert_eq!(config.default_kernel, PathBuf::from("/tmp/custom-kernel"));
-        unsafe { std::env::remove_var("HUSK_DEFAULT_KERNEL") };
     }
 
     #[test]
     fn env_override_api_token() {
-        // SAFETY: test is single-threaded; no other threads read this env var.
-        unsafe { std::env::set_var("HUSK_API_TOKEN", "test-token") };
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSK_API_TOKEN", "test-token");
         let config = load_config(None);
         assert_eq!(config.api_token.as_deref(), Some("test-token"));
-        unsafe { std::env::remove_var("HUSK_API_TOKEN") };
     }
 
     #[cfg(feature = "linux-net")]
     #[test]
     fn env_override_dns_servers_comma_separated() {
-        // SAFETY: test is single-threaded; no other threads read this env var.
-        unsafe { std::env::set_var("HUSK_DNS_SERVERS", "1.1.1.1, 8.8.4.4, 9.9.9.9") };
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSK_DNS_SERVERS", "1.1.1.1, 8.8.4.4, 9.9.9.9");
         let config = load_config(None);
         assert_eq!(config.dns_servers, vec!["1.1.1.1", "8.8.4.4", "9.9.9.9"]);
-        unsafe { std::env::remove_var("HUSK_DNS_SERVERS") };
+    }
+
+    #[test]
+    fn resolve_api_token_prefers_cli_token() {
+        let config_dir = temp_test_dir("resolve-api-token-cli");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "api_token = \"from-config\"\n").unwrap();
+
+        let resolved = resolve_api_token(Some("from-cli".to_string()), Some(&config_path));
+        assert_eq!(resolved.as_deref(), Some("from-cli"));
+    }
+
+    #[test]
+    fn resolve_api_token_uses_config_when_cli_missing() {
+        let config_dir = temp_test_dir("resolve-api-token-config");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "api_token = \"from-config\"\n").unwrap();
+
+        let resolved = resolve_api_token(None, Some(&config_path));
+        assert_eq!(resolved.as_deref(), Some("from-config"));
+    }
+
+    #[test]
+    fn resolve_api_token_returns_none_when_not_set() {
+        let config_dir = temp_test_dir("resolve-api-token-none");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "data_dir = \"/tmp/husk\"\n").unwrap();
+
+        let resolved = resolve_api_token(None, Some(&config_path));
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_explicit_path() {
+        let explicit = PathBuf::from("/tmp/husk-explicit-config.toml");
+        assert_eq!(resolve_config_path(Some(&explicit)), explicit);
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_home_config_when_present() {
+        let _guard = env_mutex().lock().unwrap();
+        let home = temp_test_dir("resolve-home");
+        let config_path = home.join(".config/husk/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "data_dir = \"/tmp/husk-home\"\n").unwrap();
+        let _home_env = EnvVarGuard::set("HOME", home.to_string_lossy().as_ref());
+
+        assert_eq!(resolve_config_path(None), config_path);
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_system_config() {
+        let _guard = env_mutex().lock().unwrap();
+        let home = temp_test_dir("resolve-system-fallback");
+        let _home_env = EnvVarGuard::set("HOME", home.to_string_lossy().as_ref());
+        assert_eq!(
+            resolve_config_path(None),
+            PathBuf::from("/etc/husk/config.toml")
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_parses_limits_and_lists() {
+        let _guard = env_mutex().lock().unwrap();
+        let _vars = [
+            EnvVarGuard::set("HUSK_API_MAX_REQUEST_BYTES", "1000"),
+            EnvVarGuard::set("HUSK_API_MAX_FILE_READ_BYTES", "2000"),
+            EnvVarGuard::set("HUSK_API_MAX_FILE_WRITE_BYTES", "3000"),
+            EnvVarGuard::set("HUSK_API_SENSITIVE_RATE_LIMIT_PER_MINUTE", "17"),
+            EnvVarGuard::set("HUSK_ALLOWED_READ_PATHS", " /etc , /var/log ,,"),
+            EnvVarGuard::set("HUSK_ALLOWED_WRITE_PATHS", "/tmp,/var/tmp"),
+            EnvVarGuard::set("HUSK_EXEC_TIMEOUT_SECS", "45"),
+            EnvVarGuard::set("HUSK_EXEC_ALLOWLIST", "echo,cat"),
+            EnvVarGuard::set("HUSK_EXEC_DENYLIST", "rm,reboot"),
+            EnvVarGuard::set("HUSK_EXEC_ENV_ALLOWLIST", "PATH,TERM"),
+        ];
+        let mut config = Config::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(config.api_max_request_bytes, 1000);
+        assert_eq!(config.api_max_file_read_bytes, 2000);
+        assert_eq!(config.api_max_file_write_bytes, 3000);
+        assert_eq!(config.api_sensitive_rate_limit_per_minute, 17);
+        assert_eq!(config.allowed_read_paths, vec!["/etc", "/var/log"]);
+        assert_eq!(config.allowed_write_paths, vec!["/tmp", "/var/tmp"]);
+        assert_eq!(config.exec_timeout_secs, 45);
+        assert_eq!(config.exec_allowlist, vec!["echo", "cat"]);
+        assert_eq!(config.exec_denylist, vec!["rm", "reboot"]);
+        assert_eq!(config.exec_env_allowlist, vec!["PATH", "TERM"]);
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn apply_env_overrides_parses_linux_network_fields() {
+        let _guard = env_mutex().lock().unwrap();
+        let _vars = [
+            EnvVarGuard::set("HUSK_FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
+            EnvVarGuard::set("HUSK_HOST_INTERFACE", "ens7"),
+            EnvVarGuard::set("HUSK_BRIDGE_NAME", "husk-test"),
+            EnvVarGuard::set("HUSK_BRIDGE_SUBNET", "10.10.0.0/24"),
+            EnvVarGuard::set("HUSK_DNS_SERVERS", "9.9.9.9, 8.8.8.8"),
+        ];
+        let mut config = Config::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.firecracker_bin,
+            PathBuf::from("/usr/local/bin/firecracker")
+        );
+        assert_eq!(config.host_interface, "ens7");
+        assert_eq!(config.bridge_name, "husk-test");
+        assert_eq!(config.bridge_subnet, "10.10.0.0/24");
+        assert_eq!(config.dns_servers, vec!["9.9.9.9", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn apply_env_overrides_ignores_invalid_numeric_values() {
+        let _guard = env_mutex().lock().unwrap();
+        let _vars = [
+            EnvVarGuard::set("HUSK_API_MAX_REQUEST_BYTES", "not-a-number"),
+            EnvVarGuard::set("HUSK_EXEC_TIMEOUT_SECS", "oops"),
+        ];
+        let mut config = Config::default();
+        let expected_req = config.api_max_request_bytes;
+        let expected_timeout = config.exec_timeout_secs;
+        apply_env_overrides(&mut config);
+        assert_eq!(config.api_max_request_bytes, expected_req);
+        assert_eq!(config.exec_timeout_secs, expected_timeout);
+    }
+
+    #[tokio::test]
+    async fn api_request_connect_error_has_actionable_hint() {
+        let client = reqwest::Client::new();
+        let err = api_request(client.get("http://127.0.0.1:9"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot connect to daemon (is `husk daemon` running?)")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_error_prefers_message_and_hint_fields() {
+        let response = request_single_response(
+            "400 Bad Request",
+            "application/json",
+            r#"{"message":"nope","hint":"try again"}"#,
+        )
+        .await;
+        let message = api_error(response, "running VM").await;
+        assert_eq!(message, "nope (hint: try again)");
+    }
+
+    #[tokio::test]
+    async fn api_error_falls_back_to_error_field_for_json() {
+        let response = request_single_response(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"error":"backend exploded"}"#,
+        )
+        .await;
+        let message = api_error(response, "running VM").await;
+        assert_eq!(message, "backend exploded");
+    }
+
+    #[tokio::test]
+    async fn api_error_uses_plain_text_body_when_available() {
+        let response =
+            request_single_response("502 Bad Gateway", "text/plain", "gateway timeout").await;
+        let message = api_error(response, "running VM").await;
+        assert_eq!(message, "gateway timeout");
+    }
+
+    #[tokio::test]
+    async fn api_error_uses_subject_for_empty_404() {
+        let response = request_single_response("404 Not Found", "text/plain", "").await;
+        let message = api_error(response, "VM 'demo'").await;
+        assert_eq!(message, "VM 'demo' not found");
+    }
+
+    #[tokio::test]
+    async fn api_error_uses_subject_for_empty_409() {
+        let response = request_single_response("409 Conflict", "text/plain", "").await;
+        let message = api_error(response, "VM 'demo'").await;
+        assert_eq!(message, "VM 'demo' already exists");
+    }
+
+    #[tokio::test]
+    async fn api_error_uses_status_for_other_empty_errors() {
+        let response = request_single_response("500 Internal Server Error", "text/plain", "").await;
+        let message = api_error(response, "creating VM").await;
+        assert_eq!(message, "creating VM: 500 Internal Server Error");
     }
 
     #[cfg(feature = "linux-net")]
