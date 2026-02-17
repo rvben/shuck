@@ -371,6 +371,29 @@ async fn snapshot_endpoints_roundtrip() {
 }
 
 #[tokio::test]
+async fn restore_missing_snapshot_returns_404() {
+    let app = router(test_core());
+    let body = serde_json::json!({
+        "name": "restored-vm",
+        "kernel_path": "/tmp/vmlinux",
+        "vcpu_count": 1,
+        "mem_size_mib": 128
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/snapshots/missing/restore")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = response_json(response).await;
+    assert_eq!(json["code"], "snapshot_not_found");
+}
+
+#[tokio::test]
 async fn create_service_with_missing_host_group_returns_404() {
     let app = router(test_core());
     let body = serde_json::json!({

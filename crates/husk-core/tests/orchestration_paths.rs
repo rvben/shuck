@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
-use husk_core::{CoreError, CreateSnapshotRequest, CreateVmRequest, HuskCore};
+use husk_core::{
+    CoreError, CreateSnapshotRequest, CreateVmRequest, HuskCore, RestoreSnapshotRequest,
+};
 use husk_state::{PortForwardRecord, StateStore, VmRecord};
 use husk_storage::StorageConfig;
 use husk_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
@@ -1114,4 +1116,37 @@ async fn snapshot_roundtrip_create_list_get_delete() {
     core.delete_snapshot("snap-1").await.unwrap();
     assert!(!snapshot_path.exists());
     assert!(core.list_snapshots().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn restore_snapshot_missing_snapshot_returns_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let err = core
+        .restore_snapshot(
+            "missing",
+            RestoreSnapshotRequest {
+                name: "restored-vm".into(),
+                kernel_path: data_dir.join("kernels/vmlinux"),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::SnapshotNotFound(_)));
 }

@@ -109,6 +109,24 @@ pub struct CreateSnapshotRequest {
     pub vm: String,
 }
 
+/// Parameters for restoring a snapshot into a new VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct RestoreSnapshotRequest {
+    pub name: String,
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub kernel_path: PathBuf,
+    pub vcpu_count: Option<u32>,
+    pub mem_size_mib: Option<u32>,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub initrd_path: Option<PathBuf>,
+    #[serde(default)]
+    pub userdata: Option<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
 /// Tracks resources allocated during VM creation for rollback on failure.
 #[derive(Default)]
 struct AllocatedResources {
@@ -798,6 +816,26 @@ impl<B: VmmBackend> HuskCore<B> {
                 }
                 other => CoreError::State(other),
             })
+    }
+
+    /// Restore a snapshot into a new VM.
+    pub async fn restore_snapshot(
+        &self,
+        snapshot_name: &str,
+        req: RestoreSnapshotRequest,
+    ) -> Result<VmRecord, CoreError> {
+        let snapshot = self.get_snapshot(snapshot_name)?;
+        self.create_vm(CreateVmRequest {
+            name: req.name,
+            kernel_path: req.kernel_path,
+            rootfs_path: PathBuf::from(snapshot.file_path),
+            vcpu_count: req.vcpu_count,
+            mem_size_mib: req.mem_size_mib,
+            initrd_path: req.initrd_path,
+            userdata: req.userdata,
+            env: req.env,
+        })
+        .await
     }
 
     /// Path to a VM's serial console log file.

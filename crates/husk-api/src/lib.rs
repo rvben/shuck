@@ -26,8 +26,8 @@ use utoipa::ToSchema;
 
 use husk_core::{
     CoreError, CreateHostGroupRequest, CreateServiceRequest, CreateSnapshotRequest,
-    CreateVmRequest, HostGroupRecord, HuskCore, ServiceRecord, ShellEvent, SnapshotRecord,
-    VmRecord,
+    CreateVmRequest, HostGroupRecord, HuskCore, RestoreSnapshotRequest, ServiceRecord, ShellEvent,
+    SnapshotRecord, VmRecord,
 };
 use husk_vmm::VmmBackend;
 
@@ -323,6 +323,7 @@ pub enum WsShellOutput {
         create_snapshot,
         get_snapshot,
         delete_snapshot,
+        restore_snapshot,
         list_vms,
         create_vm,
         get_vm,
@@ -357,6 +358,7 @@ pub enum WsShellOutput {
         CreateHostGroupRequest,
         CreateServiceRequest,
         CreateSnapshotRequest,
+        RestoreSnapshotRequest,
         ScaleServiceRequest,
         CreateVmRequest,
     )),
@@ -544,6 +546,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             "/v1/snapshots/{name}",
             get(get_snapshot::<B>).delete(delete_snapshot::<B>),
         )
+        .route("/v1/snapshots/{name}/restore", post(restore_snapshot::<B>))
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
@@ -1123,6 +1126,28 @@ async fn delete_snapshot<B: VmmBackend + 'static>(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_snapshot(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/snapshots/{name}/restore",
+    tag = "snapshots",
+    params(("name" = String, Path, description = "Snapshot name")),
+    request_body = RestoreSnapshotRequest,
+    responses(
+        (status = 201, description = "VM restored from snapshot", body = VmResponse),
+        (status = 404, description = "Snapshot not found", body = ErrorResponse),
+        (status = 409, description = "VM already exists or invalid state", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn restore_snapshot<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<RestoreSnapshotRequest>,
+) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let vm = core.restore_snapshot(&name, req).await.map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(record_to_response(vm))))
 }
 
 #[utoipa::path(
@@ -2481,6 +2506,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn restore_missing_snapshot_returns_404() {
+        let app = router(test_core());
+        let body = serde_json::json!({
+            "name": "restored-vm",
+            "kernel_path": "/tmp/vmlinux",
+            "vcpu_count": 1,
+            "mem_size_mib": 128
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/snapshots/missing/restore")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "snapshot_not_found");
     }
 
     #[tokio::test]

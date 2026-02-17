@@ -317,6 +317,26 @@ enum SnapshotAction {
         /// Snapshot name
         name: String,
     },
+    /// Restore a snapshot into a new VM
+    Restore {
+        /// Snapshot name
+        snapshot: String,
+        /// New VM name
+        #[arg(long)]
+        name: String,
+        /// Kernel path for the restored VM
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Optional initrd path
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+        /// Number of vCPUs
+        #[arg(long, default_value_t = 1)]
+        cpus: u32,
+        /// Memory in MiB
+        #[arg(long, default_value_t = 128)]
+        memory: u32,
+    },
     /// Delete a snapshot by name
     Delete {
         /// Snapshot name
@@ -1754,6 +1774,54 @@ async fn snapshot_command(
                 );
             }
         }
+        SnapshotAction::Restore {
+            snapshot,
+            name,
+            kernel,
+            initrd,
+            cpus,
+            memory,
+        } => {
+            let mut body = serde_json::json!({
+                "name": &name,
+                "kernel_path": &kernel,
+                "vcpu_count": cpus,
+                "mem_size_mib": memory,
+            });
+            if let Some(initrd_path) = initrd.as_ref() {
+                body["initrd_path"] = serde_json::json!(initrd_path);
+            }
+
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/snapshots/{snapshot}/restore")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let vm: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "snapshot-restore",
+                        "snapshot": snapshot,
+                        "vm": vm,
+                    }),
+                    format!(
+                        "Restored snapshot {} into VM {}",
+                        snapshot,
+                        vm["name"].as_str().unwrap_or("-")
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("snapshot '{snapshot}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
         SnapshotAction::Delete { name } => {
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/snapshots/{name}")),
@@ -2848,6 +2916,46 @@ mod tests {
                 assert_eq!(vm, "vm-a");
             }
             _ => panic!("expected snapshot create command"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_restore_command() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "snapshot",
+            "restore",
+            "snap-1",
+            "--name",
+            "restored-vm",
+            "--kernel",
+            "/tmp/vmlinux",
+            "--cpus",
+            "2",
+            "--memory",
+            "256",
+        ])
+        .expect("snapshot restore parses");
+        match cli.command {
+            Commands::Snapshot {
+                action:
+                    SnapshotAction::Restore {
+                        snapshot,
+                        name,
+                        kernel,
+                        initrd,
+                        cpus,
+                        memory,
+                    },
+            } => {
+                assert_eq!(snapshot, "snap-1");
+                assert_eq!(name, "restored-vm");
+                assert_eq!(kernel, PathBuf::from("/tmp/vmlinux"));
+                assert!(initrd.is_none());
+                assert_eq!(cpus, 2);
+                assert_eq!(memory, 256);
+            }
+            _ => panic!("expected snapshot restore command"),
         }
     }
 
