@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use husk_storage::{StorageConfig, StorageError, clone_rootfs};
+use husk_storage::{
+    LocalStorageDriver, StorageConfig, StorageDriver, StorageError, clone_rootfs,
+    default_storage_driver,
+};
 use tempfile::tempdir;
 
 // ── StorageConfig path helpers ──────────────────────────────────────
@@ -99,4 +102,22 @@ async fn clone_rootfs_large_file() {
     let result = std::fs::read(&dest).unwrap();
     assert_eq!(result.len(), data.len());
     assert_eq!(result, data);
+}
+
+#[test]
+fn default_storage_driver_name_is_stable() {
+    let driver = default_storage_driver();
+    assert_eq!(driver.name(), "local-reflink");
+}
+
+#[tokio::test]
+async fn local_storage_driver_trait_clone_rootfs() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.ext4");
+    let dest = dir.path().join("dest.ext4");
+    std::fs::write(&source, b"driver content").unwrap();
+
+    let driver = LocalStorageDriver;
+    driver.clone_rootfs(&source, &dest).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"driver content");
 }

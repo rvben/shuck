@@ -5,6 +5,7 @@ pub mod agent_client;
 #[cfg(feature = "linux-net")]
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use husk_vmm::VmmBackend;
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,7 @@ pub struct HuskCore<B: VmmBackend> {
     #[cfg(feature = "linux-net")]
     ip_allocator: husk_net::IpAllocator,
     storage: husk_storage::StorageConfig,
+    storage_driver: Arc<dyn husk_storage::StorageDriver>,
     #[cfg(feature = "linux-net")]
     bridge_name: String,
     #[cfg(feature = "linux-net")]
@@ -139,6 +141,7 @@ impl<B: VmmBackend> HuskCore<B> {
             state,
             ip_allocator,
             storage,
+            storage_driver: husk_storage::default_storage_driver(),
             bridge_name,
             dns_servers,
             runtime_dir,
@@ -160,6 +163,7 @@ impl<B: VmmBackend> HuskCore<B> {
             vmm,
             state,
             storage,
+            storage_driver: husk_storage::default_storage_driver(),
             runtime_dir,
         }
     }
@@ -231,7 +235,9 @@ impl<B: VmmBackend> HuskCore<B> {
             }
         }
         let vm_rootfs = vm_dir.join("rootfs.ext4");
-        husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
+        self.storage_driver
+            .clone_rootfs(&req.rootfs_path, &vm_rootfs)
+            .await?;
         resources.vm_dir = Some(vm_dir);
 
         if !self.dns_servers.is_empty() {
@@ -315,7 +321,9 @@ impl<B: VmmBackend> HuskCore<B> {
             }
         }
         let vm_rootfs = vm_dir.join("rootfs.ext4");
-        husk_storage::clone_rootfs(&req.rootfs_path, &vm_rootfs).await?;
+        self.storage_driver
+            .clone_rootfs(&req.rootfs_path, &vm_rootfs)
+            .await?;
         resources.vm_dir = Some(vm_dir);
 
         // Resolve initrd: use explicit path, or look for conventional location

@@ -1,6 +1,9 @@
 //! Storage utilities for validating kernels/rootfs images and cloning VM root disks.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +19,41 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("command failed: {0}")]
     CommandFailed(String),
+}
+
+pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Abstraction for storage backends used to prepare VM root disks.
+pub trait StorageDriver: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn clone_rootfs<'a>(
+        &'a self,
+        source: &'a Path,
+        dest: &'a Path,
+    ) -> StorageFuture<'a, Result<(), StorageError>>;
+}
+
+/// Default local storage driver backed by reflink-or-copy filesystem cloning.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalStorageDriver;
+
+impl StorageDriver for LocalStorageDriver {
+    fn name(&self) -> &'static str {
+        "local-reflink"
+    }
+
+    fn clone_rootfs<'a>(
+        &'a self,
+        source: &'a Path,
+        dest: &'a Path,
+    ) -> StorageFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move { clone_rootfs_impl(source, dest).await })
+    }
+}
+
+pub fn default_storage_driver() -> Arc<dyn StorageDriver> {
+    Arc::new(LocalStorageDriver)
 }
 
 /// Manages rootfs images and kernel files.
@@ -52,6 +90,11 @@ impl StorageConfig {
 /// Uses reflink (clonefile on macOS/APFS, FICLONE on Linux/btrfs/XFS) when the
 /// filesystem supports it, falling back to a regular copy otherwise.
 pub async fn clone_rootfs(source: &Path, dest: &Path) -> Result<(), StorageError> {
+    let driver = LocalStorageDriver;
+    driver.clone_rootfs(source, dest).await
+}
+
+async fn clone_rootfs_impl(source: &Path, dest: &Path) -> Result<(), StorageError> {
     if !source.exists() {
         return Err(StorageError::RootfsNotFound(source.to_owned()));
     }
