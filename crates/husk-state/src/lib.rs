@@ -1,4 +1,5 @@
-//! SQLite-backed persistent state store for VM records, CID allocation, and port forwards.
+//! SQLite-backed persistent state store for VM records, CID allocation, port
+//! forwards, host groups, and services.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -19,6 +20,18 @@ pub enum StateError {
     VmNotFoundByName(String),
     #[error("VM already exists: {0}")]
     VmAlreadyExists(String),
+    #[error("host group not found: {0}")]
+    HostGroupNotFound(Uuid),
+    #[error("host group not found by name: {0}")]
+    HostGroupNotFoundByName(String),
+    #[error("host group already exists: {0}")]
+    HostGroupAlreadyExists(String),
+    #[error("service not found: {0}")]
+    ServiceNotFound(Uuid),
+    #[error("service not found by name: {0}")]
+    ServiceNotFoundByName(String),
+    #[error("service already exists: {0}")]
+    ServiceAlreadyExists(String),
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
     #[error("lock poisoned")]
@@ -64,6 +77,28 @@ pub struct PortForwardRecord {
     pub guest_port: u16,
     pub protocol: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// Persistent host group record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostGroupRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Persistent service record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub host_group_id: Option<Uuid>,
+    pub desired_instances: u32,
+    pub image: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// SQLite-backed state store. Thread-safe via internal Mutex.
@@ -135,6 +170,24 @@ impl StateStore {
                 guest_port INTEGER NOT NULL,
                 protocol TEXT NOT NULL DEFAULT 'tcp',
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS host_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS services (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                host_group_id TEXT REFERENCES host_groups(id) ON DELETE SET NULL,
+                desired_instances INTEGER NOT NULL DEFAULT 1,
+                image TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )?;
 
@@ -257,6 +310,180 @@ impl StateStore {
         let deleted = conn.execute("DELETE FROM vms WHERE id = ?1", params![id.to_string()])?;
         if deleted == 0 {
             return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
+    // ── Host Groups ───────────────────────────────────────────────────
+
+    /// Insert a new host group record.
+    pub fn insert_host_group(&self, record: &HostGroupRecord) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO host_groups (id, name, description, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.description,
+                record.created_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::HostGroupAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get a host group by ID.
+    pub fn get_host_group(&self, id: Uuid) -> Result<HostGroupRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, description, created_at, updated_at
+             FROM host_groups WHERE id = ?1",
+            params![id.to_string()],
+            row_to_host_group_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::HostGroupNotFound(id),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// Get a host group by name.
+    pub fn get_host_group_by_name(&self, name: &str) -> Result<HostGroupRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, description, created_at, updated_at
+             FROM host_groups WHERE name = ?1",
+            params![name],
+            row_to_host_group_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                StateError::HostGroupNotFoundByName(name.to_string())
+            }
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all host groups.
+    pub fn list_host_groups(&self) -> Result<Vec<HostGroupRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, created_at, updated_at
+             FROM host_groups ORDER BY created_at",
+        )?;
+
+        let records = stmt
+            .query_map([], row_to_host_group_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    /// Delete a host group record.
+    pub fn delete_host_group(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM host_groups WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if deleted == 0 {
+            return Err(StateError::HostGroupNotFound(id));
+        }
+        Ok(())
+    }
+
+    // ── Services ──────────────────────────────────────────────────────
+
+    /// Insert a new service record.
+    pub fn insert_service(&self, record: &ServiceRecord) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO services (id, name, host_group_id, desired_instances, image, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.host_group_id.map(|id| id.to_string()),
+                record.desired_instances,
+                record.image,
+                record.created_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::ServiceAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get a service by ID.
+    pub fn get_service(&self, id: Uuid) -> Result<ServiceRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, host_group_id, desired_instances, image, created_at, updated_at
+             FROM services WHERE id = ?1",
+            params![id.to_string()],
+            row_to_service_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::ServiceNotFound(id),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// Get a service by name.
+    pub fn get_service_by_name(&self, name: &str) -> Result<ServiceRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, host_group_id, desired_instances, image, created_at, updated_at
+             FROM services WHERE name = ?1",
+            params![name],
+            row_to_service_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::ServiceNotFoundByName(name.into()),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all services.
+    pub fn list_services(&self) -> Result<Vec<ServiceRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, host_group_id, desired_instances, image, created_at, updated_at
+             FROM services ORDER BY created_at",
+        )?;
+
+        let records = stmt
+            .query_map([], row_to_service_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    /// Delete a service record.
+    pub fn delete_service(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM services WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if deleted == 0 {
+            return Err(StateError::ServiceNotFound(id));
         }
         Ok(())
     }
@@ -465,6 +692,37 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     })
 }
 
+fn row_to_host_group_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostGroupRecord> {
+    let id_str: String = row.get(0)?;
+    let created_str: String = row.get(3)?;
+    let updated_str: String = row.get(4)?;
+
+    Ok(HostGroupRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        created_at: parse_datetime(&created_str)?,
+        updated_at: parse_datetime(&updated_str)?,
+    })
+}
+
+fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRecord> {
+    let id_str: String = row.get(0)?;
+    let host_group_id_str: Option<String> = row.get(2)?;
+    let created_str: String = row.get(5)?;
+    let updated_str: String = row.get(6)?;
+
+    Ok(ServiceRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        host_group_id: host_group_id_str.as_deref().map(parse_uuid).transpose()?,
+        desired_instances: row.get(3)?,
+        image: row.get(4)?,
+        created_at: parse_datetime(&created_str)?,
+        updated_at: parse_datetime(&updated_str)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +746,28 @@ mod tests {
             userdata: None,
             userdata_status: None,
             userdata_env: None,
+        }
+    }
+
+    fn make_host_group(name: &str) -> HostGroupRecord {
+        HostGroupRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            description: Some(format!("{name} group")),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn make_service(name: &str, host_group_id: Option<Uuid>) -> ServiceRecord {
+        ServiceRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            host_group_id,
+            desired_instances: 1,
+            image: Some("ghcr.io/example/service:latest".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -959,5 +1239,115 @@ mod tests {
 
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.userdata_status.as_deref(), Some("completed"));
+    }
+
+    // ── Host Groups ───────────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_get_host_group() {
+        let store = StateStore::open_memory().unwrap();
+        let group = make_host_group("platform");
+        store.insert_host_group(&group).unwrap();
+
+        let fetched = store.get_host_group(group.id).unwrap();
+        assert_eq!(fetched.name, "platform");
+        assert_eq!(fetched.description.as_deref(), Some("platform group"));
+    }
+
+    #[test]
+    fn get_host_group_by_name() {
+        let store = StateStore::open_memory().unwrap();
+        let group = make_host_group("edge");
+        store.insert_host_group(&group).unwrap();
+
+        let fetched = store.get_host_group_by_name("edge").unwrap();
+        assert_eq!(fetched.id, group.id);
+    }
+
+    #[test]
+    fn duplicate_host_group_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_host_group(&make_host_group("core")).unwrap();
+
+        let dup = make_host_group("core");
+        let err = store.insert_host_group(&dup).unwrap_err();
+        assert!(
+            matches!(err, StateError::HostGroupAlreadyExists(ref name) if name == "core"),
+            "expected HostGroupAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_host_group() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.delete_host_group(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::HostGroupNotFound(_)));
+    }
+
+    // ── Services ──────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_list_services() {
+        let store = StateStore::open_memory().unwrap();
+        let group = make_host_group("service-hosts");
+        store.insert_host_group(&group).unwrap();
+
+        store
+            .insert_service(&make_service("api", Some(group.id)))
+            .unwrap();
+        store
+            .insert_service(&make_service("worker", Some(group.id)))
+            .unwrap();
+
+        let services = store.list_services().unwrap();
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].name, "api");
+        assert_eq!(services[1].name, "worker");
+        assert_eq!(services[0].host_group_id, Some(group.id));
+    }
+
+    #[test]
+    fn get_service_by_name() {
+        let store = StateStore::open_memory().unwrap();
+        let service = make_service("queue", None);
+        store.insert_service(&service).unwrap();
+
+        let fetched = store.get_service_by_name("queue").unwrap();
+        assert_eq!(fetched.id, service.id);
+        assert_eq!(fetched.desired_instances, 1);
+    }
+
+    #[test]
+    fn duplicate_service_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_service(&make_service("cache", None)).unwrap();
+
+        let dup = make_service("cache", None);
+        let err = store.insert_service(&dup).unwrap_err();
+        assert!(
+            matches!(err, StateError::ServiceAlreadyExists(ref name) if name == "cache"),
+            "expected ServiceAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_service() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.delete_service(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::ServiceNotFound(_)));
+    }
+
+    #[test]
+    fn deleting_host_group_nulls_service_reference() {
+        let store = StateStore::open_memory().unwrap();
+        let group = make_host_group("batch");
+        store.insert_host_group(&group).unwrap();
+
+        let service = make_service("etl", Some(group.id));
+        store.insert_service(&service).unwrap();
+
+        store.delete_host_group(group.id).unwrap();
+        let fetched = store.get_service(service.id).unwrap();
+        assert_eq!(fetched.host_group_id, None);
     }
 }

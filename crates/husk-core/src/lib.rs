@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub use husk_state::VmRecord;
+pub use husk_state::{HostGroupRecord, ServiceRecord, VmRecord};
 pub use husk_vmm::{VmInfo, VmState};
 
 pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, ShellEvent};
@@ -28,6 +28,16 @@ pub enum CoreError {
     },
     #[error("VM already exists: {0}")]
     VmAlreadyExists(String),
+    #[error("host group not found: {0}")]
+    HostGroupNotFound(String),
+    #[error("host group already exists: {0}")]
+    HostGroupAlreadyExists(String),
+    #[error("service not found: {0}")]
+    ServiceNotFound(String),
+    #[error("service already exists: {0}")]
+    ServiceAlreadyExists(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("VMM error: {0}")]
     Vmm(#[from] husk_vmm::VmmError),
     #[cfg(feature = "linux-net")]
@@ -62,6 +72,28 @@ pub struct CreateVmRequest {
     /// Environment variables to pass to the userdata script.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+}
+
+/// Parameters for creating a host group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CreateHostGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Parameters for creating a service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CreateServiceRequest {
+    pub name: String,
+    #[serde(default)]
+    pub host_group: Option<String>,
+    #[serde(default)]
+    pub desired_instances: Option<u32>,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -523,6 +555,124 @@ impl<B: VmmBackend> HuskCore<B> {
     /// Get info about a specific VM.
     pub fn get_vm(&self, name: &str) -> Result<VmRecord, CoreError> {
         self.lookup_vm(name)
+    }
+
+    /// Create a host group.
+    pub fn create_host_group(
+        &self,
+        req: CreateHostGroupRequest,
+    ) -> Result<HostGroupRecord, CoreError> {
+        let record = HostGroupRecord {
+            id: Uuid::new_v4(),
+            name: req.name,
+            description: req.description,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        self.state.insert_host_group(&record).map_err(|e| match e {
+            husk_state::StateError::HostGroupAlreadyExists(name) => {
+                CoreError::HostGroupAlreadyExists(name)
+            }
+            other => CoreError::State(other),
+        })?;
+        Ok(record)
+    }
+
+    /// List all host groups.
+    pub fn list_host_groups(&self) -> Result<Vec<HostGroupRecord>, CoreError> {
+        Ok(self.state.list_host_groups()?)
+    }
+
+    /// Get a host group by name.
+    pub fn get_host_group(&self, name: &str) -> Result<HostGroupRecord, CoreError> {
+        self.state
+            .get_host_group_by_name(name)
+            .map_err(|e| match e {
+                husk_state::StateError::HostGroupNotFoundByName(_) => {
+                    CoreError::HostGroupNotFound(name.into())
+                }
+                other => CoreError::State(other),
+            })
+    }
+
+    /// Delete a host group by name.
+    pub fn delete_host_group(&self, name: &str) -> Result<(), CoreError> {
+        let record = self.get_host_group(name)?;
+        self.state
+            .delete_host_group(record.id)
+            .map_err(|e| match e {
+                husk_state::StateError::HostGroupNotFound(_) => {
+                    CoreError::HostGroupNotFound(name.into())
+                }
+                other => CoreError::State(other),
+            })
+    }
+
+    /// Create a service.
+    pub fn create_service(&self, req: CreateServiceRequest) -> Result<ServiceRecord, CoreError> {
+        let desired_instances = req.desired_instances.unwrap_or(1);
+        if desired_instances == 0 {
+            return Err(CoreError::InvalidArgument(
+                "desired_instances must be >= 1".into(),
+            ));
+        }
+
+        let host_group_id = match req.host_group.as_deref() {
+            Some(group_name) => {
+                let group = self
+                    .state
+                    .get_host_group_by_name(group_name)
+                    .map_err(|e| match e {
+                        husk_state::StateError::HostGroupNotFoundByName(_) => {
+                            CoreError::HostGroupNotFound(group_name.into())
+                        }
+                        other => CoreError::State(other),
+                    })?;
+                Some(group.id)
+            }
+            None => None,
+        };
+
+        let record = ServiceRecord {
+            id: Uuid::new_v4(),
+            name: req.name,
+            host_group_id,
+            desired_instances,
+            image: req.image,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        self.state.insert_service(&record).map_err(|e| match e {
+            husk_state::StateError::ServiceAlreadyExists(name) => {
+                CoreError::ServiceAlreadyExists(name)
+            }
+            other => CoreError::State(other),
+        })?;
+        Ok(record)
+    }
+
+    /// List all services.
+    pub fn list_services(&self) -> Result<Vec<ServiceRecord>, CoreError> {
+        Ok(self.state.list_services()?)
+    }
+
+    /// Get a service by name.
+    pub fn get_service(&self, name: &str) -> Result<ServiceRecord, CoreError> {
+        self.state.get_service_by_name(name).map_err(|e| match e {
+            husk_state::StateError::ServiceNotFoundByName(_) => {
+                CoreError::ServiceNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })
+    }
+
+    /// Delete a service by name.
+    pub fn delete_service(&self, name: &str) -> Result<(), CoreError> {
+        let record = self.get_service(name)?;
+        self.state.delete_service(record.id).map_err(|e| match e {
+            husk_state::StateError::ServiceNotFound(_) => CoreError::ServiceNotFound(name.into()),
+            other => CoreError::State(other),
+        })
     }
 
     /// Path to a VM's serial console log file.

@@ -74,6 +74,10 @@ async fn openapi_contains_critical_paths() {
     for required in [
         "/v1/health",
         "/v1/metrics",
+        "/v1/host-groups",
+        "/v1/host-groups/{name}",
+        "/v1/services",
+        "/v1/services/{name}",
         "/v1/vms",
         "/v1/vms/{name}",
         "/v1/vms/{name}/exec",
@@ -82,13 +86,19 @@ async fn openapi_contains_critical_paths() {
         "/v1/vms/{name}/logs",
         "/v1/vms/{name}/shell",
     ] {
-        assert!(paths.contains_key(required), "missing OpenAPI path: {required}");
+        assert!(
+            paths.contains_key(required),
+            "missing OpenAPI path: {required}"
+        );
     }
 
     #[cfg(feature = "linux-net")]
     {
         for required in ["/v1/vms/{name}/ports", "/v1/vms/{name}/ports/{host_port}"] {
-            assert!(paths.contains_key(required), "missing OpenAPI path: {required}");
+            assert!(
+                paths.contains_key(required),
+                "missing OpenAPI path: {required}"
+            );
         }
     }
 }

@@ -24,7 +24,10 @@ use tracing::{debug, info, warn};
 use utoipa::OpenApi;
 use utoipa::ToSchema;
 
-use husk_core::{CoreError, CreateVmRequest, HuskCore, ShellEvent, VmRecord};
+use husk_core::{
+    CoreError, CreateHostGroupRequest, CreateServiceRequest, CreateVmRequest, HostGroupRecord,
+    HuskCore, ServiceRecord, ShellEvent, VmRecord,
+};
 use husk_vmm::VmmBackend;
 
 type AppState<B> = Arc<HuskCore<B>>;
@@ -46,6 +49,26 @@ pub struct VmResponse {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub userdata_status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HostGroupResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceResponse {
+    pub id: String,
+    pub name: String,
+    pub host_group_id: Option<String>,
+    pub desired_instances: u32,
+    pub image: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -272,6 +295,14 @@ pub enum WsShellOutput {
     ),
     paths(
         health,
+        list_host_groups,
+        create_host_group,
+        get_host_group,
+        delete_host_group,
+        list_services,
+        create_service,
+        get_service,
+        delete_service,
         list_vms,
         create_vm,
         get_vm,
@@ -288,6 +319,8 @@ pub enum WsShellOutput {
     ),
     components(schemas(
         VmResponse,
+        HostGroupResponse,
+        ServiceResponse,
         ErrorResponse,
         ExecRequest,
         ExecResponse,
@@ -300,10 +333,14 @@ pub enum WsShellOutput {
         LogsQuery,
         WsShellInput,
         WsShellOutput,
+        CreateHostGroupRequest,
+        CreateServiceRequest,
         CreateVmRequest,
     )),
     tags(
         (name = "vms", description = "VM lifecycle management"),
+        (name = "host_groups", description = "Host group management"),
+        (name = "services", description = "Service model resources"),
         (name = "exec", description = "Command execution in VMs"),
         (name = "files", description = "File transfer to/from VMs"),
         (name = "shell", description = "Interactive shell sessions"),
@@ -458,6 +495,22 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
 ) -> Router {
     let policy = current_policy();
     let router = Router::new()
+        .route(
+            "/v1/host-groups",
+            get(list_host_groups::<B>).post(create_host_group::<B>),
+        )
+        .route(
+            "/v1/host-groups/{name}",
+            get(get_host_group::<B>).delete(delete_host_group::<B>),
+        )
+        .route(
+            "/v1/services",
+            get(list_services::<B>).post(create_service::<B>),
+        )
+        .route(
+            "/v1/services/{name}",
+            get(get_service::<B>).delete(delete_service::<B>),
+        )
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
@@ -628,7 +681,10 @@ async fn rate_limit_middleware(
 }
 
 fn is_protected_route(method: &Method, path: &str) -> bool {
-    if !path.starts_with("/v1/vms") {
+    if !(path.starts_with("/v1/vms")
+        || path.starts_with("/v1/services")
+        || path.starts_with("/v1/host-groups"))
+    {
         return false;
     }
     if *method != Method::GET {
@@ -781,6 +837,158 @@ husk_api_uptime_seconds {}\n",
         running,
         m.start.elapsed().as_secs(),
     )
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/host-groups",
+    tag = "host_groups",
+    responses(
+        (status = 200, description = "List of host groups", body = Vec<HostGroupResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn list_host_groups<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<HostGroupResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let groups = core.list_host_groups().map_err(map_error)?;
+    Ok(Json(
+        groups
+            .into_iter()
+            .map(host_group_to_response)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/host-groups",
+    tag = "host_groups",
+    request_body = CreateHostGroupRequest,
+    responses(
+        (status = 201, description = "Host group created", body = HostGroupResponse),
+        (status = 409, description = "Host group already exists", body = ErrorResponse)
+    )
+)]
+async fn create_host_group<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<CreateHostGroupRequest>,
+) -> Result<(StatusCode, Json<HostGroupResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let group = core.create_host_group(req).map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(host_group_to_response(group))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/host-groups/{name}",
+    tag = "host_groups",
+    params(("name" = String, Path, description = "Host group name")),
+    responses(
+        (status = 200, description = "Host group details", body = HostGroupResponse),
+        (status = 404, description = "Host group not found", body = ErrorResponse)
+    )
+)]
+async fn get_host_group<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<HostGroupResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let group = core.get_host_group(&name).map_err(map_error)?;
+    Ok(Json(host_group_to_response(group)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/host-groups/{name}",
+    tag = "host_groups",
+    params(("name" = String, Path, description = "Host group name")),
+    responses(
+        (status = 204, description = "Host group deleted"),
+        (status = 404, description = "Host group not found", body = ErrorResponse)
+    )
+)]
+async fn delete_host_group<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_host_group(&name).map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/services",
+    tag = "services",
+    responses(
+        (status = 200, description = "List of services", body = Vec<ServiceResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn list_services<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<ServiceResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let services = core.list_services().map_err(map_error)?;
+    Ok(Json(
+        services
+            .into_iter()
+            .map(service_to_response)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/services",
+    tag = "services",
+    request_body = CreateServiceRequest,
+    responses(
+        (status = 201, description = "Service created", body = ServiceResponse),
+        (status = 404, description = "Referenced host group not found", body = ErrorResponse),
+        (status = 409, description = "Service already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn create_service<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<CreateServiceRequest>,
+) -> Result<(StatusCode, Json<ServiceResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let service = core.create_service(req).map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(service_to_response(service))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/services/{name}",
+    tag = "services",
+    params(("name" = String, Path, description = "Service name")),
+    responses(
+        (status = 200, description = "Service details", body = ServiceResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+async fn get_service<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<ServiceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let service = core.get_service(&name).map_err(map_error)?;
+    Ok(Json(service_to_response(service)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/services/{name}",
+    tag = "services",
+    params(("name" = String, Path, description = "Service name")),
+    responses(
+        (status = 204, description = "Service deleted"),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+async fn delete_service<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_service(&name).map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -1644,10 +1852,31 @@ async fn remove_port_forward_handler<B: VmmBackend + 'static>(
 fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
     let (status, code, message) = match &err {
         CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, "vm_not_found", err.to_string()),
+        CoreError::HostGroupNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            "host_group_not_found",
+            err.to_string(),
+        ),
+        CoreError::ServiceNotFound(_) => {
+            (StatusCode::NOT_FOUND, "service_not_found", err.to_string())
+        }
         CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state", err.to_string()),
+        CoreError::InvalidArgument(_) => {
+            (StatusCode::BAD_REQUEST, "invalid_argument", err.to_string())
+        }
         CoreError::VmAlreadyExists(_) => {
             (StatusCode::CONFLICT, "vm_already_exists", err.to_string())
         }
+        CoreError::HostGroupAlreadyExists(_) => (
+            StatusCode::CONFLICT,
+            "host_group_already_exists",
+            err.to_string(),
+        ),
+        CoreError::ServiceAlreadyExists(_) => (
+            StatusCode::CONFLICT,
+            "service_already_exists",
+            err.to_string(),
+        ),
         CoreError::Agent(husk_core::AgentError::NotReady(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_not_ready",
@@ -1699,6 +1928,28 @@ fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) 
             ),
         ),
         other => map_error(other),
+    }
+}
+
+fn host_group_to_response(r: HostGroupRecord) -> HostGroupResponse {
+    HostGroupResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        description: r.description,
+        created_at: r.created_at.to_rfc3339(),
+        updated_at: r.updated_at.to_rfc3339(),
+    }
+}
+
+fn service_to_response(r: ServiceRecord) -> ServiceResponse {
+    ServiceResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        host_group_id: r.host_group_id.map(|id| id.to_string()),
+        desired_instances: r.desired_instances,
+        image: r.image,
+        created_at: r.created_at.to_rfc3339(),
+        updated_at: r.updated_at.to_rfc3339(),
     }
 }
 
@@ -1806,6 +2057,126 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn host_group_and_service_crud_basic() {
+        let app = router(test_core());
+
+        let create_group = serde_json::json!({
+            "name": "default",
+            "description": "default hosts"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/host-groups")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_group).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let group = response_json(response).await;
+        assert_eq!(group["name"], "default");
+
+        let create_service = serde_json::json!({
+            "name": "api",
+            "host_group": "default",
+            "desired_instances": 2,
+            "image": "ghcr.io/example/api:latest"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_service).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let service = response_json(response).await;
+        assert_eq!(service["name"], "api");
+        assert_eq!(service["desired_instances"], 2);
+        assert!(service["host_group_id"].is_string());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/services/api")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete("/v1/services/api")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete("/v1/host-groups/default")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn create_service_unknown_host_group_returns_404() {
+        let app = router(test_core());
+        let body = serde_json::json!({
+            "name": "api",
+            "host_group": "missing"
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "host_group_not_found");
+    }
+
+    #[tokio::test]
+    async fn create_service_invalid_desired_instances_returns_400() {
+        let app = router(test_core());
+        let body = serde_json::json!({
+            "name": "api",
+            "desired_instances": 0
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "invalid_argument");
     }
 
     #[tokio::test]
@@ -2017,6 +2388,10 @@ mod tests {
         assert!(!is_protected_route(&Method::GET, "/v1/health"));
         assert!(!is_protected_route(&Method::GET, "/v1/vms"));
         assert!(!is_protected_route(&Method::GET, "/v1/vms/example"));
+        assert!(!is_protected_route(&Method::GET, "/v1/services"));
+        assert!(!is_protected_route(&Method::GET, "/v1/host-groups"));
+        assert!(is_protected_route(&Method::POST, "/v1/services"));
+        assert!(is_protected_route(&Method::POST, "/v1/host-groups"));
         assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
         assert!(is_protected_route(&Method::DELETE, "/v1/vms/example"));
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/shell"));
@@ -2075,6 +2450,22 @@ mod tests {
             .oneshot(
                 Request::get("/v1/vms/nonexistent/shell")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_service_mutation_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let body = serde_json::json!({ "name": "default" });
+        let response = app
+            .oneshot(
+                Request::post("/v1/host-groups")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
             )
             .await
@@ -2226,6 +2617,21 @@ mod tests {
         let (status, _) = map_error(CoreError::VmAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 
+        let (status, _) = map_error(CoreError::HostGroupNotFound("test".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = map_error(CoreError::ServiceNotFound("test".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = map_error(CoreError::HostGroupAlreadyExists("test".into()));
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = map_error(CoreError::ServiceAlreadyExists("test".into()));
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = map_error(CoreError::InvalidArgument("bad value".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
         let (status, _) = map_error(CoreError::Agent(AgentError::NotReady(Duration::from_secs(
             5,
         ))));
@@ -2234,9 +2640,9 @@ mod tests {
         let (status, _) = map_error(CoreError::Agent(AgentError::UnexpectedResponse));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-        let (status, _) = map_error(CoreError::Storage(husk_storage::StorageError::CommandFailed(
-            "x".into(),
-        )));
+        let (status, _) = map_error(CoreError::Storage(
+            husk_storage::StorageError::CommandFailed("x".into()),
+        ));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
         let (status, _) = map_error(CoreError::State(husk_state::StateError::LockPoisoned));

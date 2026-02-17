@@ -189,6 +189,106 @@ async fn list_vms_returns_empty_array() {
     assert!(arr.is_empty());
 }
 
+// ── Host Groups / Services ───────────────────────────────────────────
+
+#[tokio::test]
+async fn host_group_and_service_endpoints_roundtrip() {
+    let app = router(test_core());
+
+    let group_body = serde_json::json!({
+        "name": "default",
+        "description": "default hosts",
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/host-groups")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&group_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let group = response_json(response).await;
+    assert_eq!(group["name"], "default");
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/host-groups").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let groups = response_json(response).await;
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+
+    let service_body = serde_json::json!({
+        "name": "api",
+        "host_group": "default",
+        "desired_instances": 2,
+        "image": "ghcr.io/example/api:latest"
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&service_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let service = response_json(response).await;
+    assert_eq!(service["name"], "api");
+    assert_eq!(service["desired_instances"], 2);
+    assert!(service["host_group_id"].is_string());
+}
+
+#[tokio::test]
+async fn create_service_with_missing_host_group_returns_404() {
+    let app = router(test_core());
+    let body = serde_json::json!({
+        "name": "api",
+        "host_group": "missing-group"
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = response_json(response).await;
+    assert_eq!(json["code"], "host_group_not_found");
+}
+
+#[tokio::test]
+async fn create_service_with_zero_instances_returns_400() {
+    let app = router(test_core());
+    let body = serde_json::json!({
+        "name": "api",
+        "desired_instances": 0
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await;
+    assert_eq!(json["code"], "invalid_argument");
+}
+
 // ── GET VM Not Found ─────────────────────────────────────────────────
 
 #[tokio::test]
