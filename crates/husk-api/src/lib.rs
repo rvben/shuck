@@ -26,8 +26,9 @@ use utoipa::ToSchema;
 
 use husk_core::{
     CoreError, CreateHostGroupRequest, CreateServiceRequest, CreateSnapshotRequest,
-    CreateVmRequest, HostGroupRecord, HuskCore, RestoreSnapshotRequest, ServiceRecord, ShellEvent,
-    SnapshotRecord, VmRecord,
+    CreateVmRequest, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskCore, ImageRecord,
+    ImportImageRequest, RestoreSnapshotRequest, ServiceRecord, ShellEvent, SnapshotRecord,
+    VmRecord,
 };
 use husk_vmm::VmmBackend;
 
@@ -79,6 +80,24 @@ pub struct SnapshotResponse {
     pub source_vm_name: String,
     pub file_path: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ImageResponse {
+    pub id: String,
+    pub name: String,
+    pub source_path: String,
+    pub file_path: String,
+    pub format: String,
+    pub size_bytes: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExportImageResponse {
+    pub name: String,
+    pub destination_path: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -319,6 +338,11 @@ pub enum WsShellOutput {
         get_service,
         delete_service,
         scale_service,
+        list_images,
+        import_image,
+        get_image,
+        delete_image,
+        export_image,
         list_snapshots,
         create_snapshot,
         get_snapshot,
@@ -343,6 +367,8 @@ pub enum WsShellOutput {
         HostGroupResponse,
         ServiceResponse,
         SnapshotResponse,
+        ImageResponse,
+        ExportImageResponse,
         ErrorResponse,
         ExecRequest,
         ExecResponse,
@@ -359,6 +385,8 @@ pub enum WsShellOutput {
         CreateServiceRequest,
         CreateSnapshotRequest,
         RestoreSnapshotRequest,
+        ImportImageRequest,
+        ExportImageRequest,
         ScaleServiceRequest,
         CreateVmRequest,
     )),
@@ -366,6 +394,7 @@ pub enum WsShellOutput {
         (name = "vms", description = "VM lifecycle management"),
         (name = "host_groups", description = "Host group management"),
         (name = "services", description = "Service model resources"),
+        (name = "images", description = "Image catalog resources"),
         (name = "snapshots", description = "Snapshot lifecycle resources"),
         (name = "exec", description = "Command execution in VMs"),
         (name = "files", description = "File transfer to/from VMs"),
@@ -538,6 +567,12 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             get(get_service::<B>).delete(delete_service::<B>),
         )
         .route("/v1/services/{name}/scale", post(scale_service::<B>))
+        .route("/v1/images", get(list_images::<B>).post(import_image::<B>))
+        .route(
+            "/v1/images/{name}",
+            get(get_image::<B>).delete(delete_image::<B>),
+        )
+        .route("/v1/images/{name}/export", post(export_image::<B>))
         .route(
             "/v1/snapshots",
             get(list_snapshots::<B>).post(create_snapshot::<B>),
@@ -720,6 +755,7 @@ fn is_protected_route(method: &Method, path: &str) -> bool {
     if !(path.starts_with("/v1/vms")
         || path.starts_with("/v1/services")
         || path.starts_with("/v1/host-groups")
+        || path.starts_with("/v1/images")
         || path.starts_with("/v1/snapshots"))
     {
         return false;
@@ -1049,6 +1085,103 @@ async fn scale_service<B: VmmBackend + 'static>(
         .scale_service(&name, req.desired_instances)
         .map_err(map_error)?;
     Ok(Json(service_to_response(service)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/images",
+    tag = "images",
+    responses(
+        (status = 200, description = "List of images", body = Vec<ImageResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn list_images<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<ImageResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let images = core.list_images().map_err(map_error)?;
+    Ok(Json(
+        images
+            .into_iter()
+            .map(image_to_response)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/images",
+    tag = "images",
+    request_body = ImportImageRequest,
+    responses(
+        (status = 201, description = "Image imported", body = ImageResponse),
+        (status = 409, description = "Image already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn import_image<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<ImportImageRequest>,
+) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let image = core.import_image(req).await.map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(image_to_response(image))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/images/{name}",
+    tag = "images",
+    params(("name" = String, Path, description = "Image name")),
+    responses(
+        (status = 200, description = "Image details", body = ImageResponse),
+        (status = 404, description = "Image not found", body = ErrorResponse)
+    )
+)]
+async fn get_image<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<ImageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let image = core.get_image(&name).map_err(map_error)?;
+    Ok(Json(image_to_response(image)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/images/{name}",
+    tag = "images",
+    params(("name" = String, Path, description = "Image name")),
+    responses(
+        (status = 204, description = "Image deleted"),
+        (status = 404, description = "Image not found", body = ErrorResponse)
+    )
+)]
+async fn delete_image<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_image(&name).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/images/{name}/export",
+    tag = "images",
+    params(("name" = String, Path, description = "Image name")),
+    request_body = ExportImageRequest,
+    responses(
+        (status = 201, description = "Image exported", body = ExportImageResponse),
+        (status = 404, description = "Image not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn export_image<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<ExportImageRequest>,
+) -> Result<(StatusCode, Json<ExportImageResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let result = core.export_image(&name, req).await.map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(export_result_to_response(result))))
 }
 
 #[utoipa::path(
@@ -2019,6 +2152,7 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::ServiceNotFound(_) => {
             (StatusCode::NOT_FOUND, "service_not_found", err.to_string())
         }
+        CoreError::ImageNotFound(_) => (StatusCode::NOT_FOUND, "image_not_found", err.to_string()),
         CoreError::SnapshotNotFound(_) => {
             (StatusCode::NOT_FOUND, "snapshot_not_found", err.to_string())
         }
@@ -2037,6 +2171,11 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::ServiceAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "service_already_exists",
+            err.to_string(),
+        ),
+        CoreError::ImageAlreadyExists(_) => (
+            StatusCode::CONFLICT,
+            "image_already_exists",
             err.to_string(),
         ),
         CoreError::SnapshotAlreadyExists(_) => (
@@ -2117,6 +2256,26 @@ fn service_to_response(r: ServiceRecord) -> ServiceResponse {
         image: r.image,
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
+    }
+}
+
+fn image_to_response(r: ImageRecord) -> ImageResponse {
+    ImageResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        source_path: r.source_path,
+        file_path: r.file_path,
+        format: r.format,
+        size_bytes: r.size_bytes,
+        created_at: r.created_at.to_rfc3339(),
+    }
+}
+
+fn export_result_to_response(r: ExportImageResult) -> ExportImageResponse {
+    ExportImageResponse {
+        name: r.name,
+        destination_path: r.destination_path.to_string_lossy().into_owned(),
+        size_bytes: r.size_bytes,
     }
 }
 
@@ -2509,6 +2668,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_crud_and_export_basic() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let runtime_dir = temp.path().join("run");
+        let source_path = temp.path().join("source.ext4");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(&source_path, b"image-bytes").unwrap();
+
+        let core = make_core(
+            husk_state::StateStore::open_memory().unwrap(),
+            husk_storage::StorageConfig {
+                data_dir: data_dir.clone(),
+            },
+            runtime_dir,
+        );
+        let app = router(core);
+
+        let import = serde_json::json!({
+            "name": "ubuntu-base",
+            "source_path": source_path,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/images")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&import).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let imported = response_json(response).await;
+        assert_eq!(imported["name"], "ubuntu-base");
+        assert_eq!(imported["format"], "ext4");
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/images").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = response_json(response).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/images/ubuntu-base")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let export_path = temp.path().join("exports/base-copy.ext4");
+        let export = serde_json::json!({
+            "destination_path": export_path,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/images/ubuntu-base/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&export).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let exported = response_json(response).await;
+        assert_eq!(exported["name"], "ubuntu-base");
+        assert_eq!(std::fs::read(export_path).unwrap(), b"image-bytes");
+
+        let response = app
+            .oneshot(
+                Request::delete("/v1/images/ubuntu-base")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn restore_missing_snapshot_returns_404() {
         let app = router(test_core());
         let body = serde_json::json!({
@@ -2742,9 +2989,12 @@ mod tests {
         assert!(!is_protected_route(&Method::GET, "/v1/vms/example"));
         assert!(!is_protected_route(&Method::GET, "/v1/services"));
         assert!(!is_protected_route(&Method::GET, "/v1/host-groups"));
+        assert!(!is_protected_route(&Method::GET, "/v1/images"));
         assert!(!is_protected_route(&Method::GET, "/v1/snapshots"));
         assert!(is_protected_route(&Method::POST, "/v1/services"));
         assert!(is_protected_route(&Method::POST, "/v1/host-groups"));
+        assert!(is_protected_route(&Method::POST, "/v1/images"));
+        assert!(is_protected_route(&Method::DELETE, "/v1/images/base"));
         assert!(is_protected_route(&Method::POST, "/v1/snapshots"));
         assert!(is_protected_route(&Method::DELETE, "/v1/snapshots/snap-1"));
         assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
@@ -2835,6 +3085,25 @@ mod tests {
         let response = app
             .oneshot(
                 Request::post("/v1/snapshots")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_image_mutation_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let body = serde_json::json!({
+            "name": "ubuntu-base",
+            "source_path": "/tmp/source.ext4"
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/images")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -2994,10 +3263,16 @@ mod tests {
         let (status, _) = map_error(CoreError::ServiceNotFound("test".into()));
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        let (status, _) = map_error(CoreError::ImageNotFound("test".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
         let (status, _) = map_error(CoreError::HostGroupAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = map_error(CoreError::ServiceAlreadyExists("test".into()));
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = map_error(CoreError::ImageAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = map_error(CoreError::InvalidArgument("bad value".into()));

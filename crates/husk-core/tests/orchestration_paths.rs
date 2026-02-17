@@ -4,7 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use husk_core::{
-    CoreError, CreateSnapshotRequest, CreateVmRequest, HuskCore, RestoreSnapshotRequest,
+    CoreError, CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskCore,
+    ImportImageRequest, RestoreSnapshotRequest,
 };
 use husk_state::{PortForwardRecord, StateStore, VmRecord};
 use husk_storage::StorageConfig;
@@ -1149,4 +1150,89 @@ async fn restore_snapshot_missing_snapshot_returns_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::SnapshotNotFound(_)));
+}
+
+#[tokio::test]
+async fn image_roundtrip_import_list_get_export_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let source_image = tmp.path().join("source.ext4");
+    std::fs::write(&source_image, b"image-rootfs-data").unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let imported = core
+        .import_image(ImportImageRequest {
+            name: "ubuntu-base".into(),
+            source_path: source_image.clone(),
+            format: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(imported.name, "ubuntu-base");
+    assert_eq!(imported.format, "ext4");
+
+    let catalog_path = data_dir.join("images/catalog/ubuntu-base.ext4");
+    assert!(catalog_path.exists());
+    assert_eq!(std::fs::read(&catalog_path).unwrap(), b"image-rootfs-data");
+
+    let listed = core.list_images().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "ubuntu-base");
+
+    let fetched = core.get_image("ubuntu-base").unwrap();
+    assert_eq!(fetched.id, imported.id);
+
+    let export_path = tmp.path().join("exports/ubuntu-base-copy.ext4");
+    let exported = core
+        .export_image(
+            "ubuntu-base",
+            ExportImageRequest {
+                destination_path: export_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(exported.name, "ubuntu-base");
+    assert_eq!(std::fs::read(&export_path).unwrap(), b"image-rootfs-data");
+
+    core.delete_image("ubuntu-base").await.unwrap();
+    assert!(!catalog_path.exists());
+    assert!(core.list_images().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn export_missing_image_returns_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let err = core
+        .export_image(
+            "missing",
+            ExportImageRequest {
+                destination_path: tmp.path().join("out.ext4"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::ImageNotFound(_)));
 }

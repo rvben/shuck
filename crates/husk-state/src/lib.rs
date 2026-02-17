@@ -38,6 +38,12 @@ pub enum StateError {
     SnapshotNotFoundByName(String),
     #[error("snapshot already exists: {0}")]
     SnapshotAlreadyExists(String),
+    #[error("image not found: {0}")]
+    ImageNotFound(Uuid),
+    #[error("image not found by name: {0}")]
+    ImageNotFoundByName(String),
+    #[error("image already exists: {0}")]
+    ImageAlreadyExists(String),
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
     #[error("lock poisoned")]
@@ -114,6 +120,18 @@ pub struct SnapshotRecord {
     pub name: String,
     pub source_vm_name: String,
     pub file_path: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Persistent image catalog record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub source_path: String,
+    pub file_path: String,
+    pub format: String,
+    pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -211,6 +229,16 @@ impl StateStore {
                 name TEXT NOT NULL UNIQUE,
                 source_vm_name TEXT NOT NULL,
                 file_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS images (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                source_path TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                format TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );",
         )?;
@@ -614,6 +642,94 @@ impl StateStore {
         Ok(())
     }
 
+    // ── Images ───────────────────────────────────────────────────────
+
+    /// Insert a new image record.
+    pub fn insert_image(&self, record: &ImageRecord) -> Result<(), StateError> {
+        let size_bytes_i64 =
+            i64::try_from(record.size_bytes).map_err(|_| StateError::CorruptData {
+                column: "size_bytes",
+                message: format!("value {} exceeds SQLite INTEGER range", record.size_bytes),
+            })?;
+
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO images (id, name, source_path, file_path, format, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.source_path,
+                record.file_path,
+                record.format,
+                size_bytes_i64,
+                record.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::ImageAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get an image by ID.
+    pub fn get_image(&self, id: Uuid) -> Result<ImageRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, source_path, file_path, format, size_bytes, created_at
+             FROM images WHERE id = ?1",
+            params![id.to_string()],
+            row_to_image_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::ImageNotFound(id),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// Get an image by name.
+    pub fn get_image_by_name(&self, name: &str) -> Result<ImageRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, source_path, file_path, format, size_bytes, created_at
+             FROM images WHERE name = ?1",
+            params![name],
+            row_to_image_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::ImageNotFoundByName(name.into()),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all images.
+    pub fn list_images(&self) -> Result<Vec<ImageRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, source_path, file_path, format, size_bytes, created_at
+             FROM images ORDER BY created_at",
+        )?;
+        let records = stmt
+            .query_map([], row_to_image_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Delete an image record.
+    pub fn delete_image(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute("DELETE FROM images WHERE id = ?1", params![id.to_string()])?;
+        if deleted == 0 {
+            return Err(StateError::ImageNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Allocate the next vsock CID.
     ///
     /// Reuses previously released CIDs (lowest first) before incrementing.
@@ -862,6 +978,24 @@ fn row_to_snapshot_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotR
     })
 }
 
+fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord> {
+    let id_str: String = row.get(0)?;
+    let created_str: String = row.get(6)?;
+    let size_bytes: i64 = row.get(5)?;
+    let size_bytes = u64::try_from(size_bytes)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, size_bytes))?;
+
+    Ok(ImageRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        source_path: row.get(2)?,
+        file_path: row.get(3)?,
+        format: row.get(4)?,
+        size_bytes,
+        created_at: parse_datetime(&created_str)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +1050,18 @@ mod tests {
             name: name.into(),
             source_vm_name: source_vm_name.into(),
             file_path: format!("/tmp/husk-snapshots/{name}.ext4"),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_image(name: &str) -> ImageRecord {
+        ImageRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            source_path: format!("/tmp/source/{name}.ext4"),
+            file_path: format!("/tmp/husk-images/{name}.ext4"),
+            format: "ext4".into(),
+            size_bytes: 1024,
             created_at: Utc::now(),
         }
     }
@@ -1581,5 +1727,57 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let err = store.delete_snapshot(Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StateError::SnapshotNotFound(_)));
+    }
+
+    // ── Images ───────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_get_image() {
+        let store = StateStore::open_memory().unwrap();
+        let image = make_image("ubuntu-base");
+        store.insert_image(&image).unwrap();
+
+        let fetched = store.get_image(image.id).unwrap();
+        assert_eq!(fetched.name, "ubuntu-base");
+        assert_eq!(fetched.format, "ext4");
+    }
+
+    #[test]
+    fn get_image_by_name() {
+        let store = StateStore::open_memory().unwrap();
+        let image = make_image("debian-base");
+        store.insert_image(&image).unwrap();
+
+        let fetched = store.get_image_by_name("debian-base").unwrap();
+        assert_eq!(fetched.id, image.id);
+    }
+
+    #[test]
+    fn list_images_returns_all() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_image(&make_image("img-a")).unwrap();
+        store.insert_image(&make_image("img-b")).unwrap();
+
+        let images = store.list_images().unwrap();
+        assert_eq!(images.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_image_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_image(&make_image("dup")).unwrap();
+
+        let err = store.insert_image(&make_image("dup")).unwrap_err();
+        assert!(
+            matches!(err, StateError::ImageAlreadyExists(ref name) if name == "dup"),
+            "expected ImageAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_image() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.delete_image(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::ImageNotFound(_)));
     }
 }

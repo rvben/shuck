@@ -4,7 +4,7 @@ pub mod agent_client;
 
 #[cfg(feature = "linux-net")]
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use husk_vmm::VmmBackend;
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub use husk_state::{HostGroupRecord, ServiceRecord, SnapshotRecord, VmRecord};
+pub use husk_state::{HostGroupRecord, ImageRecord, ServiceRecord, SnapshotRecord, VmRecord};
 pub use husk_vmm::{VmInfo, VmState};
 
 pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, ShellEvent};
@@ -41,6 +41,10 @@ pub enum CoreError {
     SnapshotNotFound(String),
     #[error("snapshot already exists: {0}")]
     SnapshotAlreadyExists(String),
+    #[error("image not found: {0}")]
+    ImageNotFound(String),
+    #[error("image already exists: {0}")]
+    ImageAlreadyExists(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("VMM error: {0}")]
@@ -125,6 +129,35 @@ pub struct RestoreSnapshotRequest {
     pub userdata: Option<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+}
+
+/// Parameters for importing an image into husk's image catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ImportImageRequest {
+    pub name: String,
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub source_path: PathBuf,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// Parameters for exporting a catalog image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ExportImageRequest {
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub destination_path: PathBuf,
+}
+
+/// Result payload returned after exporting an image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ExportImageResult {
+    pub name: String,
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub destination_path: PathBuf,
+    pub size_bytes: u64,
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -838,6 +871,106 @@ impl<B: VmmBackend> HuskCore<B> {
         .await
     }
 
+    /// Import a rootfs image into the managed image catalog.
+    pub async fn import_image(&self, req: ImportImageRequest) -> Result<ImageRecord, CoreError> {
+        match self.state.get_image_by_name(&req.name) {
+            Ok(_) => return Err(CoreError::ImageAlreadyExists(req.name)),
+            Err(husk_state::StateError::ImageNotFoundByName(_)) => {}
+            Err(other) => return Err(CoreError::State(other)),
+        }
+
+        husk_storage::validate_rootfs(&req.source_path)?;
+
+        let catalog_dir = self.storage.images_dir().join("catalog");
+        tokio::fs::create_dir_all(&catalog_dir)
+            .await
+            .map_err(husk_storage::StorageError::Io)?;
+
+        let extension = req
+            .source_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("ext4");
+        let image_path = catalog_dir.join(format!("{}.{}", req.name, extension));
+        self.storage_driver
+            .clone_rootfs(&req.source_path, &image_path)
+            .await?;
+
+        let metadata = tokio::fs::metadata(&image_path)
+            .await
+            .map_err(husk_storage::StorageError::Io)?;
+        let record = ImageRecord {
+            id: Uuid::new_v4(),
+            name: req.name.clone(),
+            source_path: req.source_path.to_string_lossy().into_owned(),
+            file_path: image_path.to_string_lossy().into_owned(),
+            format: req
+                .format
+                .unwrap_or_else(|| infer_image_format(&req.source_path)),
+            size_bytes: metadata.len(),
+            created_at: chrono::Utc::now(),
+        };
+
+        if let Err(err) = self.state.insert_image(&record).map_err(|e| match e {
+            husk_state::StateError::ImageAlreadyExists(name) => CoreError::ImageAlreadyExists(name),
+            other => CoreError::State(other),
+        }) {
+            let _ = tokio::fs::remove_file(&image_path).await;
+            return Err(err);
+        }
+
+        Ok(record)
+    }
+
+    /// List all catalog images.
+    pub fn list_images(&self) -> Result<Vec<ImageRecord>, CoreError> {
+        Ok(self.state.list_images()?)
+    }
+
+    /// Get a catalog image by name.
+    pub fn get_image(&self, name: &str) -> Result<ImageRecord, CoreError> {
+        self.state.get_image_by_name(name).map_err(|e| match e {
+            husk_state::StateError::ImageNotFoundByName(_) => CoreError::ImageNotFound(name.into()),
+            other => CoreError::State(other),
+        })
+    }
+
+    /// Export a catalog image to a destination path.
+    pub async fn export_image(
+        &self,
+        name: &str,
+        req: ExportImageRequest,
+    ) -> Result<ExportImageResult, CoreError> {
+        let image = self.get_image(name)?;
+        self.storage_driver
+            .clone_rootfs(Path::new(&image.file_path), &req.destination_path)
+            .await?;
+        let metadata = tokio::fs::metadata(&req.destination_path)
+            .await
+            .map_err(husk_storage::StorageError::Io)?;
+
+        Ok(ExportImageResult {
+            name: image.name,
+            destination_path: req.destination_path,
+            size_bytes: metadata.len(),
+        })
+    }
+
+    /// Delete a catalog image by name.
+    pub async fn delete_image(&self, name: &str) -> Result<(), CoreError> {
+        let image = self.get_image(name)?;
+        match tokio::fs::remove_file(&image.file_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Storage(husk_storage::StorageError::Io(e))),
+        }
+
+        self.state.delete_image(image.id).map_err(|e| match e {
+            husk_state::StateError::ImageNotFound(_) => CoreError::ImageNotFound(name.into()),
+            other => CoreError::State(other),
+        })
+    }
+
     /// Path to a VM's serial console log file.
     pub fn serial_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         let record = self.lookup_vm(name)?;
@@ -1191,6 +1324,13 @@ impl<B: VmmBackend> HuskCore<B> {
             other => CoreError::State(other),
         })
     }
+}
+
+fn infer_image_format(path: &Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_else(|| "ext4".to_string())
 }
 
 /// Serial log files exceeding this size are eligible for rotation.

@@ -184,6 +184,13 @@ enum Commands {
         action: SnapshotAction,
     },
 
+    /// Manage image catalog resources
+    #[command(alias = "img")]
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
+    },
+
     /// Open an interactive shell in a VM
     Shell {
         /// VM name
@@ -340,6 +347,41 @@ enum SnapshotAction {
     /// Delete a snapshot by name
     Delete {
         /// Snapshot name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageAction {
+    /// Import an image into the catalog
+    Import {
+        /// Image name
+        name: String,
+        /// Source image path
+        #[arg(long)]
+        source: PathBuf,
+        /// Optional image format (default inferred from extension)
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// List imported images
+    List,
+    /// Get an image by name
+    Get {
+        /// Image name
+        name: String,
+    },
+    /// Export an image to a destination path
+    Export {
+        /// Image name
+        name: String,
+        /// Destination path on host
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    /// Delete an image by name
+    Delete {
+        /// Image name
         name: String,
     },
 }
@@ -1062,6 +1104,10 @@ async fn main() -> Result<()> {
         Commands::Snapshot { action } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             snapshot_command(api_url, api_token, action, output).await
+        }
+        Commands::Image { action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            image_command(api_url, api_token, action, output).await
         }
         Commands::Logs { name, follow, tail } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -1841,6 +1887,182 @@ async fn snapshot_command(
                 );
             } else {
                 let msg = api_error(resp, &format!("snapshot '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn image_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: ImageAction,
+    output: OutputFormat,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        ImageAction::Import {
+            name,
+            source,
+            format,
+        } => {
+            let mut body = serde_json::json!({
+                "name": &name,
+                "source_path": &source,
+            });
+            if let Some(image_format) = format.as_deref() {
+                body["format"] = serde_json::json!(image_format);
+            }
+
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/images")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let image: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "image-import",
+                        "image": image,
+                    }),
+                    format!("Imported image: {}", image["name"].as_str().unwrap_or("-")),
+                );
+            } else {
+                let msg = api_error(resp, &format!("image '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        ImageAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/images")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing images").await;
+                exit_with_error(output, msg);
+            }
+
+            let images: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "image-list",
+                        "images": images,
+                    }),
+                    "",
+                );
+            } else if images.is_empty() {
+                println!("No images found");
+            } else {
+                println!("{:<20} {:<8} {:>10}   {}", "NAME", "FORMAT", "SIZE", "FILE");
+                for image in &images {
+                    println!(
+                        "{:<20} {:<8} {:>10}   {}",
+                        image["name"].as_str().unwrap_or("-"),
+                        image["format"].as_str().unwrap_or("-"),
+                        image["size_bytes"].as_u64().unwrap_or(0),
+                        image["file_path"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        ImageAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/images/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("image '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let image: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "image-get",
+                        "image": image,
+                    }),
+                    "",
+                );
+            } else {
+                let s = |key: &str| image[key].as_str().unwrap_or("-");
+                println!("Name:        {}", s("name"));
+                println!("Format:      {}", s("format"));
+                println!("Size bytes:  {}", image["size_bytes"].as_u64().unwrap_or(0));
+                println!("Source path: {}", s("source_path"));
+                println!("File path:   {}", s("file_path"));
+                println!("Created:     {}", s("created_at"));
+            }
+        }
+        ImageAction::Export { name, destination } => {
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/images/{name}/export")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({
+                    "destination_path": &destination,
+                })),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let exported: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "image-export",
+                        "image": name,
+                        "export": exported,
+                    }),
+                    format!(
+                        "Exported image {} to {}",
+                        name,
+                        exported["destination_path"].as_str().unwrap_or("-")
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("image '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        ImageAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/images/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "image-delete",
+                        "image": &name,
+                    }),
+                    format!("Deleted image: {name}"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("image '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -2956,6 +3178,58 @@ mod tests {
                 assert_eq!(memory, 256);
             }
             _ => panic!("expected snapshot restore command"),
+        }
+    }
+
+    #[test]
+    fn parse_image_import_command() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "image",
+            "import",
+            "ubuntu-base",
+            "--source",
+            "/tmp/source.ext4",
+            "--format",
+            "ext4",
+        ])
+        .expect("image import parses");
+        match cli.command {
+            Commands::Image {
+                action:
+                    ImageAction::Import {
+                        name,
+                        source,
+                        format,
+                    },
+            } => {
+                assert_eq!(name, "ubuntu-base");
+                assert_eq!(source, PathBuf::from("/tmp/source.ext4"));
+                assert_eq!(format.as_deref(), Some("ext4"));
+            }
+            _ => panic!("expected image import command"),
+        }
+    }
+
+    #[test]
+    fn parse_image_export_command() {
+        let cli = Cli::try_parse_from([
+            "husk",
+            "image",
+            "export",
+            "ubuntu-base",
+            "--destination",
+            "/tmp/exported.ext4",
+        ])
+        .expect("image export parses");
+        match cli.command {
+            Commands::Image {
+                action: ImageAction::Export { name, destination },
+            } => {
+                assert_eq!(name, "ubuntu-base");
+                assert_eq!(destination, PathBuf::from("/tmp/exported.ext4"));
+            }
+            _ => panic!("expected image export command"),
         }
     }
 
