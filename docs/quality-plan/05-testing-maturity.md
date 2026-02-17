@@ -48,3 +48,4 @@
 | 2026-02-17 | Coverage floor raised from 50% to 55% with targeted CLI helper tests | Workspace line coverage now sustained above 55% (`make coverage-ci`) |
 | 2026-02-17 | Coverage floor raised to 70% enforced scope with additional core/vz tests | `make coverage-ci` now enforces line>=70 with explicit scope exclusions and passes |
 | 2026-02-17 | Coverage floor raised to 73% with expanded agent protocol/error-path tests | `make coverage-ci` now enforces line>=73 and passes at 73.90% in enforced scope |
+| 2026-02-17 | Coverage floor raised to 74% with additional wait-ready/storage branch tests | `make coverage-ci` now enforces line>=74 and passes at 74.14% in enforced scope |
