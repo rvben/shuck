@@ -46,3 +46,4 @@
 | 2026-02-16 | TEST-003 and TEST-004 completed | Protocol + allocator/lifecycle property depth increased |
 | 2026-02-16 | TEST-006 coverage/mutation gates enabled | Coverage and mutation checks now automated in quality workflows |
 | 2026-02-17 | Coverage floor raised from 50% to 55% with targeted CLI helper tests | Workspace line coverage now sustained above 55% (`make coverage-ci`) |
+| 2026-02-17 | Coverage floor raised to 70% enforced scope with additional core/vz tests | `make coverage-ci` now enforces line>=70 with explicit scope exclusions and passes |

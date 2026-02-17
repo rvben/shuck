@@ -32,10 +32,14 @@
 
 ## Coverage policy
 
-- Workspace coverage floor:
-  - line >= 55%
+- Workspace coverage floor (enforced by `make coverage-ci`):
+  - line >= 70%
+- Coverage scope exclusions:
+  - `crates/husk/src/main.rs` (CLI binary entrypoint orchestration)
+  - `crates/husk-agent/src/main.rs` (agent binary entrypoint bootstrap)
+  - `crates/husk-vmm/src/apple_vz.rs` (platform-specific Virtualization.framework FFI shim)
 - Last validated:
-  - 2026-02-17 (`make coverage-ci` passed with 55.50% line coverage)
+  - 2026-02-17 (`make coverage-ci` passed with 73.28% line coverage in enforced scope)
 
 ## Mutation policy
 
