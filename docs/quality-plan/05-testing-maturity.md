@@ -51,3 +51,4 @@
 | 2026-02-17 | Coverage floor raised to 74% with additional wait-ready/storage branch tests | `make coverage-ci` now enforces line>=74 and passes at 74.14% in enforced scope |
 | 2026-02-17 | Coverage floor raised to 75% with additional API policy/error-path tests | `make coverage-ci` now enforces line>=75 and passes at 75.55% in enforced scope |
 | 2026-02-17 | Coverage floor raised to 76% with rootfs DNS injection path tests | `make coverage-ci` now enforces line>=76 and passes at 76.83% in enforced scope |
+| 2026-02-17 | Coverage floor raised to 77% with additional API helper + resolv write-edge tests | `make coverage-ci` now enforces line>=77 and passes at 77.15% in enforced scope |

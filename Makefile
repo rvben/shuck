@@ -119,7 +119,7 @@ test-perf-baseline:
 
 # Coverage gate (line + branch) for workspace quality floor.
 coverage-ci:
-	cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/husk/src/main.rs|crates/husk-agent/src/main.rs|crates/husk-vmm/src/apple_vz.rs' --fail-under-lines 76 --lcov --output-path target/llvm-cov.info
+	cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/husk/src/main.rs|crates/husk-agent/src/main.rs|crates/husk-vmm/src/apple_vz.rs' --fail-under-lines 77 --lcov --output-path target/llvm-cov.info
 
 # Mutation-testing smoke gate (tooling + target discoverability).
 mutation-gate:
