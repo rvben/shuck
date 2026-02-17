@@ -2084,6 +2084,7 @@ mod tests {
 
     #[test]
     fn normalize_guest_path_rejects_parent_traversal() {
+        assert_eq!(normalize_guest_path("relative/path"), None);
         assert_eq!(normalize_guest_path("/var/log/../tmp"), None);
         assert_eq!(
             normalize_guest_path("/var//log/./kernel"),
@@ -2097,6 +2098,10 @@ mod tests {
         assert!(is_allowed_guest_path("/tmp/test.txt", &allow));
         assert!(is_allowed_guest_path("/var/log/kern.log", &allow));
         assert!(!is_allowed_guest_path("/etc/passwd", &allow));
+
+        let no_allowlist: Vec<String> = Vec::new();
+        assert!(is_allowed_guest_path("/etc/passwd", &no_allowlist));
+        assert!(!is_allowed_guest_path("etc/passwd", &no_allowlist));
     }
 
     #[test]
@@ -2119,6 +2124,30 @@ mod tests {
 
         policy.exec_allowlist.clear();
         assert!(exec_command_allowed("cat", &policy));
+        policy.exec_env_allowlist.clear();
+        assert!(exec_env_allowed(&env, &policy));
+    }
+
+    #[test]
+    fn rate_limited_route_classification() {
+        assert_eq!(
+            is_rate_limited_route(&Method::POST, "/v1/vms/test/exec"),
+            Some("exec")
+        );
+        assert_eq!(
+            is_rate_limited_route(&Method::POST, "/v1/vms/test/files/read"),
+            Some("file_read")
+        );
+        assert_eq!(
+            is_rate_limited_route(&Method::POST, "/v1/vms/test/files/write"),
+            Some("file_write")
+        );
+        assert_eq!(
+            is_rate_limited_route(&Method::GET, "/v1/vms/test/shell"),
+            Some("shell")
+        );
+        assert_eq!(is_rate_limited_route(&Method::GET, "/v1/vms"), None);
+        assert_eq!(is_rate_limited_route(&Method::POST, "/v1/vms"), None);
     }
 
     #[test]
@@ -2232,6 +2261,23 @@ mod tests {
     fn map_agent_connect_error_falls_back_for_non_agent_errors() {
         let (status, _) = map_agent_connect_error(CoreError::VmNotFound("vm".into()));
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn map_agent_connect_error_returns_service_unavailable_with_hint() {
+        let (status, body) = map_agent_connect_error(CoreError::Agent(
+            husk_core::AgentError::Connection(std::io::Error::other("dial failed")),
+        ));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let payload = body.0;
+        assert_eq!(payload.code, "agent_not_ready");
+        assert_eq!(
+            payload.hint.as_deref(),
+            Some("retry after the VM boot sequence has completed")
+        );
+        assert_eq!(payload.error.as_deref(), Some(payload.message.as_str()));
+        assert!(payload.message.contains("agent not ready:"));
     }
 
     #[test]

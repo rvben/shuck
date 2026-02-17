@@ -992,6 +992,9 @@ mod tests {
     const FAKE_MOUNT_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 mount_dir="$4"
+if [ "${HUSK_FAKE_SKIP_ETC_DIR:-0}" = "1" ]; then
+  exit "${HUSK_FAKE_MOUNT_EXIT:-0}"
+fi
 mkdir -p "$mount_dir/etc/systemd/system"
 mkdir -p "$mount_dir/run/systemd/resolve"
 touch "$mount_dir/run/systemd/resolve/stub-resolv.conf"
@@ -1201,6 +1204,39 @@ exit "${HUSK_FAKE_UMOUNT_EXIT:-0}"
         match err {
             CoreError::Storage(husk_storage::StorageError::Io(ioe)) => {
                 assert!(ioe.to_string().contains("umount failed"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    #[tokio::test]
+    async fn inject_resolv_conf_returns_error_when_resolv_write_fails() {
+        let _guard = env_test_lock().lock().await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        write_executable_script(&bin_dir.path().join("mount"), FAKE_MOUNT_SCRIPT);
+        write_executable_script(&bin_dir.path().join("umount"), FAKE_UMOUNT_SCRIPT);
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = rootfs_dir.path().join("rootfs.img");
+        std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+
+        let mut path = OsString::from(bin_dir.path().as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        let _path_guard = ScopedEnvVar::set("PATH", &path);
+        let _mount_exit = ScopedEnvVar::set("HUSK_FAKE_MOUNT_EXIT", "0");
+        let _umount_exit = ScopedEnvVar::set("HUSK_FAKE_UMOUNT_EXIT", "0");
+        let _skip_etc = ScopedEnvVar::set("HUSK_FAKE_SKIP_ETC_DIR", "1");
+
+        let servers = vec!["1.1.1.1".to_string()];
+        let err = inject_resolv_conf(&rootfs, &servers).await.unwrap_err();
+
+        match err {
+            CoreError::Storage(husk_storage::StorageError::Io(ioe)) => {
+                assert!(ioe.to_string().contains("No such file"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
