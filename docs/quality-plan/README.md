@@ -55,3 +55,4 @@ This folder tracks the roadmap to move every reviewed area to 100/100.
 | 2026-02-17 | Testing sustainment: coverage floor increased to 70% (enforced scope) with new core orchestration and apple-vz test depth |
 | 2026-02-17 | Testing sustainment: coverage floor increased to 73% with additional agent handler/client error-path depth |
 | 2026-02-17 | Testing sustainment: coverage floor increased to 74% with targeted wait-ready/storage branch coverage |
+| 2026-02-17 | Testing sustainment: coverage floor increased to 75% with additional API policy/error-path branch coverage |
