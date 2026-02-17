@@ -981,6 +981,83 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "linux-net", unix))]
+    use std::ffi::{OsStr, OsString};
+    #[cfg(all(feature = "linux-net", unix))]
+    use std::path::Path;
+    #[cfg(all(feature = "linux-net", unix))]
+    use std::sync::OnceLock;
+
+    #[cfg(all(feature = "linux-net", unix))]
+    const FAKE_MOUNT_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+mount_dir="$4"
+mkdir -p "$mount_dir/etc/systemd/system"
+mkdir -p "$mount_dir/run/systemd/resolve"
+touch "$mount_dir/run/systemd/resolve/stub-resolv.conf"
+ln -sf "$mount_dir/run/systemd/resolve/stub-resolv.conf" "$mount_dir/etc/resolv.conf"
+exit "${HUSK_FAKE_MOUNT_EXIT:-0}"
+"#;
+
+    #[cfg(all(feature = "linux-net", unix))]
+    const FAKE_UMOUNT_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+mount_dir="$1"
+if [ -n "${HUSK_FAKE_CAPTURE_FILE:-}" ] && [ -f "$mount_dir/etc/resolv.conf" ]; then
+  cp "$mount_dir/etc/resolv.conf" "$HUSK_FAKE_CAPTURE_FILE"
+fi
+if [ -n "${HUSK_FAKE_MASK_CAPTURE_FILE:-}" ] && [ -L "$mount_dir/etc/systemd/system/systemd-resolved.service" ]; then
+  readlink "$mount_dir/etc/systemd/system/systemd-resolved.service" > "$HUSK_FAKE_MASK_CAPTURE_FILE"
+fi
+exit "${HUSK_FAKE_UMOUNT_EXIT:-0}"
+"#;
+
+    #[cfg(all(feature = "linux-net", unix))]
+    fn env_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    fn write_executable_script(path: &Path, script: &str) {
+        std::fs::write(path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize environment mutation using env_test_lock().
+            unsafe { std::env::set_var(key, value.as_ref()) };
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => {
+                    // SAFETY: tests serialize environment mutation using env_test_lock().
+                    unsafe { std::env::set_var(self.key, value) };
+                }
+                None => {
+                    // SAFETY: tests serialize environment mutation using env_test_lock().
+                    unsafe { std::env::remove_var(self.key) };
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn rotate_log_file_truncates_oversized() {
@@ -1026,5 +1103,106 @@ mod tests {
 
         let result = rotate_log_file(&path, LOG_ROTATE_KEEP).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    #[tokio::test]
+    async fn inject_resolv_conf_writes_nameservers_and_masks_resolved() {
+        let _guard = env_test_lock().lock().await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        write_executable_script(&bin_dir.path().join("mount"), FAKE_MOUNT_SCRIPT);
+        write_executable_script(&bin_dir.path().join("umount"), FAKE_UMOUNT_SCRIPT);
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = rootfs_dir.path().join("rootfs.img");
+        std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+
+        let capture_dir = tempfile::tempdir().unwrap();
+        let resolv_capture = capture_dir.path().join("resolv.conf.capture");
+        let mask_capture = capture_dir.path().join("resolved-mask.capture");
+
+        let mut path = OsString::from(bin_dir.path().as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        let _path_guard = ScopedEnvVar::set("PATH", &path);
+        let _mount_exit = ScopedEnvVar::set("HUSK_FAKE_MOUNT_EXIT", "0");
+        let _umount_exit = ScopedEnvVar::set("HUSK_FAKE_UMOUNT_EXIT", "0");
+        let _capture_guard = ScopedEnvVar::set("HUSK_FAKE_CAPTURE_FILE", &resolv_capture);
+        let _mask_guard = ScopedEnvVar::set("HUSK_FAKE_MASK_CAPTURE_FILE", &mask_capture);
+
+        let servers = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
+        inject_resolv_conf(&rootfs, &servers).await.unwrap();
+
+        let resolv_contents = std::fs::read_to_string(resolv_capture).unwrap();
+        assert_eq!(resolv_contents, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+
+        let mask_target = std::fs::read_to_string(mask_capture).unwrap();
+        assert_eq!(mask_target.trim(), "/dev/null");
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    #[tokio::test]
+    async fn inject_resolv_conf_returns_error_when_mount_fails() {
+        let _guard = env_test_lock().lock().await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        write_executable_script(&bin_dir.path().join("mount"), FAKE_MOUNT_SCRIPT);
+        write_executable_script(&bin_dir.path().join("umount"), FAKE_UMOUNT_SCRIPT);
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = rootfs_dir.path().join("rootfs.img");
+        std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+
+        let mut path = OsString::from(bin_dir.path().as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        let _path_guard = ScopedEnvVar::set("PATH", &path);
+        let _mount_exit = ScopedEnvVar::set("HUSK_FAKE_MOUNT_EXIT", "1");
+        let _umount_exit = ScopedEnvVar::set("HUSK_FAKE_UMOUNT_EXIT", "0");
+
+        let servers = vec!["1.1.1.1".to_string()];
+        let err = inject_resolv_conf(&rootfs, &servers).await.unwrap_err();
+
+        match err {
+            CoreError::Storage(husk_storage::StorageError::Io(ioe)) => {
+                assert!(ioe.to_string().contains("mount failed"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    #[tokio::test]
+    async fn inject_resolv_conf_returns_error_when_umount_fails() {
+        let _guard = env_test_lock().lock().await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        write_executable_script(&bin_dir.path().join("mount"), FAKE_MOUNT_SCRIPT);
+        write_executable_script(&bin_dir.path().join("umount"), FAKE_UMOUNT_SCRIPT);
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = rootfs_dir.path().join("rootfs.img");
+        std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+
+        let mut path = OsString::from(bin_dir.path().as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        let _path_guard = ScopedEnvVar::set("PATH", &path);
+        let _mount_exit = ScopedEnvVar::set("HUSK_FAKE_MOUNT_EXIT", "0");
+        let _umount_exit = ScopedEnvVar::set("HUSK_FAKE_UMOUNT_EXIT", "1");
+
+        let servers = vec!["1.1.1.1".to_string()];
+        let err = inject_resolv_conf(&rootfs, &servers).await.unwrap_err();
+
+        match err {
+            CoreError::Storage(husk_storage::StorageError::Io(ioe)) => {
+                assert!(ioe.to_string().contains("umount failed"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
