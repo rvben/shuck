@@ -71,6 +71,11 @@ pub struct ServiceResponse {
     pub updated_at: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ScaleServiceRequest {
+    pub desired_instances: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub code: String,
@@ -303,6 +308,7 @@ pub enum WsShellOutput {
         create_service,
         get_service,
         delete_service,
+        scale_service,
         list_vms,
         create_vm,
         get_vm,
@@ -335,6 +341,7 @@ pub enum WsShellOutput {
         WsShellOutput,
         CreateHostGroupRequest,
         CreateServiceRequest,
+        ScaleServiceRequest,
         CreateVmRequest,
     )),
     tags(
@@ -511,6 +518,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             "/v1/services/{name}",
             get(get_service::<B>).delete(delete_service::<B>),
         )
+        .route("/v1/services/{name}/scale", post(scale_service::<B>))
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
@@ -989,6 +997,29 @@ async fn delete_service<B: VmmBackend + 'static>(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_service(&name).map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/services/{name}/scale",
+    tag = "services",
+    params(("name" = String, Path, description = "Service name")),
+    request_body = ScaleServiceRequest,
+    responses(
+        (status = 200, description = "Service scaled", body = ServiceResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn scale_service<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<ScaleServiceRequest>,
+) -> Result<Json<ServiceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let service = core
+        .scale_service(&name, req.desired_instances)
+        .map_err(map_error)?;
+    Ok(Json(service_to_response(service)))
 }
 
 #[utoipa::path(
@@ -2170,6 +2201,69 @@ mod tests {
                 Request::post("/v1/services")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn scale_service_updates_desired_instances() {
+        let app = router(test_core());
+        let create = serde_json::json!({ "name": "api", "desired_instances": 1 });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let scale = serde_json::json!({ "desired_instances": 4 });
+        let response = app
+            .oneshot(
+                Request::post("/v1/services/api/scale")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&scale).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "api");
+        assert_eq!(json["desired_instances"], 4);
+    }
+
+    #[tokio::test]
+    async fn scale_service_zero_instances_returns_400() {
+        let app = router(test_core());
+        let create = serde_json::json!({ "name": "api", "desired_instances": 1 });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let scale = serde_json::json!({ "desired_instances": 0 });
+        let response = app
+            .oneshot(
+                Request::post("/v1/services/api/scale")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&scale).unwrap()))
                     .unwrap(),
             )
             .await

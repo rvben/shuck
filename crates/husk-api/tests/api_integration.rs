@@ -246,6 +246,42 @@ async fn host_group_and_service_endpoints_roundtrip() {
 }
 
 #[tokio::test]
+async fn scale_service_endpoint_updates_desired_instances() {
+    let app = router(test_core());
+
+    let create = serde_json::json!({
+        "name": "api",
+        "desired_instances": 1
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&create).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let scale = serde_json::json!({ "desired_instances": 3 });
+    let response = app
+        .oneshot(
+            Request::post("/v1/services/api/scale")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&scale).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let service = response_json(response).await;
+    assert_eq!(service["name"], "api");
+    assert_eq!(service["desired_instances"], 3);
+}
+
+#[tokio::test]
 async fn create_service_with_missing_host_group_returns_404() {
     let app = router(test_core());
     let body = serde_json::json!({

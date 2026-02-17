@@ -475,6 +475,25 @@ impl StateStore {
         Ok(records)
     }
 
+    /// Update desired instance count for a service.
+    pub fn update_service_desired_instances(
+        &self,
+        id: Uuid,
+        desired_instances: u32,
+    ) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE services
+             SET desired_instances = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![id.to_string(), desired_instances, Utc::now().to_rfc3339()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::ServiceNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Delete a service record.
     pub fn delete_service(&self, id: Uuid) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -1334,6 +1353,29 @@ mod tests {
     fn delete_nonexistent_service() {
         let store = StateStore::open_memory().unwrap();
         let err = store.delete_service(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::ServiceNotFound(_)));
+    }
+
+    #[test]
+    fn update_service_desired_instances_persists() {
+        let store = StateStore::open_memory().unwrap();
+        let service = make_service("api", None);
+        store.insert_service(&service).unwrap();
+
+        store
+            .update_service_desired_instances(service.id, 5)
+            .unwrap();
+
+        let fetched = store.get_service(service.id).unwrap();
+        assert_eq!(fetched.desired_instances, 5);
+    }
+
+    #[test]
+    fn update_nonexistent_service_desired_instances_returns_not_found() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store
+            .update_service_desired_instances(Uuid::new_v4(), 3)
+            .unwrap_err();
         assert!(matches!(err, StateError::ServiceNotFound(_)));
     }
 

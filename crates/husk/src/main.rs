@@ -279,6 +279,13 @@ enum ServiceAction {
         /// Service name
         name: String,
     },
+    /// Scale a service
+    Scale {
+        /// Service name
+        name: String,
+        /// Desired instance count
+        desired_instances: u32,
+    },
     /// Delete a service by name
     Delete {
         /// Service name
@@ -1534,6 +1541,41 @@ async fn service_command(
                 println!("Updated:           {}", s("updated_at"));
             }
         }
+        ServiceAction::Scale {
+            name,
+            desired_instances,
+        } => {
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/services/{name}/scale")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({
+                    "desired_instances": desired_instances,
+                })),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let service: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "service-scale",
+                        "service": service,
+                    }),
+                    format!(
+                        "Scaled service {} to {}",
+                        service["name"].as_str().unwrap_or("-"),
+                        service["desired_instances"]
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("service '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
         ServiceAction::Delete { name } => {
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/services/{name}")),
@@ -2594,6 +2636,25 @@ mod tests {
                 assert_eq!(image.as_deref(), Some("ghcr.io/acme/api:1.2.3"));
             }
             _ => panic!("expected service create command"),
+        }
+    }
+
+    #[test]
+    fn parse_service_scale_command() {
+        let cli =
+            Cli::try_parse_from(["husk", "service", "scale", "api", "7"]).expect("service scale");
+        match cli.command {
+            Commands::Service {
+                action:
+                    ServiceAction::Scale {
+                        name,
+                        desired_instances,
+                    },
+            } => {
+                assert_eq!(name, "api");
+                assert_eq!(desired_instances, 7);
+            }
+            _ => panic!("expected service scale command"),
         }
     }
 

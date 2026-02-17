@@ -666,6 +666,31 @@ impl<B: VmmBackend> HuskCore<B> {
         })
     }
 
+    /// Scale a service to the desired instance count.
+    pub fn scale_service(
+        &self,
+        name: &str,
+        desired_instances: u32,
+    ) -> Result<ServiceRecord, CoreError> {
+        if desired_instances == 0 {
+            return Err(CoreError::InvalidArgument(
+                "desired_instances must be >= 1".into(),
+            ));
+        }
+
+        let record = self.get_service(name)?;
+        self.state
+            .update_service_desired_instances(record.id, desired_instances)
+            .map_err(|e| match e {
+                husk_state::StateError::ServiceNotFound(_) => {
+                    CoreError::ServiceNotFound(name.into())
+                }
+                other => CoreError::State(other),
+            })?;
+
+        self.get_service(name)
+    }
+
     /// Delete a service by name.
     pub fn delete_service(&self, name: &str) -> Result<(), CoreError> {
         let record = self.get_service(name)?;
