@@ -225,6 +225,16 @@ async fn connect_accepts_ok_vsock_handshake() {
 }
 
 #[tokio::test]
+async fn connect_invalid_utf8_handshake_maps_connection_error() {
+    let (_dir, path) = spawn_vsock_proxy(b"\xff\n").await;
+    let err = match AgentClient::connect(&path, 52).await {
+        Ok(_) => panic!("expected invalid handshake failure"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, AgentError::Connection(_)));
+}
+
+#[tokio::test]
 async fn connect_unix_missing_socket_maps_connection_error() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.sock");
@@ -256,6 +266,27 @@ async fn wait_ready_retries_until_ping_succeeds() {
         start.elapsed() >= std::time::Duration::from_millis(90),
         "expected at least one backoff sleep before success"
     );
+}
+
+#[tokio::test]
+async fn wait_ready_ping_error_after_deadline_returns_ping_error() {
+    let (_dir, path) = spawn_vsock_ping_proxy(vec![false]).await;
+    let err = match AgentClient::wait_ready(&path, 52, std::time::Duration::ZERO).await {
+        Ok(_) => panic!("expected wait_ready ping failure"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "not ready yet"));
+}
+
+#[tokio::test]
+async fn wait_ready_connect_error_after_deadline_returns_connect_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.firecracker.vsock");
+    let err = match AgentClient::wait_ready(&missing, 52, std::time::Duration::ZERO).await {
+        Ok(_) => panic!("expected wait_ready connect failure"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, AgentError::Connection(_)));
 }
 
 #[tokio::test]

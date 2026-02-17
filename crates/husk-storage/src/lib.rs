@@ -150,6 +150,18 @@ mod tests {
         assert!(matches!(result, Err(StorageError::RootfsNotFound(_))));
     }
 
+    #[test]
+    fn storage_config_default_data_dir_is_stable() {
+        let cfg = StorageConfig::default();
+        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/husk"));
+    }
+
+    #[test]
+    fn validate_rootfs_existing_file_ok() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert!(validate_rootfs(tmp.path()).is_ok());
+    }
+
     #[cfg(target_os = "macos")]
     mod macos_kernel_validation {
         use super::*;
