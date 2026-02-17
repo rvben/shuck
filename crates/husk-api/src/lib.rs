@@ -1724,6 +1724,7 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+    use std::sync::OnceLock;
 
     use axum::body::Body;
     use axum::http::Request;
@@ -1772,6 +1773,11 @@ mod tests {
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn policy_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
@@ -1917,6 +1923,95 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn read_file_policy_denied_returns_403() {
+        let _guard = policy_test_lock().lock().await;
+        set_policy(ApiPolicy {
+            allowed_read_paths: vec!["/safe".into()],
+            ..ApiPolicy::default()
+        });
+
+        let app = router(test_core());
+        let body = serde_json::json!({ "path": "/etc/passwd" });
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/any/files/read")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "policy_read_path_denied");
+
+        set_policy(ApiPolicy::default());
+    }
+
+    #[tokio::test]
+    async fn write_file_policy_denied_returns_403() {
+        let _guard = policy_test_lock().lock().await;
+        set_policy(ApiPolicy {
+            allowed_write_paths: vec!["/safe".into()],
+            ..ApiPolicy::default()
+        });
+
+        let app = router(test_core());
+        let body = serde_json::json!({
+            "path": "/etc/passwd",
+            "data": husk_agent_proto::base64_encode(b"x"),
+            "mode": null
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/any/files/write")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "policy_write_path_denied");
+
+        set_policy(ApiPolicy::default());
+    }
+
+    #[tokio::test]
+    async fn write_file_too_large_returns_413() {
+        let _guard = policy_test_lock().lock().await;
+        set_policy(ApiPolicy {
+            max_file_write_bytes: 1,
+            ..ApiPolicy::default()
+        });
+
+        let app = router(test_core());
+        let body = serde_json::json!({
+            "path": "/tmp/output.bin",
+            "data": husk_agent_proto::base64_encode(b"xy"),
+            "mode": null
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/any/files/write")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "write_file_too_large");
+
+        set_policy(ApiPolicy::default());
+    }
+
     #[test]
     fn protected_route_detection_is_correct() {
         assert!(!is_protected_route(&Method::GET, "/v1/health"));
@@ -2034,6 +2129,13 @@ mod tests {
         assert!(!limiter.allow("k", 2));
     }
 
+    #[test]
+    fn rate_limiter_zero_limit_allows_requests() {
+        let limiter = SlidingWindowRateLimiter::default();
+        assert!(limiter.allow("k", 0));
+        assert!(limiter.allow("k", 0));
+    }
+
     // ── tail_lines unit tests ─────────────────────────────────────────
 
     #[test]
@@ -2102,5 +2204,45 @@ mod tests {
 
         let (status, _) = map_error(CoreError::Agent(AgentError::UnexpectedResponse));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, _) = map_error(CoreError::Storage(husk_storage::StorageError::CommandFailed(
+            "x".into(),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, _) = map_error(CoreError::State(husk_state::StateError::LockPoisoned));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, _) = map_error(CoreError::Vmm(husk_vmm::VmmError::VmNotFound(
+            uuid::Uuid::new_v4(),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        #[cfg(feature = "linux-net")]
+        {
+            let (status, _) = map_error(CoreError::Network(husk_net::NetError::CommandFailed {
+                cmd: "x".into(),
+                message: "y".into(),
+            }));
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn map_agent_connect_error_falls_back_for_non_agent_errors() {
+        let (status, _) = map_agent_connect_error(CoreError::VmNotFound("vm".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn ws_shell_start_deserializes_default_terminal_size() {
+        let msg: WsShellInput = serde_json::from_str(r#"{"type":"start"}"#).unwrap();
+        match msg {
+            WsShellInput::Start { cols, rows, .. } => {
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
+            }
+            other => panic!("expected start message, got {other:?}"),
+        }
     }
 }
