@@ -1,8 +1,8 @@
 #!/bin/sh
 # Check if the running kernel has the features required by k3s.
 #
-# Run inside a Husk VM:
-#   husk exec <vm> -- sh /path/to/check-k3s-kernel.sh
+# Run inside a Shuck VM:
+#   shuck exec <vm> -- sh /path/to/check-k3s-kernel.sh
 #
 # Checks /proc/config.gz (if available) or /boot/config-$(uname -r).
 

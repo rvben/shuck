@@ -1,4 +1,4 @@
-# Husk
+# Shuck
 
 An open-source microVM manager built on [Firecracker](https://firecracker-microvm.github.io/) (Linux) and [Apple Virtualization.framework](https://developer.apple.com/documentation/virtualization) (macOS).
 
@@ -13,30 +13,30 @@ An open-source microVM manager built on [Firecracker](https://firecracker-microv
 
 ```bash
 # Install
-cargo install --path crates/husk
+cargo install --path crates/shuck
 
 # Start the daemon
-husk daemon &
+shuck daemon &
 
 # Boot a VM
-husk run --name myvm --kernel /path/to/vmlinux /path/to/rootfs.ext4
+shuck run --name myvm --kernel /path/to/vmlinux /path/to/rootfs.ext4
 
 # Interact
-husk exec myvm -- uname -a
-husk shell myvm
-husk cp local.txt myvm:/tmp/local.txt
-husk logs myvm -f
+shuck exec myvm -- uname -a
+shuck shell myvm
+shuck cp local.txt myvm:/tmp/local.txt
+shuck logs myvm -f
 
 # Clean up
-husk destroy myvm
+shuck destroy myvm
 ```
 
 ## Configuration
 
 Copy `config.example.toml` to one of the discovery paths:
 
-1. `~/.config/husk/config.toml` (user)
-2. `/etc/husk/config.toml` (system)
+1. `~/.config/shuck/config.toml` (user)
+2. `/etc/shuck/config.toml` (system)
 
 Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` for all available fields.
 
@@ -50,12 +50,12 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 ## Architecture
 
 ```
-CLI (husk) ──> REST API (husk-api) ──> Core (husk-core)
-                                           ├── VMM (husk-vmm)      Firecracker / Apple VZ
-                                           ├── State (husk-state)  SQLite persistence
-                                           ├── Net (husk-net)      TAP devices, IP allocation
-                                           └── Storage (husk-storage) Rootfs cloning
-                                       Guest Agent (husk-agent) ←── Proto (husk-agent-proto)
+CLI (shuck) ──> REST API (shuck-api) ──> Core (shuck-core)
+                                           ├── VMM (shuck-vmm)      Firecracker / Apple VZ
+                                           ├── State (shuck-state)  SQLite persistence
+                                           ├── Net (shuck-net)      TAP devices, IP allocation
+                                           └── Storage (shuck-storage) Rootfs cloning
+                                       Guest Agent (shuck-agent) ←── Proto (shuck-agent-proto)
 ```
 
 Host-guest communication uses vsock (port 52). Messages are length-prefixed JSON with base64-encoded binary payloads.
@@ -85,11 +85,11 @@ make update-rootfs                  # Inject agent into rootfs image
 
 ### Systemd
 
-A systemd unit file is provided at `contrib/husk.service`.
+A systemd unit file is provided at `contrib/shuck.service`.
 
 ## Links
 
-- [k3s on Husk](docs/k3s.md) - Running Kubernetes clusters on Firecracker VMs
+- [k3s on Shuck](docs/k3s.md) - Running Kubernetes clusters on Firecracker VMs
 - [Quality Plan](docs/quality-plan/README.md) - Multi-aspect roadmap to 100/100 quality targets
 - [Threat Model](docs/security/threat-model.md) - STRIDE model and control mapping
 - [Hardening Guide](docs/security/hardening-guide.md) - Deployment security checklist

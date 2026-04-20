@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the initramfs for Alpine-based husk VMs.
+# Build the initramfs for Alpine-based shuck VMs.
 #
 # Downloads the Alpine linux-virt kernel package, extracts the required
 # modules, bundles them with a BusyBox-based init, and produces a gzip
@@ -10,13 +10,13 @@
 #
 # Defaults: ALPINE_VERSION=3.21  ARCH=aarch64
 #
-# Output: ~/.local/share/husk/kernels/initramfs-virt.gz
+# Output: ~/.local/share/shuck/kernels/initramfs-virt.gz
 
 set -euo pipefail
 
 ALPINE_VERSION="${1:-3.21}"
 ARCH="${2:-aarch64}"
-OUTPUT_DIR="${HOME}/.local/share/husk/kernels"
+OUTPUT_DIR="${HOME}/.local/share/shuck/kernels"
 WORK_DIR="$(mktemp -d)"
 
 cleanup() { rm -rf "$WORK_DIR"; }

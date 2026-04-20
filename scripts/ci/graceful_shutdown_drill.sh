@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${HUSK_DRILL_PORT:-17877}"
+PORT="${SHUCK_DRILL_PORT:-17877}"
 BASE_URL="http://127.0.0.1:${PORT}"
 DATA_DIR="$(mktemp -d)"
 LOG_FILE="$(mktemp)"
@@ -18,8 +18,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[graceful-shutdown] starting daemon on ${BASE_URL}"
-HUSK_DATA_DIR="${DATA_DIR}" \
-  cargo run --quiet --package husk --no-default-features -- daemon --listen "127.0.0.1:${PORT}" \
+SHUCK_DATA_DIR="${DATA_DIR}" \
+  cargo run --quiet --package shuck --no-default-features -- daemon --listen "127.0.0.1:${PORT}" \
   >"${LOG_FILE}" 2>&1 &
 PID=$!
 

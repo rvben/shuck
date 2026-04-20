@@ -3,7 +3,7 @@
 Global flag:
 
 ```bash
-husk --output json <command> ...
+shuck --output json <command> ...
 ```
 
 ## Common conventions

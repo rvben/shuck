@@ -13,8 +13,8 @@
 
 | ID | Task | Priority | Status | Evidence to close |
 |---|---|---|---|---|
-| SEC-001 | Enforce local-only default plus explicit `--allow-remote` guardrail for non-loopback binds | P1 | Done | Commit `f577f2e`, `cargo test -p husk` |
-| SEC-002 | Add API auth (token or mTLS) and enforce on all mutating and shell endpoints | P1 | Done | Commit `538072d`, `cargo test -p husk-api -p husk` |
+| SEC-001 | Enforce local-only default plus explicit `--allow-remote` guardrail for non-loopback binds | P1 | Done | Commit `f577f2e`, `cargo test -p shuck` |
+| SEC-002 | Add API auth (token or mTLS) and enforce on all mutating and shell endpoints | P1 | Done | Commit `538072d`, `cargo test -p shuck-api -p shuck` |
 | SEC-003 | Add rate limits for shell, exec, and file endpoints to reduce abuse blast radius | P2 | Done | Commit `ded9179`, 429 middleware tests |
 | SEC-004 | Add optional guest path allowlist for read/write operations | P1 | Done | Commit `ded9179`, allowlist enforcement tests |
 | SEC-005 | Add execution policy hooks (timeout, command allow/deny list, env key allowlist) | P1 | Done | Commit `ded9179`, exec policy tests |
@@ -36,9 +36,9 @@
 ## Notes
 
 - Source hotspots:
-  - `/Users/ruben/Projects/husk/crates/husk-api/src/lib.rs`
-  - `/Users/ruben/Projects/husk/crates/husk/src/main.rs`
-  - `/Users/ruben/Projects/husk/crates/husk-agent/src/lib.rs`
+  - `/Users/ruben/Projects/shuck/crates/shuck-api/src/lib.rs`
+  - `/Users/ruben/Projects/shuck/crates/shuck/src/main.rs`
+  - `/Users/ruben/Projects/shuck/crates/shuck-agent/src/lib.rs`
 
 ## Progress log
 

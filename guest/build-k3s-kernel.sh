@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-OUTPUT="${1:-/mnt/husk/vmlinux-k3s}"
+OUTPUT="${1:-/mnt/shuck/vmlinux-k3s}"
 KERNEL_VERSION="${2:-6.1.102}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 BUILD_DIR="/tmp/kernel-build"
@@ -169,4 +169,4 @@ echo "Kernel config highlights:"
 grep -c '=y' .config | xargs -I{} echo "  Built-in options: {}"
 echo ""
 echo "To use this kernel:"
-echo "  husk run --kernel $OUTPUT --name myvm rootfs.ext4"
+echo "  shuck run --kernel $OUTPUT --name myvm rootfs.ext4"

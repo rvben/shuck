@@ -5,12 +5,12 @@
 
 ## Context
 
-Husk supports Linux Firecracker and macOS Virtualization.framework. Host networking semantics differ across platforms.
+Shuck supports Linux Firecracker and macOS Virtualization.framework. Host networking semantics differ across platforms.
 
 ## Decision
 
 - Linux:
-  - bridge + TAP + nftables NAT in `husk-net`
+  - bridge + TAP + nftables NAT in `shuck-net`
   - explicit host port forwarding support
 - macOS:
   - rely on VZ-managed shared NAT
