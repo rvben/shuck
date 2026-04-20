@@ -61,8 +61,8 @@ enum Commands {
 
     /// Create and boot a new VM
     Run {
-        /// Path to rootfs ext4 image
-        rootfs: PathBuf,
+        /// Path to rootfs ext4 image (defaults to the configured default_rootfs)
+        rootfs: Option<PathBuf>,
 
         /// VM name
         #[arg(long)]
@@ -706,7 +706,37 @@ async fn main() -> Result<()> {
         } => {
             let config = load_config(config_path.as_deref());
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
-            let kernel = kernel.unwrap_or(config.default_kernel);
+
+            let rootfs = match rootfs {
+                Some(path) => path,
+                None => {
+                    let default = config.default_rootfs.clone();
+                    if !default.exists() {
+                        eprintln!(
+                            "Default rootfs not found at {}.\nRun `shuck images pull` to fetch it, or pass a rootfs path explicitly.",
+                            default.display()
+                        );
+                        exit_with_error(output, "default rootfs not available".to_string());
+                    }
+                    default
+                }
+            };
+
+            let kernel = match kernel {
+                Some(path) => path,
+                None => {
+                    let default = config.default_kernel.clone();
+                    if !default.exists() {
+                        eprintln!(
+                            "Default kernel not found at {}.\nRun `shuck images pull` to fetch it, or pass --kernel explicitly.",
+                            default.display()
+                        );
+                        exit_with_error(output, "default kernel not available".to_string());
+                    }
+                    default
+                }
+            };
+
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
@@ -728,6 +758,10 @@ async fn main() -> Result<()> {
             });
             if let Some(ref initrd_path) = initrd {
                 body["initrd_path"] = serde_json::json!(initrd_path);
+            } else if let Some(ref default_initrd) = config.default_initrd
+                && default_initrd.exists()
+            {
+                body["initrd_path"] = serde_json::json!(default_initrd);
             }
             if let Some(ref userdata_path) = userdata {
                 let script = std::fs::read_to_string(userdata_path).with_context(|| {
