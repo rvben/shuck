@@ -1490,6 +1490,164 @@ async fn restore_snapshot_rejects_unsafe_target_names() {
 }
 
 #[tokio::test]
+async fn import_image_rejects_relative_source_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    let err = core
+        .import_image(ImportImageRequest {
+            name: "ubuntu".into(),
+            source_path: PathBuf::from("relative/rootfs.ext4"),
+            format: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "relative source path must be rejected, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_image_rejects_source_with_parent_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    let err = core
+        .import_image(ImportImageRequest {
+            name: "ubuntu".into(),
+            source_path: PathBuf::from("/var/lib/shuck/../../etc/shadow"),
+            format: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "source path with '..' must be rejected, got {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn import_image_rejects_symlink_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real.ext4");
+    std::fs::write(&real, b"rootfs-bytes").unwrap();
+    let link = tmp.path().join("link.ext4");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let core = make_core(&tmp);
+    let err = core
+        .import_image(ImportImageRequest {
+            name: "ubuntu".into(),
+            source_path: link,
+            format: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "symlink source must be rejected, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn export_image_rejects_relative_destination_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src.ext4");
+    std::fs::write(&source, b"data").unwrap();
+    let core = make_core(&tmp);
+    core.import_image(ImportImageRequest {
+        name: "base".into(),
+        source_path: source,
+        format: None,
+    })
+    .await
+    .unwrap();
+
+    let err = core
+        .export_image(
+            "base",
+            ExportImageRequest {
+                destination_path: PathBuf::from("relative/out.ext4"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "relative destination path must be rejected, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn export_image_rejects_destination_with_parent_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src.ext4");
+    std::fs::write(&source, b"data").unwrap();
+    let core = make_core(&tmp);
+    core.import_image(ImportImageRequest {
+        name: "base".into(),
+        source_path: source,
+        format: None,
+    })
+    .await
+    .unwrap();
+
+    let err = core
+        .export_image(
+            "base",
+            ExportImageRequest {
+                destination_path: PathBuf::from("/var/lib/shuck/../../etc/shadow"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "destination with '..' must be rejected, got {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn export_image_rejects_symlink_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src.ext4");
+    std::fs::write(&source, b"data").unwrap();
+    let core = make_core(&tmp);
+    core.import_image(ImportImageRequest {
+        name: "base".into(),
+        source_path: source,
+        format: None,
+    })
+    .await
+    .unwrap();
+
+    let real = tmp.path().join("target.ext4");
+    std::fs::write(&real, b"original").unwrap();
+    let link = tmp.path().join("link.ext4");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let err = core
+        .export_image(
+            "base",
+            ExportImageRequest {
+                destination_path: link,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "symlink destination must be rejected, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&real).unwrap(),
+        b"original",
+        "symlink target must not be overwritten"
+    );
+}
+
+#[tokio::test]
 async fn create_vm_accepts_safe_names() {
     let tmp = tempfile::tempdir().unwrap();
     let core = make_core(&tmp);

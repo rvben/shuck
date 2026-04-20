@@ -240,6 +240,38 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Validate a user-supplied host filesystem path before the daemon opens it.
+///
+/// Rejects relative paths, `..` components, and paths whose final component is
+/// a symlink. Running as root, the daemon should not be tricked into reading
+/// or writing arbitrary files on behalf of an authenticated caller.
+fn validate_host_path(kind: &str, path: &Path) -> Result<(), CoreError> {
+    if !path.is_absolute() {
+        return Err(CoreError::InvalidArgument(format!(
+            "{kind} path must be absolute, got {}",
+            path.display()
+        )));
+    }
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(CoreError::InvalidArgument(format!(
+                "{kind} path must not contain '..' segments: {}",
+                path.display()
+            )));
+        }
+    }
+    match path.symlink_metadata() {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(CoreError::InvalidArgument(format!(
+                "{kind} path must not be a symlink: {}",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Tracks resources allocated during VM creation for rollback on failure.
 #[derive(Default)]
 struct AllocatedResources {
@@ -959,6 +991,7 @@ impl<B: VmmBackend> ShuckCore<B> {
     /// Import a rootfs image into the managed image catalog.
     pub async fn import_image(&self, req: ImportImageRequest) -> Result<ImageRecord, CoreError> {
         validate_resource_name("image", &req.name)?;
+        validate_host_path("import source", &req.source_path)?;
         match self.state.get_image_by_name(&req.name) {
             Ok(_) => return Err(CoreError::ImageAlreadyExists(req.name)),
             Err(shuck_state::StateError::ImageNotFoundByName(_)) => {}
@@ -1031,6 +1064,7 @@ impl<B: VmmBackend> ShuckCore<B> {
         name: &str,
         req: ExportImageRequest,
     ) -> Result<ExportImageResult, CoreError> {
+        validate_host_path("export destination", &req.destination_path)?;
         let image = self.get_image(name)?;
         self.storage_driver
             .clone_rootfs(Path::new(&image.file_path), &req.destination_path)
