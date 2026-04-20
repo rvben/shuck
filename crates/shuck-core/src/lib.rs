@@ -1599,20 +1599,18 @@ fn load_or_create_secret_key(data_dir: &Path) -> Result<[u8; SECRET_KEY_LEN], Co
         .fill(&mut key)
         .map_err(|_| CoreError::SecretCrypto("failed to generate secret key".into()))?;
 
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&key_path)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&key_path) {
         Ok(mut file) => {
             use std::io::Write;
             file.write_all(&key)
                 .map_err(|e| CoreError::Storage(shuck_storage::StorageError::Io(e)))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-            }
             Ok(key)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

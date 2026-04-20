@@ -1289,6 +1289,27 @@ async fn secret_roundtrip_create_reveal_rotate_delete() {
     assert!(core.list_secrets().unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn secret_key_file_is_mode_0o600_on_creation() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    core.create_secret(CreateSecretRequest {
+        name: "db-password".into(),
+        value: "x".into(),
+    })
+    .unwrap();
+
+    let key_path = tmp.path().join("data/keys/secrets.key");
+    let mode = std::fs::metadata(&key_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "secret key must be 0o600, got {mode:o}");
+}
+
 #[tokio::test]
 async fn reveal_missing_secret_returns_not_found() {
     let tmp = tempfile::tempdir().unwrap();
