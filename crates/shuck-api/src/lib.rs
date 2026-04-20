@@ -197,6 +197,11 @@ struct SlidingWindowRateLimiter {
 }
 
 impl SlidingWindowRateLimiter {
+    #[cfg(test)]
+    fn clear(&self) {
+        self.events.lock().expect("rate limiter lock poisoned").clear();
+    }
+
     fn allow(&self, key: &str, limit_per_minute: u32) -> bool {
         if limit_per_minute == 0 {
             return true;
@@ -688,9 +693,12 @@ pub async fn serve_with_auth<B: VmmBackend + 'static>(
     let app = router_with_auth(core, auth_token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "shuck daemon listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
@@ -766,10 +774,10 @@ async fn rate_limit_middleware(
     let policy = current_policy();
     if let Some(kind) = is_rate_limited_route(req.method(), req.uri().path()) {
         let client = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("local");
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string())
+            .unwrap_or_else(|| "unknown".into());
         let key = format!("{kind}:{client}");
         if !rate_limiter().allow(&key, policy.sensitive_rate_limit_per_minute) {
             metrics().rate_limited_total.fetch_add(1, Ordering::Relaxed);
@@ -3499,6 +3507,56 @@ mod tests {
         );
         assert_eq!(is_rate_limited_route(&Method::GET, "/v1/vms"), None);
         assert_eq!(is_rate_limited_route(&Method::POST, "/v1/vms"), None);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_middleware_ignores_x_forwarded_for() {
+        let _guard = policy_test_lock().lock().await;
+        rate_limiter().clear();
+        set_policy(ApiPolicy {
+            sensitive_rate_limit_per_minute: 2,
+            ..ApiPolicy::default()
+        });
+
+        let body = serde_json::json!({ "path": "/safe/ok" });
+        let mk = || router(test_core());
+
+        for xff in ["1.1.1.1", "2.2.2.2"] {
+            let response = mk()
+                .oneshot(
+                    Request::post("/v1/vms/any/files/read")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", xff)
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "request under limit must not be rate-limited (xff={xff})"
+            );
+        }
+
+        let response = mk()
+            .oneshot(
+                Request::post("/v1/vms/any/files/read")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "3.3.3.3")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "spoofed x-forwarded-for must not evade the rate limiter"
+        );
+
+        rate_limiter().clear();
+        set_policy(ApiPolicy::default());
     }
 
     #[test]
