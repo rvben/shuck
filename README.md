@@ -45,6 +45,11 @@ shuck logs hello -f
 shuck destroy hello
 ```
 
+`shuck images pull` fetches the latest signed image set from the `images-*`
+[GitHub Releases](https://github.com/rvben/shuck/releases). If no image
+release is published yet for this arch, the command will fail — use the
+BYO path below in the meantime.
+
 ## BYO kernel / rootfs
 
 If you want to use your own images, pass `--kernel` and the rootfs path:
