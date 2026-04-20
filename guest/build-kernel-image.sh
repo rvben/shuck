@@ -19,6 +19,11 @@ WORK_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
+command -v python3 >/dev/null 2>&1 || {
+    echo "ERROR: python3 is required (install via 'brew install python' on macOS or 'apt-get install python3' on Linux)" >&2
+    exit 1
+}
+
 case "$ARCH" in
     aarch64) OUT_NAME="Image-virt" ;;
     x86_64)  OUT_NAME="vmlinux" ;;
@@ -44,26 +49,32 @@ OUT_PATH="$OUTPUT_DIR/$OUT_NAME"
 # Scan for the gzip magic header (1f 8b 08) inside vmlinuz and decompress
 # everything from that offset forward. This is the extract-vmlinux trick.
 # python3 is used for portability (macOS od lacks GNU -w1; perl is not always present).
-OFFSET=$(python3 -c "
+OFFSET=$(python3 - "$VMLINUZ" <<'PYEOF'
 import sys
-data = open('$VMLINUZ', 'rb').read()
+data = open(sys.argv[1], 'rb').read()
 idx = data.find(b'\x1f\x8b\x08')
 print(idx if idx >= 0 else '')
-")
+PYEOF
+)
 
 if [ -z "$OFFSET" ]; then
     echo "No gzip magic found — assuming already-uncompressed Image"
     cp "$VMLINUZ" "$OUT_PATH"
 else
     echo "Decompressing gzip stream at offset $OFFSET"
-    # gunzip exits 2 ("trailing garbage ignored") when the vmlinuz has data
-    # appended after the gzip stream (e.g. an EFI stub appended at the end).
-    # Exit code 2 is non-fatal; the decompressed Image is still valid.
-    # Suppress the trailing-garbage message on stderr (expected, not an error).
-    dd if="$VMLINUZ" bs=1 skip="$OFFSET" status=none | gunzip 2>/dev/null > "$OUT_PATH" || {
-        rc=$?
-        [ $rc -eq 2 ] || { echo "ERROR: gunzip failed with exit code $rc" >&2; exit 1; }
-    }
+    # gunzip exits 2 with a "trailing garbage ignored" message when the
+    # compressed stream is followed by PE/EFI trailer bytes (normal for Alpine's
+    # vmlinuz-virt). Filter just that message; let any other stderr through.
+    set +e
+    dd if="$VMLINUZ" bs=1 skip="$OFFSET" status=none \
+        | gunzip 2>"$WORK_DIR/gunzip.err" > "$OUT_PATH"
+    GUNZIP_RC=${PIPESTATUS[1]}
+    set -e
+    grep -v "trailing garbage ignored" "$WORK_DIR/gunzip.err" >&2 || true
+    if [ "$GUNZIP_RC" -ne 0 ] && [ "$GUNZIP_RC" -ne 2 ]; then
+        echo "ERROR: gunzip failed with exit code $GUNZIP_RC" >&2
+        exit 1
+    fi
 fi
 
 # Sanity check: aarch64 Image starts with ARM64 magic 'ARM\x64' at offset 56,
