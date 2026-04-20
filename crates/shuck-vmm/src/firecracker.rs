@@ -190,14 +190,8 @@ impl FirecrackerBackend {
             .transpose()?;
 
         // Boot source
-        let boot_source =
-            Self::boot_source_payload(kernel_path_str, &kernel_args, initrd_path_str);
-        Self::fc_put(
-            socket_path,
-            "/boot-source",
-            &boot_source,
-        )
-        .await?;
+        let boot_source = Self::boot_source_payload(kernel_path_str, &kernel_args, initrd_path_str);
+        Self::fc_put(socket_path, "/boot-source", &boot_source).await?;
 
         // Root drive
         Self::fc_put(
@@ -338,7 +332,13 @@ impl VmmBackend for FirecrackerBackend {
         {
             Ok(info) => Ok(info),
             Err(e) => {
+                // Remove every runtime artifact that create_vm or Firecracker
+                // may have written before the failure. Each removal is
+                // independent: a missing file is not an error here.
                 let _ = std::fs::remove_file(&serial_log_path);
+                let _ = std::fs::remove_file(&log_path);
+                let _ = std::fs::remove_file(&socket_path);
+                let _ = std::fs::remove_file(&vsock_path);
                 Err(e)
             }
         }
@@ -606,6 +606,45 @@ mod tests {
         assert!(
             matches!(err, VmmError::VmAlreadyExists(ref name) if name == "existing"),
             "expected VmAlreadyExists, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_vm_cleans_up_runtime_files_on_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point at a binary that does not exist so spawn() fails immediately.
+        let backend =
+            FirecrackerBackend::new(dir.path().join("does-not-exist-firecracker"), dir.path());
+
+        let config = VmConfig {
+            name: "cleanup-on-fail".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/tmp/vmlinux".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_args: None,
+            initrd_path: None,
+            vsock_cid: 4,
+            tap_device: None,
+            guest_mac: None,
+        };
+
+        let err = backend.create_vm(config).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::ProcessError(_)),
+            "expected ProcessError, got: {err}"
+        );
+
+        // After a create failure the runtime dir must not leak the pre-created
+        // log / serial-log files, nor any partial socket / vsock artifacts.
+        let leaked: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "runtime dir should be empty after failed create_vm, found: {leaked:?}"
         );
     }
 
