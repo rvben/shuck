@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 pub mod images;
 
-pub const DEFAULT_IMAGES_BASE_URL: &str =
-    "https://github.com/rvben/shuck/releases/latest/download";
+pub const DEFAULT_IMAGES_BASE_URL: &str = "https://github.com/rvben/shuck/releases/latest/download";
 
 pub fn default_data_dir() -> PathBuf {
     if cfg!(target_os = "macos")
@@ -45,4 +44,11 @@ pub fn default_initrd_path() -> PathBuf {
 
 pub fn default_images_base_url() -> String {
     DEFAULT_IMAGES_BASE_URL.to_string()
+}
+
+/// Serde helper: wraps `default_initrd_path` in `Some` so `default_initrd`
+/// in the CLI Config defaults to the computed initramfs path rather than
+/// None. Users can explicitly set it to `null` in config to opt out.
+pub fn default_initrd_some() -> Option<PathBuf> {
+    Some(default_initrd_path())
 }

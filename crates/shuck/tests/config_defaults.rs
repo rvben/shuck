@@ -9,8 +9,7 @@ fn default_rootfs_path_is_under_data_dir() {
         data.display()
     );
     assert!(
-        path.ends_with("images/alpine-aarch64.ext4")
-            || path.ends_with("images/alpine-x86_64.ext4")
+        path.ends_with("images/alpine-aarch64.ext4") || path.ends_with("images/alpine-x86_64.ext4")
     );
 }
 

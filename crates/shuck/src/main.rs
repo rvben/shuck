@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use shuck::{
-    default_data_dir, default_images_base_url, default_kernel_path, default_rootfs_path,
+    default_data_dir, default_images_base_url, default_initrd_path, default_kernel_path,
+    default_rootfs_path,
 };
 
 use anyhow::{Context, Result};
@@ -444,7 +445,7 @@ struct Config {
     default_kernel: PathBuf,
     #[serde(default = "shuck::default_rootfs_path")]
     default_rootfs: PathBuf,
-    #[serde(default)]
+    #[serde(default = "shuck::default_initrd_some")]
     default_initrd: Option<PathBuf>,
     #[serde(default = "shuck::default_images_base_url")]
     images_base_url: String,
@@ -629,7 +630,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
             default_rootfs: default_rootfs_path(),
-            default_initrd: None,
+            default_initrd: Some(default_initrd_path()),
             images_base_url: default_images_base_url(),
             api_token: None,
             api_max_request_bytes: default_api_max_request_bytes(),
@@ -2944,7 +2945,17 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
         }
     }
 
-    println!("  images_base_url ... {}", config.images_base_url);
+    // images_base_url
+    let url = &config.images_base_url;
+    let base_url_env_hint = if std::env::var("SHUCK_IMAGES_BASE_URL").is_ok() {
+        " [SHUCK_IMAGES_BASE_URL override]"
+    } else {
+        ""
+    };
+    match reqwest::Url::parse(url) {
+        Ok(_) => println!("  images_base_url ({url}) ... OK{base_url_env_hint}"),
+        Err(err) => println!("  images_base_url ({url}) ... FAIL ({err}){base_url_env_hint}"),
+    }
 
     #[cfg(feature = "linux-net")]
     {
