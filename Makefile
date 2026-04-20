@@ -1,5 +1,10 @@
 .PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
+# Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
+ARCH ?= aarch64
+# Alpine Linux version used by build-initramfs.
+ALPINE_VERSION ?= 3.21
+
 all: lint test
 
 # Build all crates (debug)
@@ -166,11 +171,10 @@ update-rootfs: build-agent-aarch64
 # Build initramfs for Alpine-based shuck VMs.
 # ARCH defaults to aarch64; pass ARCH=x86_64 for Firecracker.
 build-initramfs:
-	guest/build-initramfs.sh 3.21 $(ARCH)
+	guest/build-initramfs.sh $(ALPINE_VERSION) $(ARCH)
 
 # Build an uncompressed kernel Image extracted from Alpine's linux-virt apk.
 # ARCH defaults to aarch64 (for macOS VZ); pass x86_64 for Firecracker.
-ARCH ?= aarch64
 build-kernel-image:
 	guest/build-kernel-image.sh $(ARCH)
 

@@ -21,11 +21,11 @@ ARCH="${2:-aarch64}"
 OUTPUT_DIR="${HOME}/.local/share/shuck/kernels"
 WORK_DIR="$(mktemp -d)"
 
-if [ "$ARCH" = "x86_64" ]; then
-    OUT_NAME="initramfs-x86_64-virt.gz"
-else
-    OUT_NAME="initramfs-virt.gz"
-fi
+case "$ARCH" in
+    aarch64) OUT_NAME="initramfs-virt.gz" ;;
+    x86_64)  OUT_NAME="initramfs-x86_64-virt.gz" ;;
+    *) echo "ERROR: unsupported arch $ARCH (expected aarch64 or x86_64)" >&2; exit 1 ;;
+esac
 
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
