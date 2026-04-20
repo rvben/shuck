@@ -29,6 +29,11 @@ fn run_with_missing_firecracker_hints_env_var() {
         .arg("/tmp/x")
         .arg("/tmp/y");
     let out = cmd.output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit, got {:?}",
+        out.status
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("SHUCK_AUTO_INSTALL_FIRECRACKER"),

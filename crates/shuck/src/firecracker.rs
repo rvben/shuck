@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "linux-net"))]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -10,12 +10,19 @@ use tar::Archive;
 
 pub const FIRECRACKER_VERSION: &str = "v1.10.1";
 
-pub fn firecracker_download_url() -> String {
-    let arch = std::env::consts::ARCH;
+fn binary_name() -> String {
     format!(
-        "https://github.com/firecracker-microvm/firecracker/releases/download/{v}/firecracker-{v}-{a}.tgz",
+        "firecracker-{}-{}",
+        FIRECRACKER_VERSION,
+        std::env::consts::ARCH
+    )
+}
+
+pub fn firecracker_download_url() -> String {
+    format!(
+        "https://github.com/firecracker-microvm/firecracker/releases/download/{v}/{n}.tgz",
         v = FIRECRACKER_VERSION,
-        a = arch,
+        n = binary_name(),
     )
 }
 
@@ -51,12 +58,7 @@ pub async fn install(data_dir: &Path) -> Result<PathBuf> {
     }
 
     // Build the expected entry name so it can be captured into the closure.
-    let target_name = format!(
-        "firecracker-{}-{}",
-        FIRECRACKER_VERSION,
-        std::env::consts::ARCH
-    );
-    let url_clone = url.clone();
+    let target_name = binary_name();
 
     // Extract on a blocking pool — tar+flate2 are synchronous.
     let dest_clone = dest.clone();
@@ -82,11 +84,7 @@ pub async fn install(data_dir: &Path) -> Result<PathBuf> {
             std::fs::set_permissions(&dest_clone, perms)?;
             return Ok(());
         }
-        Err(anyhow!(
-            "{target_name} not found in {url_clone}",
-            target_name = target_name,
-            url_clone = url_clone,
-        ))
+        Err(anyhow!("{target_name} not found in {url}"))
     })
     .await
     .context("extraction task join")??;

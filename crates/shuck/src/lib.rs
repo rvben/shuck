@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
 pub mod firecracker;
 pub mod images;
 
