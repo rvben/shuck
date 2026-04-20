@@ -52,6 +52,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 
+# Compression / archive
+flate2 = "1"
+tar = "0.4"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+pub mod firecracker;
 pub mod images;
 
 pub const DEFAULT_IMAGES_BASE_URL: &str = "https://github.com/rvben/shuck/releases/latest/download";

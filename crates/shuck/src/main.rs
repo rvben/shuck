@@ -770,6 +770,9 @@ async fn main() -> Result<()> {
                 body["userdata"] = serde_json::json!(script);
             }
 
+            #[cfg(all(target_os = "linux", feature = "linux-net"))]
+            ensure_firecracker(&config).await?;
+
             let client = reqwest::Client::new();
             let resp = api_request(
                 with_api_auth(
@@ -2885,6 +2888,33 @@ fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
     );
 
     Ok((base, prefix_len))
+}
+
+/// Ensure Firecracker is available, installing it automatically when
+/// `SHUCK_AUTO_INSTALL_FIRECRACKER=1` is set and the binary cannot be found.
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
+async fn ensure_firecracker(config: &Config) -> anyhow::Result<PathBuf> {
+    if let Some(p) = find_in_path(&config.firecracker_bin) {
+        return Ok(p);
+    }
+    let data = shuck::default_data_dir();
+    let bin = data.join("bin/firecracker");
+    if bin.exists() {
+        return Ok(bin);
+    }
+    if std::env::var("SHUCK_AUTO_INSTALL_FIRECRACKER")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        anyhow::bail!(
+            "firecracker not found on PATH. Install it, or re-run with SHUCK_AUTO_INSTALL_FIRECRACKER=1 to download {}",
+            shuck::firecracker::firecracker_download_url()
+        );
+    }
+    let installed = shuck::firecracker::install(&data).await?;
+    eprintln!("Installed firecracker to {}", installed.display());
+    Ok(installed)
 }
 
 /// Check if a binary name can be found in PATH.
