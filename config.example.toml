@@ -21,6 +21,21 @@
 #   Linux default: <data_dir>/kernels/vmlinux       (uncompressed x86_64 ELF)
 # default_kernel = "/var/lib/shuck/kernels/vmlinux"
 
+# Path to the default rootfs image. Used when `shuck run` is invoked
+# without an explicit rootfs argument.
+#   aarch64 default: <data_dir>/images/alpine-aarch64.ext4
+#   x86_64 default:  <data_dir>/images/alpine-x86_64.ext4
+# default_rootfs = "/var/lib/shuck/images/alpine-x86_64.ext4"
+
+# Optional initrd/initramfs path used alongside the default kernel.
+# Apple VZ requires one for Alpine linux-virt (virtio_blk is a module,
+# not built-in) — build with `make build-initramfs`.
+# default_initrd = "/var/lib/shuck/kernels/initramfs-virt.gz"
+
+# Base URL for `shuck images pull`. Must host kernel-<arch>,
+# initramfs-<arch>.gz, rootfs-<arch>.ext4, and SHA256SUMS at the root.
+# images_base_url = "https://github.com/rvben/shuck/releases/latest/download"
+
 # ── API Security and Limits ─────────────────────────────────────────
 
 # Optional bearer token required by mutating and shell endpoints.
@@ -81,6 +96,9 @@
 #
 #   SHUCK_DATA_DIR         →  data_dir
 #   SHUCK_DEFAULT_KERNEL   →  default_kernel
+#   SHUCK_DEFAULT_ROOTFS   →  default_rootfs
+#   SHUCK_DEFAULT_INITRD   →  default_initrd
+#   SHUCK_IMAGES_BASE_URL  →  images_base_url
 #   SHUCK_FIRECRACKER_BIN  →  firecracker_bin    (Linux only)
 #   SHUCK_HOST_INTERFACE   →  host_interface     (Linux only)
 #   SHUCK_BRIDGE_NAME      →  bridge_name        (Linux only)

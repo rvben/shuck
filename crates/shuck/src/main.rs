@@ -2,6 +2,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use shuck::{
+    default_data_dir, default_images_base_url, default_kernel_path, default_rootfs_path,
+};
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
@@ -436,8 +440,14 @@ struct Config {
     firecracker_bin: PathBuf,
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
-    #[serde(default = "default_kernel_path")]
+    #[serde(default = "shuck::default_kernel_path")]
     default_kernel: PathBuf,
+    #[serde(default = "shuck::default_rootfs_path")]
+    default_rootfs: PathBuf,
+    #[serde(default)]
+    default_initrd: Option<PathBuf>,
+    #[serde(default = "shuck::default_images_base_url")]
+    images_base_url: String,
     #[serde(default)]
     api_token: Option<String>,
     #[serde(default = "default_api_max_request_bytes")]
@@ -477,24 +487,6 @@ struct Config {
 #[cfg(feature = "linux-net")]
 fn default_firecracker_bin() -> PathBuf {
     PathBuf::from("firecracker")
-}
-
-fn default_data_dir() -> PathBuf {
-    if cfg!(target_os = "macos")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(".local/share/shuck");
-    }
-    PathBuf::from("/var/lib/shuck")
-}
-
-fn default_kernel_path() -> PathBuf {
-    let data_dir = default_data_dir();
-    if cfg!(target_os = "macos") {
-        data_dir.join("kernels/Image-virt")
-    } else {
-        data_dir.join("kernels/vmlinux")
-    }
 }
 
 fn default_api_max_request_bytes() -> usize {
@@ -636,6 +628,9 @@ impl Default for Config {
             firecracker_bin: default_firecracker_bin(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
+            default_rootfs: default_rootfs_path(),
+            default_initrd: None,
+            images_base_url: default_images_base_url(),
             api_token: None,
             api_max_request_bytes: default_api_max_request_bytes(),
             api_max_file_read_bytes: default_api_max_file_read_bytes(),
@@ -2651,6 +2646,15 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("SHUCK_DEFAULT_KERNEL") {
         config.default_kernel = PathBuf::from(val);
     }
+    if let Ok(val) = std::env::var("SHUCK_DEFAULT_ROOTFS") {
+        config.default_rootfs = PathBuf::from(val);
+    }
+    if let Ok(val) = std::env::var("SHUCK_DEFAULT_INITRD") {
+        config.default_initrd = Some(PathBuf::from(val));
+    }
+    if let Ok(val) = std::env::var("SHUCK_IMAGES_BASE_URL") {
+        config.images_base_url = val;
+    }
     if let Ok(val) = std::env::var("SHUCK_API_TOKEN") {
         config.api_token = Some(val);
     }
@@ -2886,6 +2890,61 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
         );
         all_ok = false;
     }
+
+    // default_rootfs
+    let rootfs = &config.default_rootfs;
+    let rootfs_env_hint = if std::env::var("SHUCK_DEFAULT_ROOTFS").is_ok() {
+        " (from SHUCK_DEFAULT_ROOTFS)"
+    } else {
+        ""
+    };
+    if rootfs.is_file() {
+        println!(
+            "  default_rootfs ({}) ... OK{rootfs_env_hint}",
+            rootfs.display()
+        );
+    } else if rootfs.exists() {
+        println!(
+            "  default_rootfs ({}) ... FAIL (not a regular file){rootfs_env_hint}",
+            rootfs.display()
+        );
+        all_ok = false;
+    } else {
+        println!(
+            "  default_rootfs ({}) ... FAIL (not found){rootfs_env_hint}",
+            rootfs.display()
+        );
+        all_ok = false;
+    }
+
+    // default_initrd (optional)
+    if let Some(initrd) = &config.default_initrd {
+        let initrd_env_hint = if std::env::var("SHUCK_DEFAULT_INITRD").is_ok() {
+            " (from SHUCK_DEFAULT_INITRD)"
+        } else {
+            ""
+        };
+        if initrd.is_file() {
+            println!(
+                "  default_initrd ({}) ... OK{initrd_env_hint}",
+                initrd.display()
+            );
+        } else if initrd.exists() {
+            println!(
+                "  default_initrd ({}) ... FAIL (not a regular file){initrd_env_hint}",
+                initrd.display()
+            );
+            all_ok = false;
+        } else {
+            println!(
+                "  default_initrd ({}) ... FAIL (not found){initrd_env_hint}",
+                initrd.display()
+            );
+            all_ok = false;
+        }
+    }
+
+    println!("  images_base_url ... {}", config.images_base_url);
 
     #[cfg(feature = "linux-net")]
     {
