@@ -12,6 +12,10 @@ pub struct DownloadSpec {
     pub dest: PathBuf,
 }
 
+/// Parse an Alpine-style `SHA256SUMS` manifest: one entry per line as
+/// `<sha256>  <filename>`. Lines with fewer than two whitespace-delimited
+/// tokens are silently skipped. Filenames with embedded whitespace are
+/// not supported — the Alpine convention does not use them.
 pub fn parse_manifest(contents: &str) -> HashMap<String, String> {
     contents
         .lines()
@@ -43,7 +47,10 @@ pub async fn fetch_and_verify(spec: DownloadSpec) -> Result<()> {
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
 
-    let tmp = spec.dest.with_extension("part");
+    let tmp = spec.dest.with_file_name(format!(
+        "{}.part",
+        spec.dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
     let mut file = tokio::fs::File::create(&tmp)
         .await
         .with_context(|| format!("opening {}", tmp.display()))?;
