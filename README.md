@@ -11,11 +11,11 @@ An open-source microVM manager built on [Firecracker](https://firecracker-microv
 
 ## Status
 
-Pre-1.0 and early. The core feature set works and has test coverage, but:
+Pre-1.0. The core feature set works and has test coverage, but:
 
 - The HTTP API, CLI flags, config schema, and on-disk state layout may change without a deprecation period.
 - The Linux/Firecracker backend is more mature than the macOS/Apple VZ backend.
-- It has not been run at scale or under production workloads. No soak testing, no external users yet.
+- It has not been run at scale or under production workloads.
 - Security features (token auth, rate limiting, encrypted secrets) exist but have had limited review. Don't expose the daemon to an untrusted network.
 
 Useful for experimentation, local development, and CI. Not recommended for production.
@@ -24,22 +24,33 @@ Useful for experimentation, local development, and CI. Not recommended for produ
 
 ```bash
 # Install
-cargo install --path crates/shuck
+pip install shuck
+
+# Fetch the default kernel + rootfs for this host
+shuck images pull
 
 # Start the daemon
 shuck daemon &
 
 # Boot a VM
-shuck run --name myvm --kernel /path/to/vmlinux /path/to/rootfs.ext4
+shuck run --name hello --cpus 2 --memory 512
 
 # Interact
-shuck exec myvm -- uname -a
-shuck shell myvm
-shuck cp local.txt myvm:/tmp/local.txt
-shuck logs myvm -f
+shuck exec hello -- uname -a
+shuck shell hello
+shuck cp local.txt hello:/tmp/local.txt
+shuck logs hello -f
 
 # Clean up
-shuck destroy myvm
+shuck destroy hello
+```
+
+## BYO kernel / rootfs
+
+If you want to use your own images, pass `--kernel` and the rootfs path:
+
+```bash
+shuck run /path/to/rootfs.ext4 --kernel /path/to/vmlinux
 ```
 
 ## Configuration
