@@ -37,3 +37,4 @@ bindings = "bin"
 manifest-path = "crates/shuck/Cargo.toml"
 python-packages = ["shuck_cli"]
 strip = true
+include = [{ path = "LICENSE", format = "sdist" }]
