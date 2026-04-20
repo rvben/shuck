@@ -1,5 +1,7 @@
 //! Shared host/guest protocol messages and framing helpers for shuck agent communication.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -177,16 +179,53 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Default vsock port the guest agent listens on.
 pub const AGENT_VSOCK_PORT: u32 = 52;
 
+/// Default wall-clock deadline for receiving a single framed payload once
+/// the length prefix has been read. Callers who need a different bound can
+/// use [`read_message_with_timeout`]. Operators can override the default
+/// via the `SHUCK_PROTO_READ_TIMEOUT_SECS` environment variable.
+pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
+
+/// Upper bound on a single chunk read while receiving a payload. Growing
+/// the buffer one chunk at a time keeps per-connection memory proportional
+/// to bytes actually received rather than to the length the peer declared.
+const PAYLOAD_READ_CHUNK: usize = 64 * 1024;
+
+/// Resolve the payload read timeout, honouring `SHUCK_PROTO_READ_TIMEOUT_SECS`.
+pub fn default_read_timeout() -> Duration {
+    let secs = std::env::var("SHUCK_PROTO_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_READ_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 /// Read a single length-prefixed JSON message from an async stream.
 ///
 /// Returns `None` on clean EOF (stream closed with no partial data).
 /// Returns an error on truncated messages or protocol violations.
+///
+/// Applies the default payload read timeout (see [`default_read_timeout`])
+/// once the length prefix has been received. No timeout applies while
+/// waiting for the next message to begin.
 pub async fn read_message<T, S>(stream: &mut S) -> Result<Option<T>, ProtocolError>
 where
     T: for<'de> Deserialize<'de>,
     S: tokio::io::AsyncRead + Unpin,
 {
-    // Read the 4-byte length prefix
+    read_message_with_timeout(stream, default_read_timeout()).await
+}
+
+/// Variant of [`read_message`] that takes an explicit payload read timeout.
+pub async fn read_message_with_timeout<T, S>(
+    stream: &mut S,
+    payload_timeout: Duration,
+) -> Result<Option<T>, ProtocolError>
+where
+    T: for<'de> Deserialize<'de>,
+    S: tokio::io::AsyncRead + Unpin,
+{
+    // Length prefix: no timeout. An idle connection waiting for the next
+    // request is legitimate; bounding that belongs at the connection layer.
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -199,9 +238,32 @@ where
         return Err(ProtocolError::MessageTooLarge { size: len });
     }
 
-    // Read the JSON payload
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
+    // Payload: bounded deadline + chunked allocation. Growing the buffer as
+    // bytes arrive means a peer cannot force MAX_MESSAGE_SIZE of RAM to be
+    // reserved up front by claiming a large length it never delivers.
+    let payload_fut = async {
+        let mut payload: Vec<u8> = Vec::with_capacity(len.min(PAYLOAD_READ_CHUNK));
+        let mut remaining = len;
+        while remaining > 0 {
+            let this_chunk = remaining.min(PAYLOAD_READ_CHUNK);
+            let start = payload.len();
+            payload.resize(start + this_chunk, 0);
+            stream.read_exact(&mut payload[start..]).await?;
+            remaining -= this_chunk;
+        }
+        Ok::<_, std::io::Error>(payload)
+    };
+
+    let payload = match tokio::time::timeout(payload_timeout, payload_fut).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            return Err(ProtocolError::ReadTimeout {
+                declared: len,
+                timeout_secs: payload_timeout.as_secs(),
+            });
+        }
+    };
 
     let msg = serde_json::from_slice(&payload)?;
     Ok(Some(msg))
@@ -228,6 +290,8 @@ where
 pub enum ProtocolError {
     #[error("message too large: {size} bytes (max {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { size: usize },
+    #[error("payload read timed out after {timeout_secs}s (declared {declared} bytes)")]
+    ReadTimeout { declared: usize, timeout_secs: u64 },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("io error: {0}")]
@@ -364,6 +428,63 @@ mod tests {
     fn empty_buffer_returns_none() {
         let result: Result<Option<(AgentRequest, usize)>, _> = decode_message(&[]);
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_message_times_out_on_slow_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        // Advertise 1000 payload bytes but never send any of them. The length
+        // prefix is accepted; the payload read must hit the deadline.
+        tokio::spawn(async move {
+            writer.write_all(&1000u32.to_be_bytes()).await.unwrap();
+            // Hold the stream open well past the reader's deadline.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let err = read_message_with_timeout::<AgentRequest, _>(
+            &mut reader,
+            Duration::from_millis(150),
+        )
+        .await
+        .expect_err("slow payload must time out");
+
+        match err {
+            ProtocolError::ReadTimeout {
+                declared,
+                timeout_secs: _,
+            } => {
+                assert_eq!(declared, 1000);
+            }
+            other => panic!("expected ReadTimeout, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_message_reads_chunked_payload() {
+        // A payload larger than PAYLOAD_READ_CHUNK exercises the growth loop.
+        let msg = AgentRequest::Exec(ExecRequest {
+            command: "x".repeat(200_000),
+            args: vec![],
+            working_dir: None,
+            env: vec![],
+        });
+        let bytes = encode_message(&msg).unwrap();
+
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            writer.write_all(&bytes).await.unwrap();
+        });
+
+        let got: AgentRequest =
+            read_message_with_timeout(&mut reader, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .unwrap();
+
+        match got {
+            AgentRequest::Exec(exec) => assert_eq!(exec.command.len(), 200_000),
+            _ => panic!("expected Exec"),
+        }
     }
 
     #[test]
