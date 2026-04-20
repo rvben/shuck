@@ -1526,7 +1526,7 @@ async fn host_group_command(
             } else if groups.is_empty() {
                 println!("No host groups found");
             } else {
-                println!("{:<24} {}", "NAME", "DESCRIPTION");
+                println!("{:<24} DESCRIPTION", "NAME");
                 for group in &groups {
                     println!(
                         "{:<24} {}",
@@ -1859,7 +1859,7 @@ async fn snapshot_command(
             } else if snapshots.is_empty() {
                 println!("No snapshots found");
             } else {
-                println!("{:<20} {:<20} {}", "NAME", "SOURCE VM", "FILE");
+                println!("{:<20} {:<20} FILE", "NAME", "SOURCE VM");
                 for snapshot in &snapshots {
                     println!(
                         "{:<20} {:<20} {}",
@@ -2055,7 +2055,7 @@ async fn image_command(
             } else if images.is_empty() {
                 println!("No images found");
             } else {
-                println!("{:<20} {:<8} {:>10}   {}", "NAME", "FORMAT", "SIZE", "FILE");
+                println!("{:<20} {:<8} {:>10}   FILE", "NAME", "FORMAT", "SIZE");
                 for image in &images {
                     println!(
                         "{:<20} {:<8} {:>10}   {}",
@@ -2275,7 +2275,7 @@ async fn secret_command(
             } else if secrets.is_empty() {
                 println!("No secrets found");
             } else {
-                println!("{:<24} {}", "NAME", "UPDATED");
+                println!("{:<24} UPDATED", "NAME");
                 for secret in &secrets {
                     println!(
                         "{:<24} {}",
