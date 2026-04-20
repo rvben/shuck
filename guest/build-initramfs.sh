@@ -10,7 +10,9 @@
 #
 # Defaults: ALPINE_VERSION=3.21  ARCH=aarch64
 #
-# Output: ~/.local/share/shuck/kernels/initramfs-virt.gz
+# Output:
+#   ARCH=aarch64 → ~/.local/share/shuck/kernels/initramfs-virt.gz
+#   ARCH=x86_64  → ~/.local/share/shuck/kernels/initramfs-x86_64-virt.gz
 
 set -euo pipefail
 
@@ -18,6 +20,12 @@ ALPINE_VERSION="${1:-3.21}"
 ARCH="${2:-aarch64}"
 OUTPUT_DIR="${HOME}/.local/share/shuck/kernels"
 WORK_DIR="$(mktemp -d)"
+
+if [ "$ARCH" = "x86_64" ]; then
+    OUT_NAME="initramfs-x86_64-virt.gz"
+else
+    OUT_NAME="initramfs-virt.gz"
+fi
 
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
@@ -183,9 +191,9 @@ chmod 755 "$INITRAMFS/init"
 
 echo "Packing initramfs"
 mkdir -p "$OUTPUT_DIR"
-(cd "$INITRAMFS" && find . | cpio -o -H newc --quiet | gzip -9) > "$OUTPUT_DIR/initramfs-virt.gz"
+(cd "$INITRAMFS" && find . | cpio -o -H newc --quiet | gzip -9) > "$OUTPUT_DIR/$OUT_NAME"
 
-echo "Built: $OUTPUT_DIR/initramfs-virt.gz ($(du -h "$OUTPUT_DIR/initramfs-virt.gz" | cut -f1))"
+echo "Built: $OUTPUT_DIR/$OUT_NAME ($(du -h "$OUTPUT_DIR/$OUT_NAME" | cut -f1))"
 
 # Also copy the uncompressed kernel Image if present in the APK
 KERNEL_IMAGE="$WORK_DIR/apk/boot/vmlinuz-virt"
