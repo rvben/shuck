@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "shuck"
 path = "src/main.rs"
 
+[lib]
+name = "shuck"
+path = "src/lib.rs"
+
 [features]
 default = ["linux-net"]
 linux-net = ["shuck-core/linux-net", "shuck-api/linux-net", "shuck-net"]
@@ -36,3 +40,6 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

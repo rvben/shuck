@@ -1842,6 +1842,7 @@ dependencies = [
  "shuck-state",
  "shuck-storage",
  "shuck-vmm",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "toml",
