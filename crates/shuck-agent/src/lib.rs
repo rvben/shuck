@@ -170,26 +170,43 @@ where
     Ok(())
 }
 
+/// Default ceiling on how long a single `Exec` command may run before the
+/// agent kills the child and returns a timeout error. Overridable via the
+/// `SHUCK_AGENT_EXEC_TIMEOUT_SECS` env var (primarily for tests).
+const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 600;
+
+fn exec_timeout() -> std::time::Duration {
+    let secs = std::env::var("SHUCK_AGENT_EXEC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 async fn handle_request(request: AgentRequest) -> AgentResponse {
     match request {
         AgentRequest::Ping => AgentResponse::Pong,
 
         AgentRequest::Exec(req) => {
-            let result = tokio::process::Command::new(&req.command)
+            let timeout = exec_timeout();
+            let fut = tokio::process::Command::new(&req.command)
                 .args(&req.args)
                 .envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .current_dir(req.working_dir.as_deref().unwrap_or("/"))
-                .output()
-                .await;
+                .kill_on_drop(true)
+                .output();
 
-            match result {
-                Ok(output) => AgentResponse::Exec(ExecResponse {
+            match tokio::time::timeout(timeout, fut).await {
+                Ok(Ok(output)) => AgentResponse::Exec(ExecResponse {
                     exit_code: output.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 }),
-                Err(e) => AgentResponse::Error(ErrorResponse {
+                Ok(Err(e)) => AgentResponse::Error(ErrorResponse {
                     message: format!("exec failed: {e}"),
+                }),
+                Err(_) => AgentResponse::Error(ErrorResponse {
+                    message: format!("exec timed out after {}s", timeout.as_secs()),
                 }),
             }
         }

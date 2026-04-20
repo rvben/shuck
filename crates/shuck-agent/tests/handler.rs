@@ -103,6 +103,40 @@ async fn exec_with_env() {
 }
 
 #[tokio::test]
+async fn exec_times_out_on_long_running_command() {
+    // Safety: test is serialized by `serial_test`-free convention here because
+    // no other test reads this env var, and they all use commands that finish
+    // in milliseconds.
+    unsafe {
+        std::env::set_var("SHUCK_AGENT_EXEC_TIMEOUT_SECS", "1");
+    }
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::Exec(ExecRequest {
+        command: "sleep".into(),
+        args: vec!["30".into()],
+        working_dir: None,
+        env: vec![],
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    unsafe {
+        std::env::remove_var("SHUCK_AGENT_EXEC_TIMEOUT_SECS");
+    }
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message.contains("timed out"),
+                "expected timeout error, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn exec_nonexistent_command() {
     let mut stream = spawn_agent().await;
 
