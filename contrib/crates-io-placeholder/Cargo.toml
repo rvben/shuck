@@ -1,0 +1,22 @@
+[package]
+name = "shuck"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.90"
+description = "Placeholder for the shuck microVM manager. The first real release is not yet on crates.io."
+license = "MIT"
+repository = "https://github.com/rvben/shuck"
+homepage = "https://github.com/rvben/shuck"
+readme = "README.md"
+authors = ["Ruben Jongejan <ruben.jongejan@gmail.com>"]
+keywords = ["microvm", "firecracker", "virtualization"]
+categories = ["command-line-utilities", "virtualization"]
+
+[[bin]]
+name = "shuck"
+path = "src/main.rs"
+
+# Declared as its own workspace root so the outer shuck workspace does not
+# try to include this placeholder in `cargo build --workspace` and so
+# `cargo publish` produces a self-contained crate archive.
+[workspace]
