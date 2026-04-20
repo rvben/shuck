@@ -18,6 +18,9 @@ WORK_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
+# Resolve paths relative to the repo root, not CWD.
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
 case "$ARCH" in
     aarch64|x86_64) ;;
     *) echo "ERROR: unsupported arch $ARCH" >&2; exit 1 ;;
@@ -28,7 +31,7 @@ MKFS_EXT4="${MKFS_EXT4:-$(command -v mkfs.ext4 2>/dev/null || find /opt/homebrew
 [ -x "$DEBUGFS" ]   || { echo "ERROR: debugfs not found (brew install e2fsprogs)" >&2; exit 1; }
 [ -x "$MKFS_EXT4" ] || { echo "ERROR: mkfs.ext4 not found (brew install e2fsprogs)" >&2; exit 1; }
 
-AGENT_BIN="target/${ARCH}-unknown-linux-musl/agent/shuck-agent"
+AGENT_BIN="$SCRIPT_DIR/target/${ARCH}-unknown-linux-musl/agent/shuck-agent"
 [ -f "$AGENT_BIN" ] || { echo "ERROR: agent binary missing at $AGENT_BIN (run make build-agent-aarch64 / build-agent)" >&2; exit 1; }
 
 # ── Fetch Alpine minirootfs tarball ──────────────────────────────────
@@ -52,7 +55,7 @@ mkdir -p "$TAR_DIR/usr/local/bin"
 cp "$AGENT_BIN" "$TAR_DIR/usr/local/bin/shuck-agent"
 chmod 0755 "$TAR_DIR/usr/local/bin/shuck-agent"
 mkdir -p "$TAR_DIR/etc"
-cp guest/inittab "$TAR_DIR/etc/inittab"
+cp "$SCRIPT_DIR/guest/inittab" "$TAR_DIR/etc/inittab"
 chmod 0644 "$TAR_DIR/etc/inittab"
 
 # Walk the tree sorted to guarantee parent directories are created before
@@ -67,12 +70,12 @@ DBG_CMDS="$WORK_DIR/debugfs.cmd"
         echo "symlink $dest $target"
     elif [ -d "$entry" ]; then
         echo "mkdir $dest"
-        mode=$(stat -f '%OLp' "$entry" 2>/dev/null || stat -c '%a' "$entry")
-        echo "set_inode_field $dest mode 040${mode}"
+        mode=$({ m=$(stat -f '%p' "$entry" 2>/dev/null) && echo "${m: -4}"; } || stat -c '%a' "$entry")
+        echo "set_inode_field $dest mode 04${mode}"
     elif [ -f "$entry" ]; then
         echo "write $entry $dest"
-        mode=$(stat -f '%OLp' "$entry" 2>/dev/null || stat -c '%a' "$entry")
-        echo "set_inode_field $dest mode 0100${mode}"
+        mode=$({ m=$(stat -f '%p' "$entry" 2>/dev/null) && echo "${m: -4}"; } || stat -c '%a' "$entry")
+        echo "set_inode_field $dest mode 010${mode}"
     else
         echo "# skipping special file: $dest" >&2
     fi
@@ -81,6 +84,13 @@ done ) >> "$DBG_CMDS"
 # Run debugfs from inside the extracted tree so relative source paths in
 # "write ./foo/bar /foo/bar" commands resolve correctly.
 (cd "$TAR_DIR" && "$DEBUGFS" -w -f "$DBG_CMDS" "$IMG" >/dev/null)
+
+# debugfs exits 0 even when individual commands in the command file fail.
+# Probe the populated image for the agent binary before declaring success.
+if ! "$DEBUGFS" -R "stat /usr/local/bin/shuck-agent" "$IMG" 2>/dev/null | grep -q "Type: regular"; then
+    echo "ERROR: shuck-agent was not written to the image (debugfs populate may have failed)" >&2
+    exit 1
+fi
 
 mkdir -p "$OUTPUT_DIR"
 OUT_PATH="$OUTPUT_DIR/alpine-${ARCH}.ext4"
