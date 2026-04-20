@@ -12,6 +12,7 @@ build-release:
 
 # Build only the guest agent (optimized for size, x86_64)
 build-agent:
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
 	cargo build --package shuck-agent --profile agent --target x86_64-unknown-linux-musl
 
 # Build guest agent for ARM64 (for macOS/VZ guests)
