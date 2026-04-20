@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
 all: lint test
 
@@ -171,6 +171,16 @@ build-initramfs:
 ARCH ?= aarch64
 build-kernel-image:
 	guest/build-kernel-image.sh $(ARCH)
+
+# Build baseline Alpine rootfs with shuck-agent and inittab baked in.
+# ARCH=aarch64 builds for macOS VZ; ARCH=x86_64 for Firecracker.
+build-rootfs:
+ifeq ($(ARCH),x86_64)
+	$(MAKE) build-agent
+else
+	$(MAKE) build-agent-aarch64
+endif
+	guest/build-rootfs.sh $(ARCH)
 
 # Validate initramfs/inittab consistency (module presence, load order, DHCP config)
 test-initramfs:
