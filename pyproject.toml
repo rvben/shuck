@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "shuck"
+dynamic = ["version"]
+description = "microVM manager built on Firecracker (Linux) and Apple Virtualization.framework (macOS)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Ruben J. Jongejan", email = "ruben.jongejan@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: System :: Operating System Kernels :: Linux",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/rvben/shuck"
+Repository = "https://github.com/rvben/shuck.git"
+Issues = "https://github.com/rvben/shuck/issues"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/shuck/Cargo.toml"
+python-packages = ["shuck_cli"]
+strip = true
