@@ -489,9 +489,10 @@ pub async fn remove_port_forward(host_port: u16, tap_name: &str) -> Result<(), N
     let comment_tag = format!("shuck-pf:{}:{}", tap_name, host_port);
     let rules = find_rules_by_comment(&output, &comment_tag);
 
+    let mut failures = Vec::new();
     for (chain, handle) in rules {
         debug!(chain = %chain, handle, "deleting port forward rule");
-        let _ = run_cmd(
+        if let Err(e) = run_cmd(
             "nft",
             &[
                 "delete",
@@ -503,9 +504,18 @@ pub async fn remove_port_forward(host_port: u16, tap_name: &str) -> Result<(), N
                 &handle.to_string(),
             ],
         )
-        .await;
+        .await
+        {
+            failures.push(format!("{chain} handle {handle}: {e}"));
+        }
     }
 
+    if !failures.is_empty() {
+        return Err(NetError::CommandFailed {
+            cmd: "nft delete rule".into(),
+            message: failures.join("; "),
+        });
+    }
     Ok(())
 }
 
@@ -519,9 +529,10 @@ pub async fn remove_all_port_forwards(tap_name: &str) -> Result<(), NetError> {
     let prefix = format!("shuck-pf:{tap_name}:");
     let rules = find_rules_by_comment_prefix(&output, &prefix);
 
+    let mut failures = Vec::new();
     for (chain, handle) in rules {
         debug!(chain = %chain, handle, "deleting port forward rule");
-        let _ = run_cmd(
+        if let Err(e) = run_cmd(
             "nft",
             &[
                 "delete",
@@ -533,9 +544,18 @@ pub async fn remove_all_port_forwards(tap_name: &str) -> Result<(), NetError> {
                 &handle.to_string(),
             ],
         )
-        .await;
+        .await
+        {
+            failures.push(format!("{chain} handle {handle}: {e}"));
+        }
     }
 
+    if !failures.is_empty() {
+        return Err(NetError::CommandFailed {
+            cmd: "nft delete rule".into(),
+            message: failures.join("; "),
+        });
+    }
     Ok(())
 }
 
