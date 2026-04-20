@@ -791,6 +791,9 @@ fn is_protected_route(method: &Method, path: &str) -> bool {
     if path.starts_with("/v1/secrets") {
         return true;
     }
+    if path == "/v1/metrics" {
+        return true;
+    }
 
     if !(path.starts_with("/v1/vms")
         || path.starts_with("/v1/services")
@@ -803,7 +806,7 @@ fn is_protected_route(method: &Method, path: &str) -> bool {
     if *method != Method::GET {
         return true;
     }
-    path.ends_with("/shell")
+    path.ends_with("/shell") || path.ends_with("/logs")
 }
 
 async fn auth_middleware(
@@ -3281,6 +3284,8 @@ mod tests {
         assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
         assert!(is_protected_route(&Method::DELETE, "/v1/vms/example"));
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/shell"));
+        assert!(is_protected_route(&Method::GET, "/v1/vms/example/logs"));
+        assert!(is_protected_route(&Method::GET, "/v1/metrics"));
     }
 
     #[tokio::test]
@@ -3338,6 +3343,30 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_logs_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(
+                Request::get("/v1/vms/any/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_metrics_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
