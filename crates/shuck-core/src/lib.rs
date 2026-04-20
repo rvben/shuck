@@ -203,6 +203,43 @@ pub struct RevealedSecret {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Maximum length of a user-supplied resource name (VM, snapshot, image, …).
+const MAX_RESOURCE_NAME_LEN: usize = 64;
+
+/// Validate a user-supplied resource name before it is used in any host
+/// filesystem path or persisted identifier.
+///
+/// Names must be 1-64 ASCII characters from `[A-Za-z0-9._-]`, may not start
+/// with `.`, and may not contain path separators, NULs, or whitespace. This
+/// prevents path traversal (`../escape`) and accidental collision with hidden
+/// files or path metacharacters when names are joined with `data_dir`.
+fn validate_resource_name(kind: &str, name: &str) -> Result<(), CoreError> {
+    if name.is_empty() {
+        return Err(CoreError::InvalidArgument(format!(
+            "{kind} name cannot be empty"
+        )));
+    }
+    if name.len() > MAX_RESOURCE_NAME_LEN {
+        return Err(CoreError::InvalidArgument(format!(
+            "{kind} name exceeds maximum length of {MAX_RESOURCE_NAME_LEN}"
+        )));
+    }
+    if name.starts_with('.') {
+        return Err(CoreError::InvalidArgument(format!(
+            "{kind} name '{name}' cannot start with '.'"
+        )));
+    }
+    for ch in name.chars() {
+        let allowed = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
+        if !allowed {
+            return Err(CoreError::InvalidArgument(format!(
+                "{kind} name '{name}' contains invalid character; allowed: [A-Za-z0-9._-]"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Tracks resources allocated during VM creation for rollback on failure.
 #[derive(Default)]
 struct AllocatedResources {
@@ -279,6 +316,7 @@ impl<B: VmmBackend> ShuckCore<B> {
     /// Allocates network, storage, and VMM resources. On failure, all
     /// partially allocated resources are rolled back.
     pub async fn create_vm(&self, req: CreateVmRequest) -> Result<VmRecord, CoreError> {
+        validate_resource_name("vm", &req.name)?;
         info!(name = %req.name, "creating VM");
 
         // If a stopped VM with this name exists, replace it automatically.
@@ -676,6 +714,7 @@ impl<B: VmmBackend> ShuckCore<B> {
         &self,
         req: CreateHostGroupRequest,
     ) -> Result<HostGroupRecord, CoreError> {
+        validate_resource_name("host group", &req.name)?;
         let record = HostGroupRecord {
             id: Uuid::new_v4(),
             name: req.name,
@@ -724,6 +763,7 @@ impl<B: VmmBackend> ShuckCore<B> {
 
     /// Create a service.
     pub fn create_service(&self, req: CreateServiceRequest) -> Result<ServiceRecord, CoreError> {
+        validate_resource_name("service", &req.name)?;
         let desired_instances = req.desired_instances.unwrap_or(1);
         if desired_instances == 0 {
             return Err(CoreError::InvalidArgument(
@@ -819,6 +859,7 @@ impl<B: VmmBackend> ShuckCore<B> {
         &self,
         req: CreateSnapshotRequest,
     ) -> Result<SnapshotRecord, CoreError> {
+        validate_resource_name("snapshot", &req.name)?;
         let vm = self.lookup_vm(&req.vm)?;
         if vm.state != "stopped" {
             return Err(CoreError::InvalidState {
@@ -900,6 +941,7 @@ impl<B: VmmBackend> ShuckCore<B> {
         snapshot_name: &str,
         req: RestoreSnapshotRequest,
     ) -> Result<VmRecord, CoreError> {
+        validate_resource_name("vm", &req.name)?;
         let snapshot = self.get_snapshot(snapshot_name)?;
         self.create_vm(CreateVmRequest {
             name: req.name,
@@ -916,6 +958,7 @@ impl<B: VmmBackend> ShuckCore<B> {
 
     /// Import a rootfs image into the managed image catalog.
     pub async fn import_image(&self, req: ImportImageRequest) -> Result<ImageRecord, CoreError> {
+        validate_resource_name("image", &req.name)?;
         match self.state.get_image_by_name(&req.name) {
             Ok(_) => return Err(CoreError::ImageAlreadyExists(req.name)),
             Err(shuck_state::StateError::ImageNotFoundByName(_)) => {}
@@ -1020,11 +1063,7 @@ impl<B: VmmBackend> ShuckCore<B> {
 
     /// Create a new encrypted secret.
     pub fn create_secret(&self, req: CreateSecretRequest) -> Result<SecretMetadata, CoreError> {
-        if req.name.trim().is_empty() {
-            return Err(CoreError::InvalidArgument(
-                "secret name cannot be empty".into(),
-            ));
-        }
+        validate_resource_name("secret", &req.name)?;
 
         let key = load_or_create_secret_key(&self.storage.data_dir)?;
         let (ciphertext, nonce) = encrypt_secret(&key, req.value.as_bytes())?;

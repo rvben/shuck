@@ -4,10 +4,13 @@ use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use shuck_core::{
-    CoreError, CreateSecretRequest, CreateSnapshotRequest, CreateVmRequest, ExportImageRequest,
-    ImportImageRequest, RestoreSnapshotRequest, RotateSecretRequest, ShuckCore,
+    CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
+    CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, ImportImageRequest,
+    RestoreSnapshotRequest, RotateSecretRequest, ShuckCore,
 };
-use shuck_state::{PortForwardRecord, StateStore, VmRecord};
+#[cfg(feature = "linux-net")]
+use shuck_state::PortForwardRecord;
+use shuck_state::{StateStore, VmRecord};
 use shuck_storage::StorageConfig;
 use shuck_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
 use tokio::sync::Mutex;
@@ -148,6 +151,7 @@ impl VmmBackend for MockVmm {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn vm_record(
     id: Uuid,
     name: &str,
@@ -634,7 +638,7 @@ async fn rotate_serial_logs_rotates_only_large_serial_files() {
     assert_eq!(std::fs::read(&other).unwrap(), b"hello");
     let rotated_size = std::fs::metadata(&large_log).unwrap().len();
     assert!(
-        rotated_size < 11 * 1024 * 1024 && rotated_size >= 4 * 1024 * 1024,
+        (4 * 1024 * 1024..11 * 1024 * 1024).contains(&rotated_size),
         "unexpected rotated size: {rotated_size}"
     );
 }
@@ -1302,4 +1306,212 @@ async fn reveal_missing_secret_returns_not_found() {
 
     let err = core.reveal_secret("missing").unwrap_err();
     assert!(matches!(err, CoreError::SecretNotFound(_)));
+}
+
+// --- Resource name validation -------------------------------------------------
+//
+// Names supplied by API callers feed directly into host filesystem paths
+// (vm_dir, snapshots_dir, image catalog). Without validation a name such as
+// "../../etc/passwd" lets a caller escape data_dir on create or delete. These
+// tests assert that core rejects unsafe names with InvalidArgument before any
+// filesystem operation is attempted.
+
+const PATH_TRAVERSAL_NAMES: &[&str] = &[
+    "../escape",
+    "..",
+    ".",
+    ".hidden",
+    "foo/bar",
+    "foo\\bar",
+    "with\0null",
+    "name with spaces",
+    "",
+    "tab\there",
+];
+
+fn make_core(tmp: &tempfile::TempDir) -> Arc<ShuckCore<MockVmm>> {
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    )
+}
+
+#[tokio::test]
+async fn create_vm_rejects_unsafe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core
+            .create_vm(CreateVmRequest {
+                name: (*name).into(),
+                kernel_path: PathBuf::from("/missing-kernel"),
+                rootfs_path: PathBuf::from("/missing-rootfs"),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "create_vm should reject {name:?} with InvalidArgument, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_snapshot_rejects_unsafe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core
+            .create_snapshot(CreateSnapshotRequest {
+                name: (*name).into(),
+                vm: "any-vm".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "create_snapshot should reject {name:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn import_image_rejects_unsafe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src.ext4");
+    std::fs::write(&source, b"data").unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core
+            .import_image(ImportImageRequest {
+                name: (*name).into(),
+                source_path: source.clone(),
+                format: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "import_image should reject {name:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_secret_rejects_unsafe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core
+            .create_secret(CreateSecretRequest {
+                name: (*name).into(),
+                value: "v".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "create_secret should reject {name:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_host_group_rejects_unsafe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core
+            .create_host_group(CreateHostGroupRequest {
+                name: (*name).into(),
+                description: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "create_host_group should reject {name:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_service_rejects_unsafe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core
+            .create_service(CreateServiceRequest {
+                name: (*name).into(),
+                host_group: None,
+                desired_instances: Some(1),
+                image: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "create_service should reject {name:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_snapshot_rejects_unsafe_target_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    let err = core
+        .restore_snapshot(
+            "any-snapshot",
+            RestoreSnapshotRequest {
+                name: "../escape".into(),
+                kernel_path: PathBuf::from("/missing"),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "restore_snapshot should reject unsafe target name, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_vm_accepts_safe_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    // Safe names should not be rejected on validation; they will fail later on
+    // missing kernel/rootfs but with a different error than InvalidArgument.
+    for name in &["my-vm", "vm_01", "v.1.2", "abc", "a", &"a".repeat(64)] {
+        let err = core
+            .create_vm(CreateVmRequest {
+                name: (*name).into(),
+                kernel_path: PathBuf::from("/missing-kernel"),
+                rootfs_path: PathBuf::from("/missing-rootfs"),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, CoreError::InvalidArgument(_)),
+            "safe name {name:?} should not be rejected as InvalidArgument; got {err:?}"
+        );
+    }
 }
