@@ -6,11 +6,17 @@ shuck installed (`make install`).
 ## 1. Build fresh reference images
 
     make build-kernel-image ARCH=aarch64
+    make build-initramfs
     make build-rootfs ARCH=aarch64
+
+The initramfs is required: Alpine's `linux-virt` kernel ships `virtio_blk`
+as a loadable module, so without an initrd to load it the kernel panics
+with `Unable to mount root fs on /dev/vda`.
 
 Confirm the paths:
 
     ls -lh ~/.local/share/shuck/kernels/Image-virt
+    ls -lh ~/.local/share/shuck/kernels/initramfs-virt.gz
     ls -lh ~/.local/share/shuck/images/alpine-aarch64.ext4
 
 ## 2. Start the daemon in the foreground
@@ -23,6 +29,7 @@ Leave this running; use a second shell for the next steps.
 
     shuck run ~/.local/share/shuck/images/alpine-aarch64.ext4 \
         --name boot-check \
+        --initrd ~/.local/share/shuck/kernels/initramfs-virt.gz \
         --cpus 2 --memory 512
 
 Expected: `Created VM: boot-check`, state `Running` within ~2s.
