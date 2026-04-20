@@ -395,6 +395,15 @@ enum ImageAction {
         /// Image name
         name: String,
     },
+    /// Fetch default kernel + initramfs + rootfs for this host into the data dir
+    Pull {
+        /// Override the configured base URL
+        #[arg(long)]
+        from: Option<String>,
+        /// Re-download even if destination files already exist
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2108,6 +2117,60 @@ async fn image_command(
                 let msg = api_error(resp, &format!("image '{name}'")).await;
                 exit_with_error(output, msg);
             }
+        }
+        ImageAction::Pull { from, force } => {
+            let config = load_config(None);
+            let base_url = from.unwrap_or(config.images_base_url.clone());
+            let manifest = shuck::images::fetch_manifest(&base_url)
+                .await
+                .context("fetching SHA256SUMS manifest")?;
+
+            let arch = std::env::consts::ARCH;
+            let kernel_asset = format!("kernel-{arch}");
+            let rootfs_asset = format!("rootfs-{arch}.ext4");
+            let initrd_asset = format!("initramfs-{arch}.gz");
+
+            let mut targets: Vec<(String, PathBuf)> = vec![
+                (kernel_asset, config.default_kernel.clone()),
+                (rootfs_asset, shuck::default_rootfs_path()),
+            ];
+            if let Some(initrd_dest) = config.default_initrd.clone() {
+                targets.push((initrd_asset, initrd_dest));
+            }
+
+            for (asset, dest) in targets {
+                let sha = manifest.get(&asset).ok_or_else(|| {
+                    anyhow::anyhow!("{asset} missing from manifest at {base_url}")
+                })?;
+                if dest.exists() && !force {
+                    println!(
+                        "Skipping {} (exists; pass --force to overwrite)",
+                        dest.display()
+                    );
+                    continue;
+                }
+                let url = format!("{}/{}", base_url.trim_end_matches('/'), asset);
+                println!("Downloading {url} -> {}", dest.display());
+                shuck::images::fetch_and_verify(shuck::images::DownloadSpec {
+                    url,
+                    expected_sha256: sha.clone(),
+                    dest: dest.clone(),
+                })
+                .await?;
+                println!("Verified {}", dest.display());
+            }
+
+            print_output(
+                output,
+                &serde_json::json!({
+                    "status": "ok",
+                    "action": "image-pull",
+                    "kernel": config.default_kernel,
+                    "rootfs": shuck::default_rootfs_path(),
+                    "initrd": config.default_initrd,
+                }),
+                "Images pulled.",
+            );
         }
     }
     Ok(())

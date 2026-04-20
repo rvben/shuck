@@ -19,6 +19,15 @@ fn parse_manifest_extracts_sha_for_named_file() {
 }
 
 #[tokio::test]
+async fn fetch_manifest_parses_asset_lines() {
+    let body: &[u8] = b"deadbeef  kernel-aarch64\nc0ffee  rootfs-aarch64.ext4\n";
+    let server = mock_server(body).await;
+    let manifest = shuck::images::fetch_manifest(&server.url).await.unwrap();
+    assert_eq!(manifest.get("kernel-aarch64").unwrap(), "deadbeef");
+    assert_eq!(manifest.get("rootfs-aarch64.ext4").unwrap(), "c0ffee");
+}
+
+#[tokio::test]
 async fn fetch_and_verify_rejects_sha_mismatch() {
     let body: &[u8] = b"payload";
     let server = mock_server(body).await;
