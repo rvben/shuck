@@ -162,9 +162,10 @@ update-rootfs: build-agent-aarch64
 	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/shuck-agent' $(ROOTFS_IMAGE)"
 	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
 
-# Build initramfs for Alpine-based shuck VMs
+# Build initramfs for Alpine-based shuck VMs.
+# ARCH defaults to aarch64; pass ARCH=x86_64 for Firecracker.
 build-initramfs:
-	guest/build-initramfs.sh
+	guest/build-initramfs.sh 3.21 $(ARCH)
 
 # Build an uncompressed kernel Image extracted from Alpine's linux-virt apk.
 # ARCH defaults to aarch64 (for macOS VZ); pass x86_64 for Firecracker.
