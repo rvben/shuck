@@ -69,7 +69,7 @@ jobs:
           cp "$HOME/.local/share/shuck/kernels/$INITRAMFS_SRC" "stage/initramfs-${{ matrix.arch }}.gz"
           cp "$HOME/.local/share/shuck/images/alpine-${{ matrix.arch }}.ext4" \
              "stage/rootfs-${{ matrix.arch }}.ext4"
-          ( cd stage && sha256sum ./* > "SHA256SUMS-${{ matrix.arch }}" )
+          ( cd stage && sha256sum kernel-* initramfs-* rootfs-* > "SHA256SUMS-${{ matrix.arch }}" )
 
       - uses: actions/upload-artifact@v4
         with:
@@ -79,6 +79,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -92,6 +93,8 @@ jobs:
           cp artifacts/images-*/kernel-* release/
           cp artifacts/images-*/initramfs-* release/
           cp artifacts/images-*/rootfs-* release/
+          count=$(find artifacts/images-* -name 'SHA256SUMS-*' -maxdepth 1 | wc -l)
+          [ "$count" -eq 2 ] || { echo "Expected 2 SHA256SUMS files, got $count" >&2; exit 1; }
           cat artifacts/images-*/SHA256SUMS-* > release/SHA256SUMS
           ls -lh release/
 
@@ -99,6 +102,8 @@ jobs:
         id: tag
         run: echo "tag=images-$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
+      # On schedule: inputs.dry_run is null, so this evaluates to true and we publish.
+      # On workflow_dispatch: honours the dry_run input (default true).
       - name: Create release
         if: ${{ inputs.dry_run != true }}
         uses: softprops/action-gh-release@v2
@@ -115,6 +120,7 @@ jobs:
               rootfs-<arch>.ext4       (Alpine + shuck-agent baked in)
           files: release/*
 
+      # Only runs on workflow_dispatch with dry_run=true (default).
       - name: Dry-run summary
         if: ${{ inputs.dry_run == true }}
         run: |
