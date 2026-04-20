@@ -197,6 +197,39 @@ async fn write_then_read_file() {
 }
 
 #[tokio::test]
+async fn read_file_rejects_oversized_file() {
+    // Safety: no other test reads this env var concurrently.
+    unsafe {
+        std::env::set_var("SHUCK_AGENT_MAX_READ_BYTES", "64");
+    }
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("big.bin");
+    std::fs::write(&file_path, vec![0u8; 128]).unwrap();
+
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: file_path.to_string_lossy().into_owned(),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    unsafe {
+        std::env::remove_var("SHUCK_AGENT_MAX_READ_BYTES");
+    }
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message.contains("exceeds max read size"),
+                "got unexpected error: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn read_nonexistent_file() {
     let mut stream = spawn_agent().await;
 

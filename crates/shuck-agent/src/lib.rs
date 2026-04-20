@@ -175,12 +175,24 @@ where
 /// `SHUCK_AGENT_EXEC_TIMEOUT_SECS` env var (primarily for tests).
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 600;
 
+/// Default ceiling on bytes returned by a single `ReadFile` response. Keeps
+/// the agent's peak memory bounded even when the host asks for a large file.
+/// Overridable via `SHUCK_AGENT_MAX_READ_BYTES`.
+const DEFAULT_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
 fn exec_timeout() -> std::time::Duration {
     let secs = std::env::var("SHUCK_AGENT_EXEC_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)
+}
+
+fn max_read_bytes() -> u64 {
+    std::env::var("SHUCK_AGENT_MAX_READ_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_READ_BYTES)
 }
 
 async fn handle_request(request: AgentRequest) -> AgentResponse {
@@ -218,16 +230,26 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                 .open(&req.path)
                 .await;
             match open {
-                Ok(mut file) => {
+                Ok(file) => {
+                    let max = max_read_bytes();
+                    let mut limited = file.take(max + 1);
                     let mut data = Vec::new();
-                    match file.read_to_end(&mut data).await {
+                    match limited.read_to_end(&mut data).await {
                         Ok(_) => {
-                            let size = data.len() as u64;
-                            let encoded = base64_encode(&data);
-                            AgentResponse::ReadFile(ReadFileResponse {
-                                data: encoded,
-                                size,
-                            })
+                            if data.len() as u64 > max {
+                                AgentResponse::Error(ErrorResponse {
+                                    message: format!(
+                                        "read failed: file exceeds max read size of {max} bytes"
+                                    ),
+                                })
+                            } else {
+                                let size = data.len() as u64;
+                                let encoded = base64_encode(&data);
+                                AgentResponse::ReadFile(ReadFileResponse {
+                                    data: encoded,
+                                    size,
+                                })
+                            }
                         }
                         Err(e) => AgentResponse::Error(ErrorResponse {
                             message: format!("read failed: {e}"),
