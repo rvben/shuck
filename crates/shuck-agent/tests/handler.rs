@@ -180,6 +180,69 @@ async fn read_nonexistent_file() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_refuses_symlink_target() {
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.txt");
+    std::fs::write(&real, b"original").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let request = AgentRequest::WriteFile(WriteFileRequest {
+        path: link.to_string_lossy().into_owned(),
+        data: base64_encode(b"attacker payload"),
+        mode: None,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message.contains("write failed"),
+                "got unexpected error: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let contents = std::fs::read(&real).unwrap();
+    assert_eq!(contents, b"original", "symlink target must not be modified");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_file_refuses_symlink_target() {
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("secret.txt");
+    std::fs::write(&real, b"sensitive").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: link.to_string_lossy().into_owned(),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Error(e) => {
+            assert!(
+                e.message.contains("read failed"),
+                "got unexpected error: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn write_file_invalid_base64_returns_error() {
     let mut stream = spawn_agent().await;
@@ -231,7 +294,10 @@ async fn shell_data_without_session_returns_error() {
 async fn shell_resize_without_session_returns_error() {
     let mut stream = spawn_agent().await;
 
-    let request = AgentRequest::ShellResize(ShellResizeRequest { cols: 100, rows: 50 });
+    let request = AgentRequest::ShellResize(ShellResizeRequest {
+        cols: 100,
+        rows: 50,
+    });
     write_message(&mut stream, &request).await.unwrap();
 
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
@@ -714,7 +780,9 @@ async fn shell_ignores_unexpected_messages_during_session() {
     }
 
     // This message type is irrelevant once in shell mode and should be ignored.
-    write_message(&mut stream, &AgentRequest::Ping).await.unwrap();
+    write_message(&mut stream, &AgentRequest::Ping)
+        .await
+        .unwrap();
 
     let request = AgentRequest::ShellData(ShellDataRequest {
         data: base64_encode(b"after-ping\n"),
@@ -760,9 +828,7 @@ async fn shell_invalid_base64_input_is_ignored() {
     }
 
     // Invalid base64 should be ignored by the shell loop.
-    let request = AgentRequest::ShellData(ShellDataRequest {
-        data: "***".into(),
-    });
+    let request = AgentRequest::ShellData(ShellDataRequest { data: "***".into() });
     write_message(&mut stream, &request).await.unwrap();
 
     // Valid data should still be processed afterwards.

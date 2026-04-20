@@ -194,19 +194,34 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
             }
         }
 
-        AgentRequest::ReadFile(req) => match tokio::fs::read(&req.path).await {
-            Ok(data) => {
-                let size = data.len() as u64;
-                let encoded = base64_encode(&data);
-                AgentResponse::ReadFile(ReadFileResponse {
-                    data: encoded,
-                    size,
-                })
+        AgentRequest::ReadFile(req) => {
+            let open = tokio::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&req.path)
+                .await;
+            match open {
+                Ok(mut file) => {
+                    let mut data = Vec::new();
+                    match file.read_to_end(&mut data).await {
+                        Ok(_) => {
+                            let size = data.len() as u64;
+                            let encoded = base64_encode(&data);
+                            AgentResponse::ReadFile(ReadFileResponse {
+                                data: encoded,
+                                size,
+                            })
+                        }
+                        Err(e) => AgentResponse::Error(ErrorResponse {
+                            message: format!("read failed: {e}"),
+                        }),
+                    }
+                }
+                Err(e) => AgentResponse::Error(ErrorResponse {
+                    message: format!("read failed: {e}"),
+                }),
             }
-            Err(e) => AgentResponse::Error(ErrorResponse {
-                message: format!("read failed: {e}"),
-            }),
-        },
+        }
 
         AgentRequest::WriteFile(req) => {
             let data = match base64_decode(&req.data) {
@@ -218,22 +233,34 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                 }
             };
             let len = data.len() as u64;
-            match tokio::fs::write(&req.path, &data).await {
-                Ok(()) => {
-                    #[cfg(unix)]
-                    if let Some(mode) = req.mode {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = tokio::fs::set_permissions(
-                            &req.path,
-                            std::fs::Permissions::from_mode(mode),
-                        )
-                        .await
-                        {
-                            warn!("failed to set permissions on {}: {e}", req.path);
+            let open = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&req.path)
+                .await;
+            match open {
+                Ok(mut file) => match file.write_all(&data).await {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        if let Some(mode) = req.mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Err(e) = tokio::fs::set_permissions(
+                                &req.path,
+                                std::fs::Permissions::from_mode(mode),
+                            )
+                            .await
+                            {
+                                warn!("failed to set permissions on {}: {e}", req.path);
+                            }
                         }
+                        AgentResponse::WriteFile(WriteFileResponse { bytes_written: len })
                     }
-                    AgentResponse::WriteFile(WriteFileResponse { bytes_written: len })
-                }
+                    Err(e) => AgentResponse::Error(ErrorResponse {
+                        message: format!("write failed: {e}"),
+                    }),
+                },
                 Err(e) => AgentResponse::Error(ErrorResponse {
                     message: format!("write failed: {e}"),
                 }),
