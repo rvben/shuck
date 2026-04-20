@@ -9,6 +9,17 @@ An open-source microVM manager built on [Firecracker](https://firecracker-microv
 - REST API + CLI
 - Cloud-init style userdata scripts
 
+## Status
+
+Pre-1.0 and early. The core feature set works and has test coverage, but:
+
+- The HTTP API, CLI flags, config schema, and on-disk state layout may change without a deprecation period.
+- The Linux/Firecracker backend is more mature than the macOS/Apple VZ backend.
+- It has not been run at scale or under production workloads. No soak testing, no external users yet.
+- Security features (token auth, rate limiting, encrypted secrets) exist but have had limited review. Don't expose the daemon to an untrusted network.
+
+Useful for experimentation, local development, and CI. Not recommended for production.
+
 ## Quick Start
 
 ```bash
@@ -44,8 +55,8 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 
 | Platform | Backend | Networking | Status |
 |----------|---------|------------|--------|
-| Linux x86_64 | Firecracker | TAP + nftables NAT, port forwarding | Full support |
-| macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed) | Full support |
+| Linux x86_64 | Firecracker | TAP + nftables NAT, port forwarding | Usable |
+| macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed) | Experimental |
 
 ## Architecture
 
@@ -87,11 +98,6 @@ make update-rootfs                  # Inject agent into rootfs image
 
 A systemd unit file is provided at `contrib/shuck.service`.
 
-## Links
+## License
 
-- [k3s on Shuck](docs/k3s.md) - Running Kubernetes clusters on Firecracker VMs
-- [Quality Plan](docs/quality-plan/README.md) - Multi-aspect roadmap to 100/100 quality targets
-- [Threat Model](docs/security/threat-model.md) - STRIDE model and control mapping
-- [Hardening Guide](docs/security/hardening-guide.md) - Deployment security checklist
-- [Runbooks](docs/operations/runbooks.md) - Incident response quick reference
-- [Compatibility Policy](docs/compatibility.md) - API/CLI deprecation and compatibility rules
+See [`LICENSE`](LICENSE).
