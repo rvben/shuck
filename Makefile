@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
 all: lint test
 
@@ -165,6 +165,12 @@ update-rootfs: build-agent-aarch64
 # Build initramfs for Alpine-based shuck VMs
 build-initramfs:
 	guest/build-initramfs.sh
+
+# Build an uncompressed kernel Image extracted from Alpine's linux-virt apk.
+# ARCH defaults to aarch64 (for macOS VZ); pass x86_64 for Firecracker.
+ARCH ?= aarch64
+build-kernel-image:
+	guest/build-kernel-image.sh $(ARCH)
 
 # Validate initramfs/inittab consistency (module presence, load order, DHCP config)
 test-initramfs:
