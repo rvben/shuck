@@ -1,0 +1,123 @@
+name: Build default images
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (do not create the release)'
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    # Rebuild monthly so Alpine + kernel fixes land in the default image.
+    - cron: '0 7 1 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            musl-target: x86_64-unknown-linux-musl
+            agent-make: build-agent
+          - arch: aarch64
+            musl-target: aarch64-unknown-linux-musl
+            agent-make: build-agent-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install e2fsprogs + musl cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs musl-tools
+          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
+            # Use the prebuilt aarch64 musl cross toolchain.
+            curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+            echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.musl-target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build agent
+        run: make ${{ matrix.agent-make }}
+
+      - name: Build kernel image
+        run: make build-kernel-image ARCH=${{ matrix.arch }}
+
+      - name: Build initramfs
+        run: make build-initramfs ARCH=${{ matrix.arch }}
+
+      - name: Build rootfs
+        run: make build-rootfs ARCH=${{ matrix.arch }}
+
+      - name: Stage artefacts
+        run: |
+          mkdir -p stage
+          KERNEL_SRC=$( [ "${{ matrix.arch }}" = "aarch64" ] && echo Image-virt || echo vmlinux )
+          cp "$HOME/.local/share/shuck/kernels/$KERNEL_SRC" "stage/kernel-${{ matrix.arch }}"
+          INITRAMFS_SRC=$( [ "${{ matrix.arch }}" = "aarch64" ] && echo initramfs-virt.gz || echo initramfs-x86_64-virt.gz )
+          cp "$HOME/.local/share/shuck/kernels/$INITRAMFS_SRC" "stage/initramfs-${{ matrix.arch }}.gz"
+          cp "$HOME/.local/share/shuck/images/alpine-${{ matrix.arch }}.ext4" \
+             "stage/rootfs-${{ matrix.arch }}.ext4"
+          ( cd stage && sha256sum ./* > "SHA256SUMS-${{ matrix.arch }}" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.arch }}
+          path: stage/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge manifests
+        run: |
+          mkdir -p release
+          cp artifacts/images-*/kernel-* release/
+          cp artifacts/images-*/initramfs-* release/
+          cp artifacts/images-*/rootfs-* release/
+          cat artifacts/images-*/SHA256SUMS-* > release/SHA256SUMS
+          ls -lh release/
+
+      - name: Compute tag
+        id: tag
+        run: echo "tag=images-$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: ${{ inputs.dry_run != true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Default images ${{ steps.tag.outputs.tag }}
+          body: |
+            Default kernel, initramfs, and rootfs images for shuck. Built from Alpine 3.21
+            minirootfs + linux-virt apk. Verify downloads against SHA256SUMS.
+
+            File naming:
+              kernel-<arch>            (uncompressed Linux Image / vmlinux)
+              initramfs-<arch>.gz      (gzipped cpio, loads virtio_blk before root mount)
+              rootfs-<arch>.ext4       (Alpine + shuck-agent baked in)
+          files: release/*
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "DRY RUN: would publish tag ${{ steps.tag.outputs.tag }} with:"
+          ls -lh release/
+          cat release/SHA256SUMS
