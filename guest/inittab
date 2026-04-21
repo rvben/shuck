@@ -26,8 +26,9 @@
 # Start shuck guest agent
 ::respawn:/usr/local/bin/shuck-agent
 
-# Virtio console for Apple VZ
-hvc0::respawn:/sbin/getty -L 115200 hvc0 vt100
+# Virtio console for Apple VZ — guarded because Firecracker guests have no
+# /dev/hvc0 and respawn would otherwise flood the serial log with open errors.
+hvc0::respawn:/bin/sh -c '[ -c /dev/hvc0 ] && exec /sbin/getty -L 115200 hvc0 vt100 || exec sleep 86400'
 
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/umount -a -r
