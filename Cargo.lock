@@ -1922,7 +1922,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shuck"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-agent-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "serde",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "ring",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "serde_json",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-state"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reflink-copy",
  "serde",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "shuck-vmm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "block2",
  "dispatch2",

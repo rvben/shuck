@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-21
+
+### Fixed
+
+- `shuck images pull` now resolves the latest `images-YYYY-MM-DD` release via the GitHub API instead of `releases/latest/download`, which GitHub redirects to the highest semver tag and therefore skipped over the image releases once v0.1.1 shipped. Pinning `images_base_url` at a `.../releases/download/<tag>` URL still short-circuits the resolver.
+
 ## [0.1.1] - 2026-04-21
 
 ### Fixed
