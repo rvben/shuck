@@ -27,7 +27,9 @@ async fn spawn_agent() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// Spawn a minimal Firecracker-vsock-like Unix listener that responds to CONNECT.
-async fn spawn_vsock_proxy(response_line: &'static [u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+async fn spawn_vsock_proxy(
+    response_line: &'static [u8],
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("firecracker.vsock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -428,7 +430,10 @@ async fn write_file_rejects_unexpected_response_variant() {
     });
 
     let mut conn = AgentConnection::new(client);
-    let err = conn.write_file("/tmp/out", b"abc", Some(0o644)).await.unwrap_err();
+    let err = conn
+        .write_file("/tmp/out", b"abc", Some(0o644))
+        .await
+        .unwrap_err();
     assert!(matches!(err, AgentError::UnexpectedResponse));
     server_task.await.unwrap();
 }

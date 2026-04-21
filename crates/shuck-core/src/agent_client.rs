@@ -41,19 +41,18 @@ impl AgentClient {
         vsock_uds_path: &Path,
         port: u32,
     ) -> Result<AgentConnection<tokio::net::UnixStream>, AgentError> {
-        let stream =
-            shuck_vmm::vsock::connect_firecracker_vsock(vsock_uds_path, port)
-                .await
-                .map_err(|e| match e {
-                    shuck_vmm::vsock::VsockConnectError::Rejected(port) => {
-                        AgentError::VsockConnectRejected(port)
-                    }
-                    shuck_vmm::vsock::VsockConnectError::Connect(e)
-                    | shuck_vmm::vsock::VsockConnectError::HandshakeWrite(e)
-                    | shuck_vmm::vsock::VsockConnectError::HandshakeRead(e) => {
-                        AgentError::Connection(e)
-                    }
-                })?;
+        let stream = shuck_vmm::vsock::connect_firecracker_vsock(vsock_uds_path, port)
+            .await
+            .map_err(|e| match e {
+                shuck_vmm::vsock::VsockConnectError::Rejected(port) => {
+                    AgentError::VsockConnectRejected(port)
+                }
+                shuck_vmm::vsock::VsockConnectError::Connect(e)
+                | shuck_vmm::vsock::VsockConnectError::HandshakeWrite(e)
+                | shuck_vmm::vsock::VsockConnectError::HandshakeRead(e) => {
+                    AgentError::Connection(e)
+                }
+            })?;
         Ok(AgentConnection { stream })
     }
 

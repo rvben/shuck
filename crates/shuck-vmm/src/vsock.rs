@@ -90,4 +90,3 @@ mod tests {
         assert!(matches!(err, VsockConnectError::Rejected(52)));
     }
 }
-
