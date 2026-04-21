@@ -441,12 +441,10 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let err = read_message_with_timeout::<AgentRequest, _>(
-            &mut reader,
-            Duration::from_millis(150),
-        )
-        .await
-        .expect_err("slow payload must time out");
+        let err =
+            read_message_with_timeout::<AgentRequest, _>(&mut reader, Duration::from_millis(150))
+                .await
+                .expect_err("slow payload must time out");
 
         match err {
             ProtocolError::ReadTimeout {
@@ -475,11 +473,10 @@ mod tests {
             writer.write_all(&bytes).await.unwrap();
         });
 
-        let got: AgentRequest =
-            read_message_with_timeout(&mut reader, Duration::from_secs(5))
-                .await
-                .unwrap()
-                .unwrap();
+        let got: AgentRequest = read_message_with_timeout(&mut reader, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
 
         match got {
             AgentRequest::Exec(exec) => assert_eq!(exec.command.len(), 200_000),

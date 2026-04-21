@@ -1302,11 +1302,7 @@ async fn secret_key_file_is_mode_0o600_on_creation() {
     .unwrap();
 
     let key_path = tmp.path().join("data/keys/secrets.key");
-    let mode = std::fs::metadata(&key_path)
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
+    let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "secret key must be 0o600, got {mode:o}");
 }
 

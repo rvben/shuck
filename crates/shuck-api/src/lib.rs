@@ -199,7 +199,10 @@ struct SlidingWindowRateLimiter {
 impl SlidingWindowRateLimiter {
     #[cfg(test)]
     fn clear(&self) {
-        self.events.lock().expect("rate limiter lock poisoned").clear();
+        self.events
+            .lock()
+            .expect("rate limiter lock poisoned")
+            .clear();
     }
 
     fn allow(&self, key: &str, limit_per_minute: u32) -> bool {
