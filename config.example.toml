@@ -11,7 +11,10 @@
 
 # Base directory for VM images, state database, and runtime files.
 #   macOS default: ~/.local/share/shuck
-#   Linux default: /var/lib/shuck
+#   Linux default: /var/lib/shuck when writable, otherwise ~/.local/share/shuck
+#                  (honors $XDG_DATA_HOME). Setting SHUCK_DATA_DIR also
+#                  cascades to default_kernel/default_rootfs/default_initrd
+#                  unless those are set explicitly.
 # data_dir = "/var/lib/shuck"
 
 # ── Kernel ───────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 pub mod firecracker;
@@ -11,17 +11,75 @@ pub mod images;
 /// direct `…/releases/download/<tag>` URL to pin a specific image set.
 pub const DEFAULT_IMAGES_BASE_URL: &str = "https://github.com/rvben/shuck";
 
+/// Default data directory.
+///
+/// macOS: always `$HOME/.local/share/shuck`.
+///
+/// Linux: `/var/lib/shuck` when the caller can write there (existing dir with
+/// write access, or a missing path under a writable parent). Otherwise falls
+/// back to the XDG data home (`$XDG_DATA_HOME/shuck`, or `$HOME/.local/share/shuck`)
+/// so unprivileged users can `pip install shuck && shuck images pull` without sudo.
 pub fn default_data_dir() -> PathBuf {
-    if cfg!(target_os = "macos")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(".local/share/shuck");
+    if cfg!(target_os = "macos") {
+        return xdg_data_home().join("shuck");
     }
-    PathBuf::from("/var/lib/shuck")
+    let system = PathBuf::from("/var/lib/shuck");
+    if can_write_to(&system) {
+        return system;
+    }
+    xdg_data_home().join("shuck")
+}
+
+fn xdg_data_home() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share");
+    }
+    PathBuf::from(".")
+}
+
+/// Writability probe used by `default_data_dir()`. Returns true if the path
+/// exists and is writable, or if its nearest existing ancestor is writable
+/// (so we can create it). Returns false on permission errors.
+fn can_write_to(path: &Path) -> bool {
+    let mut cursor: &Path = path;
+    loop {
+        match std::fs::metadata(cursor) {
+            Ok(md) => return !md.permissions().readonly() && write_access(cursor),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match cursor.parent() {
+                Some(parent) if parent != cursor => cursor = parent,
+                _ => return false,
+            },
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_access(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `access(2)` reads a NUL-terminated path and does not retain
+    // the pointer past the call. `W_OK` is a well-defined libc constant.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn write_access(_path: &Path) -> bool {
+    true
 }
 
 pub fn default_kernel_path() -> PathBuf {
-    let data_dir = default_data_dir();
+    default_kernel_path_for(&default_data_dir())
+}
+
+pub fn default_kernel_path_for(data_dir: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         data_dir.join("kernels/Image-virt")
     } else {
@@ -30,7 +88,10 @@ pub fn default_kernel_path() -> PathBuf {
 }
 
 pub fn default_rootfs_path() -> PathBuf {
-    let data_dir = default_data_dir();
+    default_rootfs_path_for(&default_data_dir())
+}
+
+pub fn default_rootfs_path_for(data_dir: &Path) -> PathBuf {
     let name = if cfg!(target_arch = "aarch64") {
         "alpine-aarch64.ext4"
     } else {
@@ -40,7 +101,10 @@ pub fn default_rootfs_path() -> PathBuf {
 }
 
 pub fn default_initrd_path() -> PathBuf {
-    let data_dir = default_data_dir();
+    default_initrd_path_for(&default_data_dir())
+}
+
+pub fn default_initrd_path_for(data_dir: &Path) -> PathBuf {
     let name = if cfg!(target_arch = "aarch64") {
         "initramfs-virt.gz"
     } else {

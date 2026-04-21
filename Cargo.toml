@@ -28,7 +28,7 @@ categories = ["virtualization"]
 tokio = { version = "1", features = ["full"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Web framework
 axum = { version = "0.8", features = ["json", "ws"] }

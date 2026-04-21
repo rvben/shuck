@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use shuck::{
     default_data_dir, default_images_base_url, default_initrd_path, default_kernel_path,
@@ -23,7 +23,7 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Daemon API address (for client commands)
-    #[arg(long, default_value = "http://127.0.0.1:7777")]
+    #[arg(long, env = "SHUCK_API_URL", default_value = "http://127.0.0.1:7777")]
     api_url: String,
 
     /// Bearer token for authenticated API access.
@@ -568,13 +568,28 @@ async fn api_error(resp: reqwest::Response, subject: &str) -> String {
     }
 }
 
+/// Stores the effective daemon URL for use in connection error messages.
+/// Set once at CLI startup so `api_request` can mention the URL without
+/// threading it through every call site.
+static DAEMON_URL: OnceLock<String> = OnceLock::new();
+
+fn set_daemon_url(url: &str) {
+    let _ = DAEMON_URL.set(url.to_string());
+}
+
 /// Send a request to the daemon API and return the response.
 ///
-/// Wraps connection errors with a hint about whether the daemon is running.
+/// Wraps connection errors with a hint about whether the daemon is running,
+/// naming the URL so users running a daemon on a non-default port can
+/// correct their `--api-url`/`SHUCK_API_URL` setting.
 async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     request.send().await.map_err(|e| {
         if e.is_connect() {
-            anyhow::anyhow!("cannot connect to daemon (is `shuck daemon` running?)")
+            let url = DAEMON_URL.get().map(String::as_str).unwrap_or("the daemon");
+            anyhow::anyhow!(
+                "cannot connect to daemon at {url}\n\
+                 hint: start it with `shuck daemon`, or point at a running daemon via --api-url / SHUCK_API_URL"
+            )
         } else {
             anyhow::anyhow!("{e}")
         }
@@ -681,6 +696,7 @@ async fn main() -> Result<()> {
         output,
         command,
     } = cli;
+    set_daemon_url(&api_url);
 
     match command {
         Commands::Daemon {
@@ -768,6 +784,19 @@ async fn main() -> Result<()> {
                     format!("reading userdata script {}", userdata_path.display())
                 })?;
                 body["userdata"] = serde_json::json!(script);
+            }
+
+            if output == OutputFormat::Text {
+                let initrd_str = body
+                    .get("initrd_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(none)");
+                eprintln!(
+                    "Using: kernel={} rootfs={} initrd={}",
+                    kernel.display(),
+                    rootfs.display(),
+                    initrd_str,
+                );
             }
 
             #[cfg(all(target_os = "linux", feature = "linux-net"))]
@@ -2748,7 +2777,23 @@ fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
 /// Environment variables take precedence over file-based config.
 fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("SHUCK_DATA_DIR") {
-        config.data_dir = PathBuf::from(val);
+        let new_data_dir = PathBuf::from(val);
+        // Cascade the override to kernel/rootfs/initrd paths when they were
+        // left at their defaults. Explicit TOML values (which do not match
+        // the default-based paths) are preserved.
+        let old_default_kernel = shuck::default_kernel_path_for(&config.data_dir);
+        let old_default_rootfs = shuck::default_rootfs_path_for(&config.data_dir);
+        let old_default_initrd = shuck::default_initrd_path_for(&config.data_dir);
+        if config.default_kernel == old_default_kernel {
+            config.default_kernel = shuck::default_kernel_path_for(&new_data_dir);
+        }
+        if config.default_rootfs == old_default_rootfs {
+            config.default_rootfs = shuck::default_rootfs_path_for(&new_data_dir);
+        }
+        if config.default_initrd.as_ref() == Some(&old_default_initrd) {
+            config.default_initrd = Some(shuck::default_initrd_path_for(&new_data_dir));
+        }
+        config.data_dir = new_data_dir;
     }
     if let Ok(val) = std::env::var("SHUCK_DEFAULT_KERNEL") {
         config.default_kernel = PathBuf::from(val);
@@ -2904,7 +2949,7 @@ async fn ensure_firecracker(config: &Config) -> anyhow::Result<PathBuf> {
     if let Some(p) = find_in_path(&config.firecracker_bin) {
         return Ok(p);
     }
-    let data = shuck::default_data_dir();
+    let data = &config.data_dir;
     let bin = data.join("bin/firecracker");
     if bin.exists() {
         return Ok(bin);
@@ -2926,7 +2971,7 @@ async fn ensure_firecracker(config: &Config) -> anyhow::Result<PathBuf> {
             "firecracker not found on PATH. Install it, or re-run with SHUCK_AUTO_INSTALL_FIRECRACKER=1 to download {url}"
         );
     }
-    let installed = shuck::firecracker::install(&data).await?;
+    let installed = shuck::firecracker::install(data).await?;
     eprintln!("Installed firecracker to {}", installed.display());
     Ok(installed)
 }
@@ -3251,6 +3296,23 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
 
 async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     tracing::info!("starting shuck daemon");
+
+    // Resolve firecracker_bin to an absolute path before handing it to the
+    // VMM backend. Auto-installed Firecracker lands at `{data_dir}/bin/firecracker`
+    // which is not on PATH for most setups; look there when PATH lookup fails.
+    #[cfg(all(target_os = "linux", feature = "linux-net"))]
+    let config = {
+        let mut config = config;
+        if !config.firecracker_bin.is_absolute() && find_in_path(&config.firecracker_bin).is_none()
+        {
+            let candidate = config.data_dir.join("bin/firecracker");
+            if candidate.is_file() {
+                tracing::info!(path = %candidate.display(), "resolved firecracker_bin from data dir");
+                config.firecracker_bin = candidate;
+            }
+        }
+        config
+    };
 
     let runtime_dir = config.data_dir.join("run");
     let db_path = config.data_dir.join("shuck.db");
@@ -3890,6 +3952,43 @@ mod tests {
     }
 
     #[test]
+    fn env_override_data_dir_cascades_to_default_paths() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("SHUCK_DATA_DIR", "/tmp/shuck-cascade-test");
+        let config = load_config(None);
+        assert_eq!(
+            config.default_kernel,
+            shuck::default_kernel_path_for(&PathBuf::from("/tmp/shuck-cascade-test"))
+        );
+        assert_eq!(
+            config.default_rootfs,
+            shuck::default_rootfs_path_for(&PathBuf::from("/tmp/shuck-cascade-test"))
+        );
+        assert_eq!(
+            config.default_initrd,
+            Some(shuck::default_initrd_path_for(&PathBuf::from(
+                "/tmp/shuck-cascade-test"
+            )))
+        );
+    }
+
+    #[test]
+    fn env_override_data_dir_preserves_explicit_default_kernel() {
+        let _guard = env_mutex().lock().unwrap();
+        let _vars = [
+            EnvVarGuard::set("SHUCK_DATA_DIR", "/tmp/shuck-cascade-test-2"),
+            EnvVarGuard::set("SHUCK_DEFAULT_KERNEL", "/custom/vmlinux"),
+        ];
+        let config = load_config(None);
+        assert_eq!(config.default_kernel, PathBuf::from("/custom/vmlinux"));
+        // rootfs still cascades (it wasn't explicitly overridden)
+        assert_eq!(
+            config.default_rootfs,
+            shuck::default_rootfs_path_for(&PathBuf::from("/tmp/shuck-cascade-test-2"))
+        );
+    }
+
+    #[test]
     fn env_override_default_kernel() {
         let _guard = env_mutex().lock().unwrap();
         let _env = EnvVarGuard::set("SHUCK_DEFAULT_KERNEL", "/tmp/custom-kernel");
@@ -4042,13 +4141,19 @@ mod tests {
 
     #[tokio::test]
     async fn api_request_connect_error_has_actionable_hint() {
+        set_daemon_url("http://127.0.0.1:9");
         let client = reqwest::Client::new();
         let err = api_request(client.get("http://127.0.0.1:9"))
             .await
             .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("cannot connect to daemon (is `shuck daemon` running?)")
+            msg.contains("cannot connect to daemon at http://127.0.0.1:9"),
+            "expected URL in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("SHUCK_API_URL"),
+            "expected SHUCK_API_URL hint in error, got: {msg}"
         );
     }
 
