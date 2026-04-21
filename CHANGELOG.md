@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-21
+
+### Fixed
+
+- `shuck images pull` (plural) now resolves — the `image` subcommand carries visible aliases `images` and `img`, matching the README and the wording used in `shuck run`'s missing-default-image error hints.
+
 ## [0.1.0] - 2026-04-20
 
 First release where `pip install shuck && shuck run` works without bring-your-own kernel or rootfs.
