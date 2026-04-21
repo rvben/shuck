@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-04-21
+
+### Added
+
+- `SHUCK_API_URL` environment variable for pointing CLI commands at a
+  remote daemon without `--api-url` on every call.
+- `shuck run` now logs which kernel, rootfs, and initrd were selected
+  before it POSTs to the daemon, making first-run debugging easier.
+
+### Fixed
+
+- `SHUCK_DATA_DIR` now cascades to `default_kernel`, `default_rootfs`,
+  and `default_initrd` unless those are set explicitly, so relocating
+  the data dir no longer requires overriding four separate variables.
+- Linux data dir falls back to the XDG data home (`~/.local/share/shuck`)
+  when `/var/lib/shuck` is not writable, so `pip install --user`-style
+  flows work without `sudo`.
+- Daemon now resolves `firecracker_bin` from `{data_dir}/bin/` when it
+  is neither absolute nor on `PATH`, so the auto-installed binary is
+  picked up on first run.
+- Daemon-connect errors now include the URL and a hint to start the
+  daemon, instead of a bare hyper error.
+- Exec requests issued right after `shuck run` retry against the guest
+  agent with exponential backoff, eliminating the first-boot 503 race.
+- Alpine rootfs no longer floods the serial log with `hvc0` open
+  errors on Firecracker guests — the getty line now guards on
+  `[ -c /dev/hvc0 ]`. Apple VZ guests still get their serial console.
+
 ## [0.1.3] - 2026-04-21
 
 ### Added
