@@ -55,9 +55,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-          - os: [self-hosted, macOS, ARM64]
+          - os: macos-latest
             target: x86_64-apple-darwin
-          - os: [self-hosted, macOS, ARM64]
+          - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
@@ -73,6 +73,10 @@ jobs:
       - name: Install maturin + zig (Linux)
         if: runner.os == 'Linux'
         run: pip install maturin ziglang cargo-zigbuild
+
+      - name: Install maturin + wheel (macOS)
+        if: runner.os == 'macOS'
+        run: pip3 install --break-system-packages maturin wheel
 
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
