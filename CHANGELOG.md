@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-21
+
+### Added
+
+- POSIX installer script: `curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | sh`. Verifies SHA-256, respects `SHUCK_VERSION` and `SHUCK_PREFIX`.
+- Homebrew tap publishing: releases now push `rvben/homebrew-tap/Formula/shuck.rb` so `brew install rvben/tap/shuck` works.
+- `shuck run` prompts on a TTY to download Firecracker when it's missing from `PATH`; non-interactive callers (CI, scripts) keep using `SHUCK_AUTO_INSTALL_FIRECRACKER=1`.
+- `SECURITY.md`, `CONTRIBUTING.md`, issue and pull-request templates; README gains alternatives, security, and troubleshooting sections.
+
+### Fixed
+
+- Compile with `--no-default-features` on Linux: the daemon start path no longer reaches for the macOS-gated `shuck_vmm::apple_vz` module, so `make test-contracts` builds cleanly on Linux.
+- Rust 1.95 compatibility: `openpty` winsize pointer uses `addr_of_mut!` to satisfy the `unnecessary_mut_passed` clippy lint without breaking BSD/macOS signatures.
+- Graceful-shutdown CI drill: pre-builds the daemon outside the health-check window and pins `RUST_LOG` so the `shuck_api` shutdown log is captured.
+
 ## [0.1.2] - 2026-04-21
 
 ### Fixed
