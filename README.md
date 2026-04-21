@@ -66,7 +66,7 @@ shuck logs hello -f
 shuck destroy hello
 ```
 
-On Linux, `shuck run` needs `firecracker` on `PATH`. If it's missing, re-run with `SHUCK_AUTO_INSTALL_FIRECRACKER=1` to have shuck download a pinned Firecracker release into the data directory.
+On Linux, `shuck run` needs `firecracker` on `PATH`. If it's missing, shuck prompts to download a pinned release into the data directory. For non-interactive use (CI, scripts), set `SHUCK_AUTO_INSTALL_FIRECRACKER=1` to skip the prompt.
 
 `shuck images pull` fetches the latest signed image set from the `images-*`
 [GitHub Releases](https://github.com/rvben/shuck/releases). If no image
@@ -134,8 +134,8 @@ The daemon defaults to loopback-only. Don't bind it on a public interface withou
 
 ## Troubleshooting
 
-**`shuck run` reports `firecracker: command not found` (Linux)**
-Install Firecracker from [the releases page](https://github.com/firecracker-microvm/firecracker/releases), or set `SHUCK_AUTO_INSTALL_FIRECRACKER=1` and re-run to have shuck fetch a pinned release.
+**`shuck run` can't find `firecracker` (Linux)**
+On a TTY, shuck prompts to download a pinned release. For scripted/CI use, set `SHUCK_AUTO_INSTALL_FIRECRACKER=1` to skip the prompt, or install Firecracker yourself from [the releases page](https://github.com/firecracker-microvm/firecracker/releases).
 
 **`shuck run` reports `kvm_init: permission denied` (Linux)**
 Add your user to the `kvm` group: `sudo usermod -aG kvm $USER` and re-login.

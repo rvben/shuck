@@ -2896,8 +2896,9 @@ fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
     Ok((base, prefix_len))
 }
 
-/// Ensure Firecracker is available, installing it automatically when
-/// `SHUCK_AUTO_INSTALL_FIRECRACKER=1` is set and the binary cannot be found.
+/// Ensure Firecracker is available. If the binary can't be found, auto-install
+/// when `SHUCK_AUTO_INSTALL_FIRECRACKER=1` is set, prompt interactively on a
+/// TTY, or bail with a hint otherwise.
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 async fn ensure_firecracker(config: &Config) -> anyhow::Result<PathBuf> {
     if let Some(p) = find_in_path(&config.firecracker_bin) {
@@ -2908,19 +2909,100 @@ async fn ensure_firecracker(config: &Config) -> anyhow::Result<PathBuf> {
     if bin.exists() {
         return Ok(bin);
     }
-    if std::env::var("SHUCK_AUTO_INSTALL_FIRECRACKER")
-        .ok()
-        .as_deref()
-        != Some("1")
-    {
+
+    let env = std::env::var("SHUCK_AUTO_INSTALL_FIRECRACKER").ok();
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let url = shuck::firecracker::firecracker_download_url();
+
+    let should_install = match decide_auto_install(env.as_deref(), is_tty) {
+        AutoInstallDecision::Yes => true,
+        AutoInstallDecision::No => false,
+        AutoInstallDecision::Prompt => prompt_firecracker_install(&url)?,
+    };
+
+    if !should_install {
         anyhow::bail!(
-            "firecracker not found on PATH. Install it, or re-run with SHUCK_AUTO_INSTALL_FIRECRACKER=1 to download {}",
-            shuck::firecracker::firecracker_download_url()
+            "firecracker not found on PATH. Install it, or re-run with SHUCK_AUTO_INSTALL_FIRECRACKER=1 to download {url}"
         );
     }
     let installed = shuck::firecracker::install(&data).await?;
     eprintln!("Installed firecracker to {}", installed.display());
     Ok(installed)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AutoInstallDecision {
+    Yes,
+    No,
+    Prompt,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
+fn decide_auto_install(env: Option<&str>, is_tty: bool) -> AutoInstallDecision {
+    match env {
+        Some("1") => AutoInstallDecision::Yes,
+        _ if is_tty => AutoInstallDecision::Prompt,
+        _ => AutoInstallDecision::No,
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
+fn prompt_firecracker_install(url: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+    eprintln!("firecracker not found on PATH.");
+    eprintln!("shuck can download a pinned release from:");
+    eprintln!("  {url}");
+    eprint!("Install it now? [Y/n] ");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_lowercase();
+    Ok(matches!(answer.as_str(), "" | "y" | "yes"))
+}
+
+#[cfg(all(test, target_os = "linux", feature = "linux-net"))]
+mod auto_install_tests {
+    use super::{AutoInstallDecision, decide_auto_install};
+
+    #[test]
+    fn env_one_always_installs() {
+        assert_eq!(
+            decide_auto_install(Some("1"), true),
+            AutoInstallDecision::Yes
+        );
+        assert_eq!(
+            decide_auto_install(Some("1"), false),
+            AutoInstallDecision::Yes
+        );
+    }
+
+    #[test]
+    fn no_env_on_tty_prompts() {
+        assert_eq!(decide_auto_install(None, true), AutoInstallDecision::Prompt);
+        assert_eq!(
+            decide_auto_install(Some(""), true),
+            AutoInstallDecision::Prompt
+        );
+        assert_eq!(
+            decide_auto_install(Some("0"), true),
+            AutoInstallDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn no_env_without_tty_bails() {
+        assert_eq!(decide_auto_install(None, false), AutoInstallDecision::No);
+        assert_eq!(
+            decide_auto_install(Some(""), false),
+            AutoInstallDecision::No
+        );
+        assert_eq!(
+            decide_auto_install(Some("0"), false),
+            AutoInstallDecision::No
+        );
+    }
 }
 
 /// Check if a binary name can be found in PATH.
