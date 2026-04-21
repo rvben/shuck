@@ -35,13 +35,16 @@ impl Pty {
 
         // Safety: openpty writes two valid fds on success. We pass null for
         // name and termp since we don't need the slave path or custom termios.
+        // The winsize pointer uses `addr_of_mut!` because the libc signature is
+        // `*mut winsize` on BSD/macOS and `*const winsize` on Linux (`*mut`
+        // coerces to `*const`).
         let ret = unsafe {
             libc::openpty(
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                std::ptr::addr_of_mut!(ws),
             )
         };
         if ret != 0 {
