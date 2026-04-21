@@ -3354,11 +3354,23 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     #[cfg(all(not(feature = "linux-net"), not(target_os = "macos")))]
     {
-        // Silence unused-variable warnings on this stub build.
-        let _ = (runtime_dir, state, storage, listen, api_token);
-        anyhow::bail!(
-            "shuck was built without a VMM backend. Rebuild with --features linux-net on Linux, or target macOS for Apple Virtualization."
-        );
+        // No networking stack available (no `linux-net` feature, not macOS).
+        // The API server can still run; VM operations will fail at create time
+        // because no networking is configured. Primarily used by CI drills.
+        let vmm =
+            shuck_vmm::firecracker::FirecrackerBackend::new(PathBuf::from("firecracker"), &runtime_dir);
+
+        let core = Arc::new(shuck_core::ShuckCore::new(
+            vmm,
+            state,
+            storage,
+            runtime_dir.clone(),
+        ));
+
+        spawn_log_rotation(Arc::clone(&core));
+        shuck_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
+        drain_vms_on_shutdown(&core).await;
+        Ok(())
     }
 }
 

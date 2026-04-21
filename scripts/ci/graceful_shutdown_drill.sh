@@ -17,9 +17,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "[graceful-shutdown] building daemon"
+cargo build --quiet --package shuck --no-default-features
+
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+BIN="${TARGET_DIR}/debug/shuck"
+if [[ ! -x "${BIN}" ]]; then
+  echo "[graceful-shutdown] expected ${BIN} to exist after build" >&2
+  exit 1
+fi
+
 echo "[graceful-shutdown] starting daemon on ${BASE_URL}"
 SHUCK_DATA_DIR="${DATA_DIR}" \
-  cargo run --quiet --package shuck --no-default-features -- daemon --listen "127.0.0.1:${PORT}" \
+  RUST_LOG="${RUST_LOG:-shuck=info,shuck_api=info}" \
+  "${BIN}" daemon --listen "127.0.0.1:${PORT}" \
   >"${LOG_FILE}" 2>&1 &
 PID=$!
 
