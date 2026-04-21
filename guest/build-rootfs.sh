@@ -63,6 +63,21 @@ chmod 0644 "$TAR_DIR/etc/inittab"
 # block/char device nodes are skipped because devtmpfs recreates them at boot.
 DBG_CMDS="$WORK_DIR/debugfs.cmd"
 : > "$DBG_CMDS"
+
+# Emit the permission bits as a 4-digit octal (suid/sgid/sticky + rwx*3).
+# BSD `stat -f '%p'` pads; GNU `stat -c '%a'` does not, so normalise ourselves —
+# otherwise debugfs parses `04755` as 0o04755 (zero file-type nibble) and the
+# resulting inode is not a directory, breaking every subsequent symlink.
+perm_suffix() {
+    local m
+    if m=$(stat -f '%p' "$1" 2>/dev/null); then
+        echo "${m: -4}"
+    else
+        m=$(stat -c '%a' "$1")
+        printf '%04o\n' "$((8#$m))"
+    fi
+}
+
 ( cd "$TAR_DIR" && find . -mindepth 1 -print0 | sort -z | while IFS= read -r -d '' entry; do
     dest="/${entry#./}"
     if [ -L "$entry" ]; then
@@ -70,12 +85,10 @@ DBG_CMDS="$WORK_DIR/debugfs.cmd"
         echo "symlink $dest $target"
     elif [ -d "$entry" ]; then
         echo "mkdir $dest"
-        mode=$({ m=$(stat -f '%p' "$entry" 2>/dev/null) && echo "${m: -4}"; } || stat -c '%a' "$entry")
-        echo "set_inode_field $dest mode 04${mode}"
+        echo "set_inode_field $dest mode 04$(perm_suffix "$entry")"
     elif [ -f "$entry" ]; then
         echo "write $entry $dest"
-        mode=$({ m=$(stat -f '%p' "$entry" 2>/dev/null) && echo "${m: -4}"; } || stat -c '%a' "$entry")
-        echo "set_inode_field $dest mode 010${mode}"
+        echo "set_inode_field $dest mode 010$(perm_suffix "$entry")"
     else
         echo "# skipping special file: $dest" >&2
     fi
