@@ -231,3 +231,83 @@ jobs:
           echo "Dry run complete. Artifacts built but nothing published."
           echo "Archives:"
           find artifacts/release-* -type f | sort
+
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Compute SHA256 hashes
+        id: hashes
+        run: |
+          for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            sha=$(cat /tmp/artifacts/release-${target}/shuck-${{ github.ref_name }}-${target}.tar.gz.sha256 | awk '{print $1}')
+            key=$(echo "${target}" | tr '-' '_')
+            echo "${key}=${sha}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NUM="${VERSION#v}"
+
+          cat > /tmp/shuck.rb << 'FORMULA'
+          class Shuck < Formula
+            desc "MicroVM manager built on Firecracker (Linux) and Apple Virtualization.framework (macOS)"
+            homepage "https://github.com/rvben/shuck"
+            version "VERSION_NUM"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_AARCH64_APPLE_DARWIN"
+              else
+                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_X86_64_APPLE_DARWIN"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_AARCH64_UNKNOWN_LINUX_GNU"
+              else
+                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_X86_64_UNKNOWN_LINUX_GNU"
+              end
+            end
+
+            def install
+              bin.install "shuck"
+            end
+
+            test do
+              system "#{bin}/shuck", "--version"
+            end
+          end
+          FORMULA
+
+          sed -i "s/VERSION_NUM/${VERSION_NUM}/g" /tmp/shuck.rb
+          sed -i "s/VERSION/${VERSION}/g" /tmp/shuck.rb
+          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.hashes.outputs.aarch64_apple_darwin }}/g" /tmp/shuck.rb
+          sed -i "s/SHA_X86_64_APPLE_DARWIN/${{ steps.hashes.outputs.x86_64_apple_darwin }}/g" /tmp/shuck.rb
+          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.hashes.outputs.aarch64_unknown_linux_gnu }}/g" /tmp/shuck.rb
+          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.hashes.outputs.x86_64_unknown_linux_gnu }}/g" /tmp/shuck.rb
+
+          git clone https://x-access-token:${GH_TOKEN}@github.com/rvben/homebrew-tap.git /tmp/tap
+          mkdir -p /tmp/tap/Formula
+          cp /tmp/shuck.rb /tmp/tap/Formula/shuck.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/shuck.rb
+          git diff --cached --quiet || git commit -m "Update shuck to ${VERSION}"
+          git push
