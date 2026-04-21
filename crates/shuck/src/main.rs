@@ -190,7 +190,7 @@ enum Commands {
     },
 
     /// Manage image catalog resources
-    #[command(alias = "img")]
+    #[command(visible_aliases = ["images", "img"])]
     Image {
         #[command(subcommand)]
         action: ImageAction,
