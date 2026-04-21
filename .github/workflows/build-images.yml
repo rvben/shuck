@@ -37,8 +37,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y e2fsprogs musl-tools
           if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
-            # Use the prebuilt aarch64 musl cross toolchain.
-            curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+            # Download the prebuilt aarch64 musl cross toolchain. musl.cc is
+            # occasionally flaky and truncates mid-stream, so download to a
+            # file with retries and validate before extracting.
+            tarball=/tmp/aarch64-linux-musl-cross.tgz
+            for attempt in 1 2 3 4; do
+              if curl --fail -sSL --retry 5 --retry-delay 5 --retry-max-time 120 \
+                  -o "$tarball" https://musl.cc/aarch64-linux-musl-cross.tgz \
+                  && tar -tzf "$tarball" >/dev/null 2>&1; then
+                break
+              fi
+              echo "musl.cc download attempt $attempt failed; retrying..." >&2
+              sleep $((attempt * 10))
+              rm -f "$tarball"
+            done
+            [ -s "$tarball" ] || { echo "ERROR: could not fetch aarch64 musl cross toolchain" >&2; exit 1; }
+            sudo tar -xzf "$tarball" -C /opt
             echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
           fi
 
