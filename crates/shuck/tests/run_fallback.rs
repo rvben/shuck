@@ -16,7 +16,10 @@ fn run_without_rootfs_and_no_default_hints_pull() {
     );
 }
 
-#[cfg(target_os = "linux")]
+// The firecracker pre-check only exists when `linux-net` is compiled in;
+// the `--no-default-features` build skips it and reaches the daemon-connection
+// path instead.
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
 #[test]
 fn run_with_missing_firecracker_hints_env_var() {
     let tmp = tempfile::tempdir().unwrap();

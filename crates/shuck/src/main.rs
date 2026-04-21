@@ -3357,8 +3357,10 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         // No networking stack available (no `linux-net` feature, not macOS).
         // The API server can still run; VM operations will fail at create time
         // because no networking is configured. Primarily used by CI drills.
-        let vmm =
-            shuck_vmm::firecracker::FirecrackerBackend::new(PathBuf::from("firecracker"), &runtime_dir);
+        let vmm = shuck_vmm::firecracker::FirecrackerBackend::new(
+            PathBuf::from("firecracker"),
+            &runtime_dir,
+        );
 
         let core = Arc::new(shuck_core::ShuckCore::new(
             vmm,
