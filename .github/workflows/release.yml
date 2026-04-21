@@ -67,6 +67,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Clean stale dist
         run: rm -rf dist target/wheels
 
@@ -76,7 +80,7 @@ jobs:
 
       - name: Install maturin + wheel (macOS)
         if: runner.os == 'macOS'
-        run: pip3 install --break-system-packages maturin wheel
+        run: pip install maturin wheel
 
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
