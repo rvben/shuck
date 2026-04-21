@@ -3335,7 +3335,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         Ok(())
     }
 
-    #[cfg(not(feature = "linux-net"))]
+    #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
     {
         let vmm = shuck_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
 
@@ -3350,6 +3350,15 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         shuck_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
         drain_vms_on_shutdown(&core).await;
         Ok(())
+    }
+
+    #[cfg(all(not(feature = "linux-net"), not(target_os = "macos")))]
+    {
+        // Silence unused-variable warnings on this stub build.
+        let _ = (runtime_dir, state, storage, listen, api_token);
+        anyhow::bail!(
+            "shuck was built without a VMM backend. Rebuild with --features linux-net on Linux, or target macOS for Apple Virtualization."
+        );
     }
 }
 
