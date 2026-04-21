@@ -22,10 +22,31 @@ Useful for experimentation, local development, and CI. Not recommended for produ
 
 ## Quick Start
 
-```bash
-# Install
-pip install shuck
+### Install
 
+macOS (Homebrew):
+
+```bash
+brew install rvben/tap/shuck
+```
+
+Linux & macOS (installer script):
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | sh
+```
+
+Cross-platform (PyPI):
+
+```bash
+pip install shuck
+```
+
+Pinning a version: `curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | SHUCK_VERSION=v0.1.2 sh` or `pip install shuck==0.1.2`.
+
+### First boot
+
+```bash
 # Fetch the default kernel + rootfs for this host
 shuck images pull
 
@@ -44,6 +65,8 @@ shuck logs hello -f
 # Clean up
 shuck destroy hello
 ```
+
+On Linux, `shuck run` needs `firecracker` on `PATH`. If it's missing, re-run with `SHUCK_AUTO_INSTALL_FIRECRACKER=1` to have shuck download a pinned Firecracker release into the data directory.
 
 `shuck images pull` fetches the latest signed image set from the `images-*`
 [GitHub Releases](https://github.com/rvben/shuck/releases). If no image
@@ -74,6 +97,20 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 | Linux x86_64 | Firecracker | TAP + nftables NAT, port forwarding | Usable |
 | macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed) | Experimental |
 
+## Alternatives
+
+shuck is one of several ways to run microVMs. Rough positioning:
+
+| Tool | Backend | Focus | Notes |
+|---|---|---|---|
+| **shuck** | Firecracker (Linux) + Apple VZ (macOS) | Single-host VM manager with a REST API and CLI | SQLite-backed state, port forwarding, guest agent over vsock. |
+| [Ignite](https://github.com/weaveworks/ignite) | Firecracker | Docker-image-style workflow on Firecracker | Archived by Weaveworks; Linux only. |
+| [firecracker-containerd](https://github.com/firecracker-microvm/firecracker-containerd) | Firecracker | containerd runtime backed by microVMs | Kubernetes-friendly; Linux only. |
+| [krunvm](https://github.com/containers/krunvm) | libkrun | OCI-image microVMs on macOS | No daemon; ephemeral per-command VMs. |
+| [Lima](https://github.com/lima-vm/lima) | QEMU (+ VZ on macOS) | Full Linux VMs as a dev environment | Heavier than Firecracker; broader guest support. |
+
+Pick shuck if you want Firecracker on Linux with a matching Apple VZ path on macOS, driven by a single CLI + daemon.
+
 ## Architecture
 
 ```
@@ -86,6 +123,34 @@ CLI (shuck) ──> REST API (shuck-api) ──> Core (shuck-core)
 ```
 
 Host-guest communication uses vsock (port 52). Messages are length-prefixed JSON with base64-encoded binary payloads.
+
+## Security
+
+- [Threat model](docs/security/threat-model.md) — STRIDE analysis and residual risks.
+- [Hardening guide](docs/security/hardening-guide.md) — deployment posture and config recommendations.
+- Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/rvben/shuck/security/advisories/new). See [SECURITY.md](SECURITY.md).
+
+The daemon defaults to loopback-only. Don't bind it on a public interface without a bearer token and a terminating reverse proxy.
+
+## Troubleshooting
+
+**`shuck run` reports `firecracker: command not found` (Linux)**
+Install Firecracker from [the releases page](https://github.com/firecracker-microvm/firecracker/releases), or set `SHUCK_AUTO_INSTALL_FIRECRACKER=1` and re-run to have shuck fetch a pinned release.
+
+**`shuck run` reports `kvm_init: permission denied` (Linux)**
+Add your user to the `kvm` group: `sudo usermod -aG kvm $USER` and re-login.
+
+**`shuck run` fails on macOS with a virtualization entitlement error**
+The binary needs the `com.apple.security.virtualization` entitlement. `pip`, `brew`, and the installer script all ship a codesigned binary. If you built from source, run `make install` — it ad-hoc signs via `shuck.entitlements`.
+
+**macOS: VM boots but exits immediately**
+Apple VZ needs an initramfs to mount the rootfs. If you're using custom images, make sure `--initrd` points at a matching initramfs (see `guest/build-initramfs.sh`).
+
+**`shuck daemon` binds but the CLI can't connect**
+The CLI defaults to `http://127.0.0.1:7777`. If the daemon listens elsewhere, pass `--api-url http://host:port` (and `--api-token` if auth is enabled).
+
+**Rootfs edits don't take effect on macOS**
+Use `make update-rootfs` to inject changes via `debugfs` (works in LXC and macOS). Loop-mounting doesn't work on macOS.
 
 ## Development
 
@@ -113,6 +178,10 @@ make update-rootfs                  # Inject agent into rootfs image
 ### Systemd
 
 A systemd unit file is provided at `contrib/shuck.service`.
+
+## Contributing
+
+Issues and pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and commit conventions.
 
 ## License
 
