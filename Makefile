@@ -15,14 +15,20 @@ build:
 build-release:
 	cargo build --workspace --release
 
+# Cross-linker defaults assume the prebuilt musl-cross toolchain from musl.cc.
+# Override when building on distros that ship an aarch64/x86_64 cross-gcc instead
+# (e.g. CI uses `gcc-aarch64-linux-gnu` because musl.cc is occasionally offline).
+X86_64_MUSL_LINKER  ?= x86_64-linux-musl-gcc
+AARCH64_MUSL_LINKER ?= aarch64-linux-musl-gcc
+
 # Build only the guest agent (optimized for size, x86_64)
 build-agent:
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$(X86_64_MUSL_LINKER) \
 	cargo build --package shuck-agent --profile agent --target x86_64-unknown-linux-musl
 
 # Build guest agent for ARM64 (for macOS/VZ guests)
 build-agent-aarch64:
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$(AARCH64_MUSL_LINKER) \
 	cargo build --package shuck-agent --profile agent --target aarch64-unknown-linux-musl
 
 # Build release for macOS (no linux-net, with entitlement signing)
