@@ -2157,7 +2157,13 @@ async fn image_command(
         }
         ImageAction::Pull { from, force } => {
             let config = load_config(None);
-            let base_url = from.unwrap_or(config.images_base_url.clone());
+            let configured = from.unwrap_or(config.images_base_url.clone());
+            let base_url = shuck::images::resolve_download_base(&configured)
+                .await
+                .context("resolving images release URL")?;
+            if base_url != configured {
+                println!("Resolved {configured} -> {base_url}");
+            }
             let manifest = shuck::images::fetch_manifest(&base_url)
                 .await
                 .context("fetching SHA256SUMS manifest")?;

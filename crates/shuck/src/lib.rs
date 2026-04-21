@@ -4,7 +4,12 @@ use std::path::PathBuf;
 pub mod firecracker;
 pub mod images;
 
-pub const DEFAULT_IMAGES_BASE_URL: &str = "https://github.com/rvben/shuck/releases/latest/download";
+/// Default source for `shuck images pull`. The repo URL form triggers the
+/// runtime resolver in `images::resolve_download_base`, which queries the
+/// GitHub API for the most recent `images-YYYY-MM-DD` release. Users can
+/// override `images_base_url` in config (or `SHUCK_IMAGES_BASE_URL`) with a
+/// direct `…/releases/download/<tag>` URL to pin a specific image set.
+pub const DEFAULT_IMAGES_BASE_URL: &str = "https://github.com/rvben/shuck";
 
 pub fn default_data_dir() -> PathBuf {
     if cfg!(target_os = "macos")

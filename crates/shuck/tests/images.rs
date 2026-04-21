@@ -1,7 +1,7 @@
 use std::fs;
 
 use sha2::{Digest, Sha256};
-use shuck::images::{DownloadSpec, fetch_and_verify, parse_manifest};
+use shuck::images::{DownloadSpec, fetch_and_verify, parse_manifest, resolve_download_base};
 
 #[test]
 fn parse_manifest_extracts_sha_for_named_file() {
@@ -41,6 +41,24 @@ async fn fetch_and_verify_rejects_sha_mismatch() {
     .expect_err("mismatched sha must error");
     assert!(
         err.to_string().contains("sha256"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_download_base_passes_through_pinned_tag() {
+    let pinned = "https://github.com/rvben/shuck/releases/download/images-2026-04-21";
+    let got = resolve_download_base(pinned).await.unwrap();
+    assert_eq!(got, pinned);
+}
+
+#[tokio::test]
+async fn resolve_download_base_rejects_non_github_repo_url() {
+    let err = resolve_download_base("https://example.com/shuck")
+        .await
+        .expect_err("non-github URL must not resolve");
+    assert!(
+        err.to_string().contains("github.com"),
         "unexpected error: {err}"
     );
 }

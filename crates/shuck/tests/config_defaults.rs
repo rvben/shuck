@@ -14,7 +14,7 @@ fn default_rootfs_path_is_under_data_dir() {
 }
 
 #[test]
-fn default_images_base_url_points_at_github_releases() {
+fn default_images_base_url_is_resolvable_github_repo() {
     assert!(shuck::DEFAULT_IMAGES_BASE_URL.contains("github.com"));
-    assert!(shuck::DEFAULT_IMAGES_BASE_URL.contains("releases"));
+    assert!(shuck::DEFAULT_IMAGES_BASE_URL.contains("rvben/shuck"));
 }
