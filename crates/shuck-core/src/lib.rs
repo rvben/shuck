@@ -1307,6 +1307,43 @@ impl<B: VmmBackend> ShuckCore<B> {
         Ok(AgentConnection::new(stream))
     }
 
+    /// Connect to the guest agent, retrying transient failures with backoff.
+    ///
+    /// Callers that reach the agent immediately after VM boot (e.g. `exec`)
+    /// race the agent bind. Use this helper instead of [`Self::agent_connect`]
+    /// when the caller can tolerate a bounded wait.
+    ///
+    /// Retries only VMM/Agent connection errors (vsock CONNECT rejected,
+    /// agent not responding). State errors (VM destroyed or stopped) fail
+    /// immediately.
+    pub async fn agent_connect_ready(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
+        let mut backoff = std::time::Duration::from_millis(200);
+        let max_backoff = std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match self.agent_connect(name).await {
+                Ok(c) => return Ok(c),
+                Err(ref e @ (CoreError::Vmm(_) | CoreError::Agent(_)))
+                    if tokio::time::Instant::now() + backoff < deadline =>
+                {
+                    debug!(
+                        %name,
+                        error = %e,
+                        retry_in = ?backoff,
+                        "agent not ready, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Execute the userdata script inside a running VM.
     ///
     /// Retries agent connection with exponential backoff (up to 120s total),
@@ -1322,32 +1359,9 @@ impl<B: VmmBackend> ShuckCore<B> {
         self.state.update_userdata_status(record.id, "running")?;
 
         let result: Result<(), CoreError> = async {
-            // Retry agent connection with backoff — the guest agent may
-            // not be listening yet immediately after VM boot. Only retry
-            // transient connection errors; bail immediately on state errors
-            // (e.g. VM destroyed or stopped while we were waiting).
-            let mut conn = {
-                let mut backoff = std::time::Duration::from_secs(1);
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                loop {
-                    match self.agent_connect(name).await {
-                        Ok(c) => break c,
-                        Err(ref e @ (CoreError::Vmm(_) | CoreError::Agent(_)))
-                            if tokio::time::Instant::now() + backoff < deadline =>
-                        {
-                            info!(
-                                %name,
-                                error = %e,
-                                retry_in = ?backoff,
-                                "agent not ready, retrying"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            };
+            let mut conn = self
+                .agent_connect_ready(name, std::time::Duration::from_secs(120))
+                .await?;
 
             conn.write_file("/tmp/shuck-userdata.sh", script.as_bytes(), Some(0o755))
                 .await?;

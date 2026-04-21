@@ -1642,8 +1642,11 @@ async fn exec_vm<B: VmmBackend + 'static>(
         env_count = req.env.len(),
         has_working_dir = req.working_dir.is_some()
     );
+    // Race-tolerant connect: exec callers often hit the agent within a second
+    // or two of VM boot, before the guest has bound vsock port 52. A short
+    // retry window eliminates the need for client-side polling.
     let mut conn = core
-        .agent_connect(&name)
+        .agent_connect_ready(&name, Duration::from_secs(30))
         .await
         .map_err(map_agent_connect_error)?;
     let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
