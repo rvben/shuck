@@ -55,9 +55,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
+          - os: [self-hosted, macOS, ARM64]
             target: x86_64-apple-darwin
-          - os: macos-latest
+          - os: [self-hosted, macOS, ARM64]
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
@@ -67,20 +67,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
 
       - name: Clean stale dist
         run: rm -rf dist target/wheels
 
       - name: Install maturin + zig (Linux)
         if: runner.os == 'Linux'
-        run: pip install maturin ziglang cargo-zigbuild
+        shell: bash
+        run: |
+          uv venv "${RUNNER_TEMP}/build-venv"
+          uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" maturin ziglang cargo-zigbuild
+          echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install maturin + wheel (macOS)
         if: runner.os == 'macOS'
-        run: pip install maturin wheel
+        shell: bash
+        run: |
+          uv venv "${RUNNER_TEMP}/build-venv"
+          uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" maturin wheel
+          echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
 
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
@@ -170,8 +176,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: astral-sh/setup-uv@v6
+
       - name: Install maturin
-        run: pip install maturin
+        shell: bash
+        run: |
+          uv venv "${RUNNER_TEMP}/build-venv"
+          uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" maturin
+          echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
 
       - name: Build sdist
         run: maturin sdist --out dist
